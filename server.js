@@ -93,6 +93,8 @@ apiRouter.get('/health', (req, res) => {
 apiRouter.post('/device/register', async (req, res) => {
     const { deviceId, deviceName } = req.body;
     
+    console.log(`设备注册请求: deviceId=${deviceId}, deviceName=${deviceName}`);
+    
     await withFileLock(DEVICES_DIR, async () => {
         let devices = [];
         const devicesFile = path.join(DEVICES_DIR, 'registry.json');
@@ -102,6 +104,7 @@ apiRouter.post('/device/register', async (req, res) => {
                 const content = fs.readFileSync(devicesFile, 'utf8');
                 if (content && content.trim()) {
                     devices = JSON.parse(content);
+                    console.log(`当前已注册设备数: ${devices.length}, 设备列表: ${devices.map(d => d.deviceId).join(', ')}`);
                 }
             } catch (e) {
                 console.error('解析设备注册文件失败:', e);
@@ -112,6 +115,7 @@ apiRouter.post('/device/register', async (req, res) => {
         let existingDevice = devices.find(d => d.deviceId === deviceId);
         
         if (existingDevice) {
+            console.log(`设备已存在: ${deviceId}`);
             res.json({
                 success: true,
                 message: '设备已存在',
@@ -127,6 +131,7 @@ apiRouter.post('/device/register', async (req, res) => {
             };
             
             devices.push(newDevice);
+            console.log(`新设备注册: ${newDevice.deviceId}, 总设备数: ${devices.length}`);
             fs.writeFileSync(devicesFile, JSON.stringify(devices, null, 2));
             
             const deviceUsageDir = path.join(USAGE_DIR, newDevice.deviceId);

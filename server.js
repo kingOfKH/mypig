@@ -26,6 +26,22 @@ function ensureDirectories() {
 }
 ensureDirectories();
 
+function safeReadJSON(filePath, defaultValue = null) {
+    try {
+        if (!fs.existsSync(filePath)) {
+            return defaultValue;
+        }
+        const content = fs.readFileSync(filePath, 'utf8');
+        if (!content || !content.trim()) {
+            return defaultValue;
+        }
+        return JSON.parse(content);
+    } catch (e) {
+        console.error(`读取JSON文件失败 ${filePath}:`, e);
+        return defaultValue;
+    }
+}
+
 const fileLocks = new Map();
 async function withFileLock(filePath, operation) {
     while (fileLocks.has(filePath)) {
@@ -82,7 +98,15 @@ apiRouter.post('/device/register', async (req, res) => {
         const devicesFile = path.join(DEVICES_DIR, 'registry.json');
         
         if (fs.existsSync(devicesFile)) {
-            devices = JSON.parse(fs.readFileSync(devicesFile, 'utf8'));
+            try {
+                const content = fs.readFileSync(devicesFile, 'utf8');
+                if (content && content.trim()) {
+                    devices = JSON.parse(content);
+                }
+            } catch (e) {
+                console.error('解析设备注册文件失败:', e);
+                devices = [];
+            }
         }
         
         let existingDevice = devices.find(d => d.deviceId === deviceId);
@@ -122,17 +146,7 @@ apiRouter.post('/device/register', async (req, res) => {
 
 apiRouter.get('/devices', (req, res) => {
     const devicesFile = path.join(DEVICES_DIR, 'registry.json');
-    
-    if (!fs.existsSync(devicesFile)) {
-        res.json({
-            success: true,
-            devices: [],
-            total: 0
-        });
-        return;
-    }
-    
-    const devices = JSON.parse(fs.readFileSync(devicesFile, 'utf8'));
+    const devices = safeReadJSON(devicesFile, []);
     
     res.json({
         success: true,
@@ -160,8 +174,9 @@ apiRouter.put('/device/:deviceId/name', async (req, res) => {
     
     await withFileLock(DEVICES_DIR, async () => {
         const devicesFile = path.join(DEVICES_DIR, 'registry.json');
+        let devices = safeReadJSON(devicesFile, []);
         
-        if (!fs.existsSync(devicesFile)) {
+        if (!devices || devices.length === 0) {
             res.status(404).json({
                 success: false,
                 error: '设备不存在'
@@ -169,7 +184,6 @@ apiRouter.put('/device/:deviceId/name', async (req, res) => {
             return;
         }
         
-        let devices = JSON.parse(fs.readFileSync(devicesFile, 'utf8'));
         const deviceIndex = devices.findIndex(d => d.deviceId === deviceId);
         
         if (deviceIndex === -1) {
@@ -243,8 +257,9 @@ apiRouter.post('/usage/sync', async (req, res) => {
                 lastSyncAt: new Date().toISOString()
             };
             
-            if (fs.existsSync(usageFile)) {
-                dailyData = JSON.parse(fs.readFileSync(usageFile, 'utf8'));
+            const existingData = safeReadJSON(usageFile, null);
+            if (existingData) {
+                dailyData = existingData;
             }
             
             dateRecords.forEach(newRecord => {
@@ -275,8 +290,8 @@ apiRouter.post('/usage/sync', async (req, res) => {
     
     await withFileLock(DEVICES_DIR, async () => {
         const devicesFile = path.join(DEVICES_DIR, 'registry.json');
-        if (fs.existsSync(devicesFile)) {
-            let devices = JSON.parse(fs.readFileSync(devicesFile, 'utf8'));
+        let devices = safeReadJSON(devicesFile, []);
+        if (devices && devices.length > 0) {
             const deviceIndex = devices.findIndex(d => d.deviceId === deviceId);
             if (deviceIndex !== -1) {
                 devices[deviceIndex].lastActiveAt = new Date().toISOString();
@@ -310,7 +325,7 @@ apiRouter.get('/usage/:deviceId/:date', (req, res) => {
         return;
     }
     
-    const data = JSON.parse(fs.readFileSync(usageFile, 'utf8'));
+    const data = safeReadJSON(usageFile, { date: date, records: [], isEmpty: true });
     
     res.json({
         success: true,
@@ -350,8 +365,10 @@ apiRouter.get('/usage/:deviceId/range', (req, res) => {
             const fileDate = file.replace('.json', '');
             if (fileDate >= startDate && fileDate <= endDate) {
                 const filePath = path.join(deviceUsageDir, file);
-                const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-                allData.push(data);
+                const data = safeReadJSON(filePath, null);
+                if (data) {
+                    allData.push(data);
+                }
             }
         }
     });

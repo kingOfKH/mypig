@@ -9,8 +9,6 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 const HOST = '0.0.0.0';
 
-const SECURITY_TOKEN = process.env.API_TOKEN || 'gd_starclick_2026';
-
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -63,21 +61,6 @@ function safeWriteJSON(filePath, data) {
         return false;
     }
 }
-
-function validateToken(req, res, next) {
-    const token = req.query.token || req.headers['x-api-token'];
-    
-    if (!token || token !== SECURITY_TOKEN) {
-        res.status(403).json({
-            success: false,
-            error: 'Access denied'
-        });
-        return;
-    }
-    
-    next();
-}
-
 const fileLocks = new Map();
 async function withFileLock(filePath, operation) {
     while (fileLocks.has(filePath)) {
@@ -91,17 +74,26 @@ async function withFileLock(filePath, operation) {
     }
 }
 
-app.get('/gdtest/status', validateToken, (req, res) => {
+app.get('/', (req, res) => {
     res.json({
         success: true,
-        status: 'running',
-        timestamp: new Date().toISOString()
+        message: 'StarClick Web Server - 应用使用记录云端存储',
+        version: '2.0.0',
+        timestamp: new Date().toISOString(),
+        endpoints: {
+            'GET /': '服务器信息',
+            'GET /api/health': '健康检查',
+            'POST /api/device/register': '注册设备',
+            'GET /api/devices': '获取所有设备列表',
+            'POST /api/usage/sync': '增量同步使用记录',
+            'GET /api/usage/:deviceId/:date': '获取指定设备日期数据',
+            'GET /api/usage/:deviceId/range': '获取日期范围数据',
+            'PUT /api/device/:deviceId/name': '更新设备名称'
+        }
     });
 });
 
 const apiRouter = express.Router();
-
-apiRouter.use(validateToken);
 
 apiRouter.get('/health', (req, res) => {
     res.json({
@@ -465,10 +457,22 @@ function formatDate(timestamp) {
 
 app.listen(PORT, HOST, () => {
     console.log('=================================');
-    console.log('  Service Started');
+    console.log('  StarClick Web Server v2.0');
+    console.log('  应用使用记录云端存储');
     console.log('=================================');
-    console.log(`Port: ${PORT}`);
-    console.log(`Time: ${new Date().toLocaleString('zh-CN')}`);
+    console.log(`服务运行在: http://${HOST}:${PORT}`);
+    console.log(`环境: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`启动时间: ${new Date().toLocaleString('zh-CN')}`);
+    console.log('=================================');
+    console.log('可用的API接口:');
+    console.log(`  GET  /                          服务器信息`);
+    console.log(`  GET  /api/health                健康检查`);
+    console.log(`  POST /api/device/register       注册设备`);
+    console.log(`  GET  /api/devices               获取设备列表`);
+    console.log(`  PUT  /api/device/:id/name       更新设备名称`);
+    console.log(`  POST /api/usage/sync            增量同步记录`);
+    console.log(`  GET  /api/usage/:id/:date       获取日期数据`);
+    console.log(`  GET  /api/usage/:id/range       获取范围数据`);
     console.log('=================================');
 });
 

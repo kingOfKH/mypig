@@ -29,13 +29,17 @@ ensureDirectories();
 function safeReadJSON(filePath, defaultValue = null) {
     try {
         if (!fs.existsSync(filePath)) {
+            console.log(`文件不存在: ${filePath}, 返回默认值`);
             return defaultValue;
         }
         const content = fs.readFileSync(filePath, 'utf8');
         if (!content || !content.trim()) {
+            console.log(`文件为空: ${filePath}, 返回默认值`);
             return defaultValue;
         }
-        return JSON.parse(content);
+        const data = JSON.parse(content);
+        console.log(`成功读取文件: ${filePath}, 数据: ${JSON.stringify(data).substring(0, 100)}`);
+        return data;
     } catch (e) {
         console.error(`读取JSON文件失败 ${filePath}:`, e);
         return defaultValue;
@@ -47,8 +51,10 @@ function safeWriteJSON(filePath, data) {
         const dir = path.dirname(filePath);
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
+            console.log(`创建目录: ${dir}`);
         }
         fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+        console.log(`成功写入文件: ${filePath}, 数据: ${JSON.stringify(data).substring(0, 100)}`);
         return true;
     } catch (e) {
         console.error(`写入JSON文件失败 ${filePath}:`, e);

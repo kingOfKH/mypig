@@ -227,7 +227,7 @@ apiRouter.put('/device/:deviceId/name', async (req, res) => {
 });
 
 apiRouter.post('/usage/sync', async (req, res) => {
-    const { deviceId, records, deletedIds } = req.body;
+    const { deviceId, deviceName, records, deletedIds } = req.body;
     
     if (!deviceId) {
         res.status(400).json({
@@ -236,6 +236,29 @@ apiRouter.post('/usage/sync', async (req, res) => {
         });
         return;
     }
+    
+    await withFileLock(DEVICES_DIR, async () => {
+        const devicesFile = path.join(DEVICES_DIR, 'registry.json');
+        let devices = safeReadJSON(devicesFile, []);
+        
+        let existingDevice = devices.find(d => d.deviceId === deviceId);
+        if (!existingDevice) {
+            console.log(`同步时发现新设备，自动注册: ${deviceId}`);
+            const newDevice = {
+                deviceId: deviceId,
+                deviceName: deviceName || `设备${devices.length + 1}`,
+                createdAt: new Date().toISOString(),
+                lastActiveAt: new Date().toISOString()
+            };
+            devices.push(newDevice);
+            safeWriteJSON(devicesFile, devices);
+            
+            const deviceUsageDir = path.join(USAGE_DIR, deviceId);
+            if (!fs.existsSync(deviceUsageDir)) {
+                fs.mkdirSync(deviceUsageDir, { recursive: true });
+            }
+        }
+    });
     
     if (!records || !Array.isArray(records) || records.length === 0) {
         res.json({

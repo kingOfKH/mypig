@@ -42,6 +42,20 @@ function safeReadJSON(filePath, defaultValue = null) {
     }
 }
 
+function safeWriteJSON(filePath, data) {
+    try {
+        const dir = path.dirname(filePath);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+        return true;
+    } catch (e) {
+        console.error(`写入JSON文件失败 ${filePath}:`, e);
+        return false;
+    }
+}
+
 const fileLocks = new Map();
 async function withFileLock(filePath, operation) {
     while (fileLocks.has(filePath)) {
@@ -132,7 +146,7 @@ apiRouter.post('/device/register', async (req, res) => {
             
             devices.push(newDevice);
             console.log(`新设备注册: ${newDevice.deviceId}, 总设备数: ${devices.length}`);
-            fs.writeFileSync(devicesFile, JSON.stringify(devices, null, 2));
+            safeWriteJSON(devicesFile, devices);
             
             const deviceUsageDir = path.join(USAGE_DIR, newDevice.deviceId);
             if (!fs.existsSync(deviceUsageDir)) {
@@ -202,7 +216,7 @@ apiRouter.put('/device/:deviceId/name', async (req, res) => {
         devices[deviceIndex].deviceName = deviceName.trim();
         devices[deviceIndex].lastActiveAt = new Date().toISOString();
         
-        fs.writeFileSync(devicesFile, JSON.stringify(devices, null, 2));
+        safeWriteJSON(devicesFile, devices);
         
         res.json({
             success: true,
@@ -289,7 +303,7 @@ apiRouter.post('/usage/sync', async (req, res) => {
             }
             
             dailyData.lastSyncAt = new Date().toISOString();
-            fs.writeFileSync(usageFile, JSON.stringify(dailyData, null, 2));
+            safeWriteJSON(usageFile, dailyData);
         });
     }
     
@@ -300,7 +314,7 @@ apiRouter.post('/usage/sync', async (req, res) => {
             const deviceIndex = devices.findIndex(d => d.deviceId === deviceId);
             if (deviceIndex !== -1) {
                 devices[deviceIndex].lastActiveAt = new Date().toISOString();
-                fs.writeFileSync(devicesFile, JSON.stringify(devices, null, 2));
+                safeWriteJSON(devicesFile, devices);
             }
         }
     });

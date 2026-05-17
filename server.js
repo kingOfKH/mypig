@@ -79,7 +79,7 @@ app.get('/', (req, res) => {
         success: true,
         message: 'StarClick Web Server - 应用使用记录云端存储',
         version: '2.0.0',
-        timestamp: new Date().toISOString(),
+        timestamp: getChinaTime(),
         endpoints: {
             'GET /': '服务器信息',
             'GET /api/health': '健康检查',
@@ -101,7 +101,7 @@ apiRouter.get('/health', (req, res) => {
         status: 'healthy',
         uptime: process.uptime(),
         memory: process.memoryUsage(),
-        timestamp: new Date().toISOString(),
+        timestamp: getChinaTime(),
         dataStats: {
             devices: fs.existsSync(DEVICES_DIR) ? fs.readdirSync(DEVICES_DIR).length : 0,
             storageType: 'JSON File System'
@@ -135,8 +135,8 @@ apiRouter.post('/device/register', async (req, res) => {
             const newDevice = {
                 deviceId: deviceId || generateDeviceId(),
                 deviceName: deviceName || `设备${devices.length + 1}`,
-                createdAt: new Date().toISOString(),
-                lastActiveAt: new Date().toISOString()
+                createdAt: getChinaTime(),
+                lastActiveAt: getChinaTime()
             };
             
             devices.push(newDevice);
@@ -210,7 +210,7 @@ apiRouter.put('/device/:deviceId/name', async (req, res) => {
         }
         
         devices[deviceIndex].deviceName = deviceName.trim();
-        devices[deviceIndex].lastActiveAt = new Date().toISOString();
+        devices[deviceIndex].lastActiveAt = getChinaTime();
         
         safeWriteJSON(devicesFile, devices);
         
@@ -244,8 +244,8 @@ apiRouter.post('/usage/sync', async (req, res) => {
             const newDevice = {
                 deviceId: deviceId,
                 deviceName: deviceName || `设备${devices.length + 1}`,
-                createdAt: new Date().toISOString(),
-                lastActiveAt: new Date().toISOString()
+                createdAt: getChinaTime(),
+                lastActiveAt: getChinaTime()
             };
             devices.push(newDevice);
             safeWriteJSON(devicesFile, devices);
@@ -293,7 +293,7 @@ apiRouter.post('/usage/sync', async (req, res) => {
             let dailyData = {
                 date: date,
                 records: [],
-                lastSyncAt: new Date().toISOString()
+                lastSyncAt: getChinaTime()
             };
             
             const existingData = safeReadJSON(usageFile, null);
@@ -322,7 +322,7 @@ apiRouter.post('/usage/sync', async (req, res) => {
                 results.deleted += deletedIds.length;
             }
             
-            dailyData.lastSyncAt = new Date().toISOString();
+            dailyData.lastSyncAt = getChinaTime();
             safeWriteJSON(usageFile, dailyData);
         });
     }
@@ -332,7 +332,7 @@ apiRouter.post('/usage/sync', async (req, res) => {
         if (devices && devices.length > 0) {
             const deviceIndex = devices.findIndex(d => d.deviceId === deviceId);
             if (deviceIndex !== -1) {
-                devices[deviceIndex].lastActiveAt = new Date().toISOString();
+                devices[deviceIndex].lastActiveAt = getChinaTime();
                 safeWriteJSON(devicesFile, devices);
             }
         }
@@ -342,7 +342,7 @@ apiRouter.post('/usage/sync', async (req, res) => {
         success: true,
         message: '同步成功',
         results: results,
-        syncedAt: new Date().toISOString()
+        syncedAt: getChinaTime()
     });
 });
 
@@ -453,6 +453,13 @@ function formatDate(timestamp) {
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
     return `${year}-${month}-${day}`;
+}
+
+function getChinaTime() {
+    const now = new Date();
+    const chinaTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+    const iso = chinaTime.toISOString();
+    return iso.replace('Z', '+08:00');
 }
 
 app.listen(PORT, HOST, () => {

@@ -115,22 +115,12 @@ apiRouter.post('/device/register', async (req, res) => {
     
     console.log(`设备注册请求: deviceId=${deviceId}, deviceName=${deviceName}`);
     
-    await withFileLock(DEVICES_DIR, async () => {
-        let devices = [];
-        const devicesFile = path.join(DEVICES_DIR, 'registry.json');
+    const devicesFile = path.join(DEVICES_DIR, 'registry.json');
+    
+    await withFileLock(devicesFile, async () => {
+        let devices = safeReadJSON(devicesFile, []);
         
-        if (fs.existsSync(devicesFile)) {
-            try {
-                const content = fs.readFileSync(devicesFile, 'utf8');
-                if (content && content.trim()) {
-                    devices = JSON.parse(content);
-                    console.log(`当前已注册设备数: ${devices.length}, 设备列表: ${devices.map(d => d.deviceId).join(', ')}`);
-                }
-            } catch (e) {
-                console.error('解析设备注册文件失败:', e);
-                devices = [];
-            }
-        }
+        console.log(`当前已注册设备数: ${devices.length}, 设备列表: ${devices.map(d => d.deviceId).join(', ')}`);
         
         let existingDevice = devices.find(d => d.deviceId === deviceId);
         
@@ -197,8 +187,9 @@ apiRouter.put('/device/:deviceId/name', async (req, res) => {
         return;
     }
     
-    await withFileLock(DEVICES_DIR, async () => {
-        const devicesFile = path.join(DEVICES_DIR, 'registry.json');
+    const devicesFile = path.join(DEVICES_DIR, 'registry.json');
+    
+    await withFileLock(devicesFile, async () => {
         let devices = safeReadJSON(devicesFile, []);
         
         if (!devices || devices.length === 0) {
@@ -243,8 +234,9 @@ apiRouter.post('/usage/sync', async (req, res) => {
         return;
     }
     
-    await withFileLock(DEVICES_DIR, async () => {
-        const devicesFile = path.join(DEVICES_DIR, 'registry.json');
+    const devicesFile = path.join(DEVICES_DIR, 'registry.json');
+    
+    await withFileLock(devicesFile, async () => {
         let devices = safeReadJSON(devicesFile, []);
         
         let existingDevice = devices.find(d => d.deviceId === deviceId);
@@ -336,8 +328,8 @@ apiRouter.post('/usage/sync', async (req, res) => {
         });
     }
     
-    await withFileLock(DEVICES_DIR, async () => {
-        const devicesFile = path.join(DEVICES_DIR, 'registry.json');
+    const devicesFile = path.join(DEVICES_DIR, 'registry.json');
+    await withFileLock(devicesFile, async () => {
         let devices = safeReadJSON(devicesFile, []);
         if (devices && devices.length > 0) {
             const deviceIndex = devices.findIndex(d => d.deviceId === deviceId);

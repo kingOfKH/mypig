@@ -328,7 +328,6 @@ apiRouter.post('/usage/sync', async (req, res) => {
         });
     }
     
-    const devicesFile = path.join(DEVICES_DIR, 'registry.json');
     await withFileLock(devicesFile, async () => {
         let devices = safeReadJSON(devicesFile, []);
         if (devices && devices.length > 0) {

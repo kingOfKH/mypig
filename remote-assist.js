@@ -350,7 +350,8 @@ async function handleMessage(ws, m) {
         case 'rtc.offer':
         case 'rtc.answer':
         case 'rtc.ice':
-        case 'rtc.meta': {
+        case 'rtc.meta':
+        case 'rtc.quality': {
             const session = sessions.get(sid);
             if (!session || session.status === 'terminated') {
                 ws.send(JSON.stringify({ op: 'error', sid, payload: { msg: 'no_session' } }));

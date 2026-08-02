@@ -4,6 +4,8 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
+const remoteAssist = require('./remote-assist');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -12,6 +14,11 @@ const HOST = '0.0.0.0';
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
+
+// 健康检查端点（供 App "测试连接" 功能使用）
+app.get('/api/health', (req, res) => {
+    res.json({ ok: true, ts: Date.now() });
+});
 
 const DATA_DIR = path.join(__dirname, 'data');
 const DEVICES_DIR = path.join(DATA_DIR, 'devices');
@@ -88,7 +95,9 @@ app.get('/', (req, res) => {
             'POST /api/usage/sync': '增量同步使用记录',
             'GET /api/usage/:deviceId/:date': '获取指定设备日期数据',
             'GET /api/usage/:deviceId/range': '获取日期范围数据',
-            'PUT /api/device/:deviceId/name': '更新设备名称'
+            'PUT /api/device/:deviceId/name': '更新设备名称',
+            'WS  /ws/remote': '远程协助信令通道 (?deviceId=&token=)',
+            'POST /api/remote/subscription': '设置/查询远程协助订阅套餐'
         }
     });
 });
@@ -421,6 +430,26 @@ apiRouter.get('/usage/:deviceId/range', (req, res) => {
     });
 });
 
+// ---- 远程协助：订阅套餐设置/查询 ----
+apiRouter.post('/remote/subscription', (req, res) => {
+    const { deviceId, plan } = req.body || {};
+    if (!deviceId) {
+        res.status(400).json({ success: false, error: '缺少 deviceId' });
+        return;
+    }
+    if (plan) {
+        const allowed = ['free', 'pro', 'flag'];
+        if (!allowed.includes(plan)) {
+            res.status(400).json({ success: false, error: '非法套餐' });
+            return;
+        }
+        remoteAssist.setSubscription(deviceId, plan);
+        res.json({ success: true, message: '套餐已更新', plan });
+    } else {
+        res.json({ success: true, plan: remoteAssist.getPlan(deviceId) });
+    }
+});
+
 app.use('/api', apiRouter);
 
 app.use((req, res) => {
@@ -462,7 +491,7 @@ function getChinaTime() {
     return iso.replace('Z', '+08:00');
 }
 
-app.listen(PORT, HOST, () => {
+const server = app.listen(PORT, HOST, () => {
     console.log('=================================');
     console.log('  StarClick Web Server v2.0');
     console.log('  应用使用记录云端存储');
@@ -480,7 +509,14 @@ app.listen(PORT, HOST, () => {
     console.log(`  POST /api/usage/sync            增量同步记录`);
     console.log(`  GET  /api/usage/:id/:date       获取日期数据`);
     console.log(`  GET  /api/usage/:id/range       获取范围数据`);
+    console.log(`  POST /api/remote/subscription   远程协助套餐`);
+    console.log(`  WS   /ws/remote                 远程协助信令通道`);
     console.log('=================================');
 });
+
+// 挂载远程协助 WebSocket 信令通道（复用同一 HTTP 服务，不另起端口）
+remoteAssist.attach(server);
+remoteAssist.startTimeoutWatchdog();
+console.log('[remote] 远程协助信令模块已挂载: /ws/remote');
 
 module.exports = app;

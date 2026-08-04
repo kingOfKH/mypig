@@ -234,6 +234,25 @@ function relayTo(deviceId, obj) {
     return false;
 }
 
+// ---- 二进制视频帧中转（CS 中继模式）----
+// 帧格式：[1B type][4B sidLen(大端)][sid UTF8][NALU 原始字节]
+// 服务端不解析 NALU，仅按 sid 找到对端 session 并原样转发整段 Buffer（含帧头，
+// 由客户端自行解析 type/sid 后取 NALU）。type 目前固定 1=视频，预留扩展音频/控制。
+function relayBinary(deviceId, buf) {
+    if (!Buffer.isBuffer(buf) || buf.length < 5) return;
+    const type = buf.readUInt8(0);
+    const sidLen = buf.readUInt32BE(1);
+    if (buf.length < 5 + sidLen) return;
+    const sid = buf.toString('utf8', 5, 5 + sidLen);
+    const session = sessions.get(sid);
+    if (!session || session.status === 'terminated') return;
+    const peer = peerOf(session, deviceId);
+    const peerWs = online.get(peer);
+    if (peerWs && peerWs.readyState === peerWs.OPEN) {
+        try { peerWs.send(buf); } catch (e) { /* 忽略单次发送失败 */ }
+    }
+}
+
 // ---- 认证（复用 server.js 的 deviceId token 思路） ----
 // 这里采用轻量方案：WebSocket 连接时通过 query ?token=xxx&deviceId=xxx 传递；
 // token 校验交由调用方提供的 verify 函数（server.js 注入），默认放行 demo。
@@ -263,6 +282,12 @@ function attach(httpServer) {
         ws.on('pong', () => { ws.isAlive = true; });
 
         ws.on('message', async (raw) => {
+            // 二进制帧 = 视频流（CS 中继模式）：[1B type][4B sidLen][sid UTF8][NALU bytes]
+            // 与 JSON 信令帧区分：ws 库收到二进制时为 Buffer，文本时为 string。
+            if (Buffer.isBuffer(raw)) {
+                relayBinary(deviceId, raw);
+                return;
+            }
             let m;
             try { m = JSON.parse(raw.toString()); } catch (e) {
                 return ws.send(JSON.stringify({ op: 'error', payload: { msg: 'invalid_json' } }));

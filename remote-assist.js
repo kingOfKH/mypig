@@ -449,11 +449,41 @@ function startTimeoutWatchdog() {
     }, 30 * 1000);
 }
 
+// ---- ICE 配置下发（含 TURN 中继）----
+// 跨网络（4G/对称 NAT）直连失败时，WebRTC 必须走 TURN 中继才能建立媒体通道，否则控制端黑屏。
+// TURN 凭证通过环境变量配置（避免硬编码到客户端 / 防被盗刷）：
+//   TURN_URL        可多个，用 | 分隔，例如 turn:turn.example.com:3478?transport=udp|turns:turn.example.com:5349
+//   TURN_USERNAME   长期凭证用户名
+//   TURN_CREDENTIAL 长期凭证密码
+function getIceConfig() {
+    const servers = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+    ];
+    const turnUrl = process.env.TURN_URL;
+    if (turnUrl && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+        for (const raw of turnUrl.split('|')) {
+            const u = raw.trim();
+            if (!u) continue;
+            servers.push({
+                urls: u,
+                username: process.env.TURN_USERNAME,
+                credential: process.env.TURN_CREDENTIAL,
+            });
+        }
+        console.log(`[ice] 已加载 TURN 配置，共 ${turnUrl.split('|').filter(Boolean).length} 个 TURN 服务器`);
+    } else {
+        console.log('[ice] 未配置 TURN 环境变量，仅使用公共 STUN（跨网络可能无法直连）');
+    }
+    return { iceServers: servers };
+}
+
 module.exports = {
     attach,
     registerVerify,
     setSubscription,
     getPlan,
+    getIceConfig,
     startTimeoutWatchdog,
     _internal: { online, sessions, consumeControlCode, createControlCode },
 };

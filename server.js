@@ -491,6 +491,11 @@ function getChinaTime() {
     return iso.replace('Z', '+08:00');
 }
 
+// ICE 配置下发（含 TURN 中继），供客户端在建立 WebRTC 前拉取，避免 TURN 凭证硬编码到客户端
+app.get('/api/ice-config', (req, res) => {
+    res.json(remoteAssist.getIceConfig());
+});
+
 const server = app.listen(PORT, HOST, () => {
     console.log('=================================');
     console.log('  StarClick Web Server v2.0');

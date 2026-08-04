@@ -458,6 +458,20 @@ app.get('/api/ice-config', (req, res) => {
     res.json(remoteAssist.getIceConfig());
 });
 
+// 临时诊断接口：用于确认服务端是否正确读到了 TURN 环境变量（部署排查用，上线后可删除）
+app.get('/api/ice-debug', (req, res) => {
+    const turnUrl = process.env.TURN_URL;
+    const hasUser = !!process.env.TURN_USERNAME;
+    const hasCred = !!process.env.TURN_CREDENTIAL;
+    res.json({
+        turnUrlConfigured: !!turnUrl,
+        turnUrlValue: turnUrl ? turnUrl.replace(/:(.*)@/, ':***@') : null, // 脱敏：隐藏可能内嵌的凭证
+        turnUsernameConfigured: hasUser,
+        turnCredentialConfigured: hasCred,
+        allThreeOk: !!(turnUrl && hasUser && hasCred),
+    });
+});
+
 app.use((req, res) => {
     res.status(404).json({
         success: false,

@@ -351,7 +351,8 @@ async function handleMessage(ws, m) {
         case 'rtc.answer':
         case 'rtc.ice':
         case 'rtc.meta':
-        case 'rtc.quality': {
+        case 'rtc.quality':
+        case 'rtc.connected': {
             const session = sessions.get(sid);
             if (!session || session.status === 'terminated') {
                 ws.send(JSON.stringify({ op: 'error', sid, payload: { msg: 'no_session' } }));
@@ -378,9 +379,10 @@ async function handleMessage(ws, m) {
                 ws.send(JSON.stringify({ op: 'error', sid, payload: { msg: 'no_session' } }));
                 break;
             }
-            // 仅控制端可下发指令
+            // 控制端可下发操作指令；被控端仅会回发 PONG（端到端延时应答），同样走 cmd 通道。
+            // 被控端发来的 cmd 一律转发给控制端，不再以 not_controller 拒绝（否则 PONG 被拒导致刷屏报错）。
             if (session.controller !== deviceId) {
-                ws.send(JSON.stringify({ op: 'error', sid, payload: { msg: 'not_controller' } }));
+                relayTo(session.controller, { op: 'cmd', sid, payload: m.payload });
                 break;
             }
             session.lastActivity = nowMs();

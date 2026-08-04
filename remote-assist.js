@@ -270,9 +270,11 @@ function attach(httpServer) {
         const token = url.searchParams.get('token');
 
         if (!deviceId || !verifyToken(deviceId, token)) {
+            console.warn(`[remote] 连接被拒 unauthorized deviceId=${deviceId} token=${token ? '***' : '(空)'}`);
             try { ws.close(4001, 'unauthorized'); } catch (e) {}
             return;
         }
+        console.log(`[remote] 新 WebSocket 连接建立 deviceId=${deviceId}（此时在线 ${online.size} 台）`);
 
         ws.deviceId = deviceId;
         ws.isAlive = true;
@@ -282,16 +284,43 @@ function attach(httpServer) {
         ws.on('pong', () => { ws.isAlive = true; });
 
         ws.on('message', async (raw) => {
+            // 调试：无条件打印原始消息类型与长度，无论文本/二进制，便于定位"客户端发了但服务端没反应"
+            const isBuf = Buffer.isBuffer(raw);
+            const t = isBuf ? `BINARY(${raw.length}B)` : `TEXT(${String(raw).length}ch)`;
+            console.log(`[remote][raw] deviceId=${deviceId} type=${t} head=${isBuf ? raw.slice(0, 12).toString('hex') : String(raw).slice(0, 80)}`);
+
+            // 容错：客户端（OkHttp）可能把 JSON 信令以二进制帧(opcode=0x2)发出，
+            // 此时 raw 是 Buffer 但内容其实是 UTF-8 的 JSON 文本（以 '{' 开头）。
+            // 视频流是真正的二进制 NALU（首字节为 type=0x01），不会以 '{' 开头，
+            // 因此用"首字节是否为 '{' 且能 JSON.parse"来把信令从二进制帧中识别出来。
+            const buf = isBuf ? raw : Buffer.from(raw);
+            const looksLikeJson = buf.length > 0 && buf[0] === 0x7b; // '{'
+            if (looksLikeJson) {
+                let m;
+                try { m = JSON.parse(buf.toString('utf8')); } catch (e) {
+                    return ws.send(JSON.stringify({ op: 'error', payload: { msg: 'invalid_json' } }));
+                }
+                console.log(`[remote] 收到消息(二进制承载的JSON) deviceId=${deviceId} op=${m && m.op} sid=${m && m.sid || ''}`);
+                try {
+                    await handleMessage(ws, m);
+                } catch (e) {
+                    console.error('[remote] 处理消息异常', e);
+                    ws.send(JSON.stringify({ op: 'error', payload: { msg: 'internal', detail: String(e && e.message) } }));
+                }
+                return;
+            }
+
             // 二进制帧 = 视频流（CS 中继模式）：[1B type][4B sidLen][sid UTF8][NALU bytes]
-            // 与 JSON 信令帧区分：ws 库收到二进制时为 Buffer，文本时为 string。
-            if (Buffer.isBuffer(raw)) {
+            if (isBuf) {
                 relayBinary(deviceId, raw);
                 return;
             }
+            // 其余文本（理论上不会到这，纯文本信令也已在上面 JSON 分支处理）
             let m;
             try { m = JSON.parse(raw.toString()); } catch (e) {
                 return ws.send(JSON.stringify({ op: 'error', payload: { msg: 'invalid_json' } }));
             }
+            console.log(`[remote] 收到消息 deviceId=${deviceId} op=${m && m.op} sid=${m && m.sid || ''}`);
             try {
                 await handleMessage(ws, m);
             } catch (e) {
@@ -340,9 +369,12 @@ async function handleMessage(ws, m) {
 
     switch (m.op) {
         case 'code.create': {
+            console.log(`[remote] >>> code.create 来自 deviceId=${deviceId}，开始生成控制码`);
             const rec = await createControlCode(deviceId);
             await audit(rec.code, deviceId, 'open', 'create_code');
-            ws.send(JSON.stringify({ op: 'code.created', payload: { code: rec.code, expiresAt: rec.expiresAt } }));
+            const resp = JSON.stringify({ op: 'code.created', payload: { code: rec.code, expiresAt: rec.expiresAt } });
+            console.log(`[remote] <<< 回包 code.created code=${rec.code} -> ${resp}`);
+            ws.send(resp);
             break;
         }
 

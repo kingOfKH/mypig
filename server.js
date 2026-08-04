@@ -452,6 +452,12 @@ apiRouter.post('/remote/subscription', (req, res) => {
 
 app.use('/api', apiRouter);
 
+// ICE 配置下发（含 TURN 中继），供客户端在建立 WebRTC 前拉取，避免 TURN 凭证硬编码到客户端
+// 注意：必须放在 404 兜底中间件（app.use((req,res)=>...)）之前，否则会被拦截返回"未找到该接口"
+app.get('/api/ice-config', (req, res) => {
+    res.json(remoteAssist.getIceConfig());
+});
+
 app.use((req, res) => {
     res.status(404).json({
         success: false,
@@ -490,11 +496,6 @@ function getChinaTime() {
     const iso = chinaTime.toISOString();
     return iso.replace('Z', '+08:00');
 }
-
-// ICE 配置下发（含 TURN 中继），供客户端在建立 WebRTC 前拉取，避免 TURN 凭证硬编码到客户端
-app.get('/api/ice-config', (req, res) => {
-    res.json(remoteAssist.getIceConfig());
-});
 
 const server = app.listen(PORT, HOST, () => {
     console.log('=================================');

@@ -238,6 +238,11 @@ function relayTo(deviceId, obj) {
 // 帧格式：[1B type][4B sidLen(大端)][sid UTF8][NALU 原始字节]
 // 服务端不解析 NALU，仅按 sid 找到对端 session 并原样转发整段 Buffer（含帧头，
 // 由客户端自行解析 type/sid 后取 NALU）。type 目前固定 1=视频，预留扩展音频/控制。
+// 中继背压阈值：对端发送缓冲区超过该字节数，说明客户端消费慢（弱网/卡顿），
+// 此时丢弃非关键帧(P帧)，只保关键帧(IDR/SPS-PPS)与最新帧，避免延迟无限堆积。
+// 实时流允许"丢旧帧保新帧"以提升流畅度与降低端到端延迟。
+const RELAY_BACKPRESSURE_BYTES = 512 * 1024; // 512KB
+
 function relayBinary(deviceId, buf) {
     if (!Buffer.isBuffer(buf) || buf.length < 5) return;
     const type = buf.readUInt8(0);
@@ -249,7 +254,15 @@ function relayBinary(deviceId, buf) {
     const peer = peerOf(session, deviceId);
     const peerWs = online.get(peer);
     if (peerWs && peerWs.readyState === peerWs.OPEN) {
-        try { peerWs.send(buf); } catch (e) { /* 忽略单次发送失败 */ }
+        // 背压丢帧：仅对非关键帧(P帧,type==2)在缓冲区积压时丢弃；
+        // 关键帧(type==1，含 IDR/SPS/PPS)必须送达，否则对端解码器无法重建参考帧。
+        try {
+            if (peerWs.bufferedAmount > RELAY_BACKPRESSURE_BYTES && type === 2) {
+                session.droppedFrames = (session.droppedFrames || 0) + 1;
+                return;
+            }
+            peerWs.send(buf);
+        } catch (e) { /* 忽略单次发送失败 */ }
     }
 }
 
@@ -427,6 +440,25 @@ async function handleMessage(ws, m) {
             session.status = 'streaming';
             session.lastActivity = nowMs();
             await persistSession(session, 'streaming');
+            break;
+        }
+
+        case 'keyframe.request': {
+            // 控制端检测到卡顿/丢包，请求被控端立即输出 IDR 关键帧以快速恢复解码。
+            // 仅允许控制端发起，转发给对端被控端。
+            const session = sessions.get(sid);
+            if (!session || session.status === 'terminated') {
+                ws.send(JSON.stringify({ op: 'error', sid, payload: { msg: 'no_session' } }));
+                break;
+            }
+            if (session.controller !== deviceId) {
+                // 仅控制端可发起关键帧请求
+                ws.send(JSON.stringify({ op: 'error', sid, payload: { msg: 'not_controller' } }));
+                break;
+            }
+            session.lastActivity = nowMs();
+            relayTo(session.host, { op: 'keyframe.request', sid, payload: m.payload || {} });
+            console.log(`[remote] keyframe.request controller=${deviceId} -> host=${session.host} sid=${sid}`);
             break;
         }
 

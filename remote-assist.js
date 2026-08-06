@@ -89,9 +89,23 @@ function gen6() {
 }
 function nowMs() { return Date.now(); }
 
+// ---- 订阅缓存（避免每次 code.connect 都同步读文件阻塞事件循环）----
+let subscriptionCache = null;
+function loadSubscriptionCache() {
+    try {
+        if (fs.existsSync(SUBSCRIPTION_FILE)) {
+            const c = fs.readFileSync(SUBSCRIPTION_FILE, 'utf8');
+            if (c && c.trim()) subscriptionCache = JSON.parse(c);
+        }
+    } catch (e) {
+        console.error('[remote] 订阅缓存加载失败', e);
+    }
+    if (!subscriptionCache) subscriptionCache = {};
+}
+loadSubscriptionCache();
+
 function getPlan(deviceId) {
-    const subs = readJson(SUBSCRIPTION_FILE, {});
-    return subs[deviceId] || 'free';
+    return subscriptionCache[deviceId] || 'free';
 }
 
 function genSessionId() {
@@ -119,21 +133,25 @@ function peerOf(session, deviceId) {
     return session.controller === deviceId ? session.host : session.controller;
 }
 
-// ---- 审计 ----
+// ---- 审计（append-only，避免每条 cmd 都 read-modify-write 整个文件阻塞事件循环）----
+const AUDIT_LOG_FILE = path.join(DATA_DIR, 'audit.log');
+let auditStream = null;
+try {
+    auditStream = fs.createWriteStream(AUDIT_LOG_FILE, { flags: 'a' });
+} catch (e) {
+    console.error('[remote] 审计日志流创建失败', e);
+}
+
 async function audit(sessionId, actor, action, detail) {
-    await withFileLock(AUDIT_FILE, async () => {
-        const list = readJson(AUDIT_FILE, []);
-        list.push({
-            sessionId,
-            actor,
-            action,          // open | connect | cmd | terminate
-            detail: detail || null,  // 脱敏摘要，如 click@(540,1200)
-            ts: nowMs(),
-        });
-        // 简单裁剪，避免无限增长
-        if (list.length > 20000) list.splice(0, list.length - 20000);
-        writeJson(AUDIT_FILE, list);
-    });
+    if (!auditStream) return;
+    const line = JSON.stringify({
+        sessionId,
+        actor,
+        action,
+        detail: detail || null,
+        ts: nowMs(),
+    }) + '\n';
+    auditStream.write(line);
 }
 
 // ---- 控制码 ----
@@ -241,7 +259,34 @@ function relayTo(deviceId, obj) {
 // 中继背压阈值：对端发送缓冲区超过该字节数，说明客户端消费慢（弱网/卡顿），
 // 此时丢弃非关键帧(P帧)，只保关键帧(IDR/SPS-PPS)与最新帧，避免延迟无限堆积。
 // 实时流允许"丢旧帧保新帧"以提升流畅度与降低端到端延迟。
-const RELAY_BACKPRESSURE_BYTES = 512 * 1024; // 512KB
+// 原画档单帧可达 300~560KB，阈值设 256KB 即可在缓冲刚开始积压时就丢非关键帧，
+// 避免缓冲区被超大帧快速撑爆导致对端永久冻结。
+const RELAY_BACKPRESSURE_BYTES = 256 * 1024; // 256KB
+
+// 调试日志开关：默认关闭，避免每帧 BINARY 日志狂刷拖垮服务器。
+// 设置环境变量 REMOTE_DEBUG=1 可重新开启（仅排查问题时临时开启）。
+const REMOTE_DEBUG = process.env.REMOTE_DEBUG === '1';
+
+// 判断 NALU 流首帧是否为关键帧（IDR=5 / SPS=7 / PPS=8）。
+// 客户端统一 type=1 承载所有视频帧，故不能再用 type 区分关键帧，
+// 必须从 NALU 数据本身解析第一个 NALU 的单元类型（低5位）。
+// 起始码为 00 00 00 01 或 00 00 01。
+function isKeyFrameBuffer(buf) {
+    const len = buf.length;
+    let i = 0;
+    while (i < len - 3) {
+        if (buf[i] === 0x00 && buf[i + 1] === 0x00) {
+            if (buf[i + 2] === 0x00 && i + 4 < len && buf[i + 3] === 0x01) {
+                return (buf[i + 4] & 0x1F) !== 1; // 4 字节起始码：type 1=P(非关键)，其余(5/7/8)为关键
+            }
+            if (buf[i + 2] === 0x01 && i + 3 < len) {
+                return (buf[i + 3] & 0x1F) !== 1; // 3 字节起始码
+            }
+        }
+        i++;
+    }
+    return false; // 无法识别，保守按非关键帧处理（可被背压丢弃）
+}
 
 function relayBinary(deviceId, buf) {
     if (!Buffer.isBuffer(buf) || buf.length < 5) return;
@@ -254,12 +299,16 @@ function relayBinary(deviceId, buf) {
     const peer = peerOf(session, deviceId);
     const peerWs = online.get(peer);
     if (peerWs && peerWs.readyState === peerWs.OPEN) {
-        // 背压丢帧：仅对非关键帧(P帧,type==2)在缓冲区积压时丢弃；
-        // 关键帧(type==1，含 IDR/SPS/PPS)必须送达，否则对端解码器无法重建参考帧。
+        // 背压丢帧：缓冲区积压时，仅丢弃非关键帧(P帧)，保留关键帧(IDR/SPS/PPS)，
+        // 否则对端解码器失去参考帧会花屏/卡死。原画大帧易触发，故阈值调低至 256KB。
         try {
-            if (peerWs.bufferedAmount > RELAY_BACKPRESSURE_BYTES && type === 2) {
-                session.droppedFrames = (session.droppedFrames || 0) + 1;
-                return;
+            if (peerWs.bufferedAmount > RELAY_BACKPRESSURE_BYTES && type === 1) {
+                // type 固定为 1，需解析 NALU 判断是否为关键帧
+                const nalu = buf.subarray(5 + sidLen);
+                if (!isKeyFrameBuffer(nalu)) {
+                    session.droppedFrames = (session.droppedFrames || 0) + 1;
+                    return;
+                }
             }
             peerWs.send(buf);
         } catch (e) { /* 忽略单次发送失败 */ }
@@ -297,10 +346,12 @@ function attach(httpServer) {
         ws.on('pong', () => { ws.isAlive = true; });
 
         ws.on('message', async (raw) => {
-            // 调试：无条件打印原始消息类型与长度，无论文本/二进制，便于定位"客户端发了但服务端没反应"
             const isBuf = Buffer.isBuffer(raw);
-            const t = isBuf ? `BINARY(${raw.length}B)` : `TEXT(${String(raw).length}ch)`;
-            console.log(`[remote][raw] deviceId=${deviceId} type=${t} head=${isBuf ? raw.slice(0, 12).toString('hex') : String(raw).slice(0, 80)}`);
+            // 调试：仅当 REMOTE_DEBUG=1 时打印每帧原始消息（平时关闭，避免日志狂刷拖垮服务器）
+            if (REMOTE_DEBUG) {
+                const t = isBuf ? `BINARY(${raw.length}B)` : `TEXT(${String(raw).length}ch)`;
+                console.log(`[remote][raw] deviceId=${deviceId} type=${t} head=${isBuf ? raw.slice(0, 12).toString('hex') : String(raw).slice(0, 80)}`);
+            }
 
             // 容错：客户端（OkHttp）可能把 JSON 信令以二进制帧(opcode=0x2)发出，
             // 此时 raw 是 Buffer 但内容其实是 UTF-8 的 JSON 文本（以 '{' 开头）。
@@ -422,7 +473,10 @@ async function handleMessage(ws, m) {
         case 'rtc.ice':
         case 'rtc.meta':
         case 'rtc.quality':
-        case 'rtc.connected': {
+        case 'rtc.connected':
+        case 'rtc.encres':
+        // 控制端上报解码能力上限 -> 被控端据此钳制编码分辨率（原画质自适应）
+        case 'rtc.deccap': {
             const session = sessions.get(sid);
             if (!session || session.status === 'terminated') {
                 ws.send(JSON.stringify({ op: 'error', sid, payload: { msg: 'no_session' } }));
@@ -518,9 +572,10 @@ async function handleMessage(ws, m) {
 
 // ---- 订阅/套餐查询（供 WebSocket 与 REST 共用） ----
 function setSubscription(deviceId, plan) {
-    const subs = readJson(SUBSCRIPTION_FILE, {});
-    subs[deviceId] = plan;
-    writeJson(SUBSCRIPTION_FILE, subs);
+    subscriptionCache[deviceId] = plan;
+    fs.writeFile(SUBSCRIPTION_FILE, JSON.stringify(subscriptionCache, null, 2), (e) => {
+        if (e) console.error('[remote] 订阅缓存刷盘失败', e);
+    });
 }
 
 // ---- 超时强断定时器（服务端驱动，客户端无法伪造） ----

@@ -17,6 +17,8 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const dgram = require('dgram');
 const { WebSocketServer } = require('ws');
 
 // ---- 路径与存储 ----
@@ -74,10 +76,13 @@ const PLAN_LIMITS = {                           // 各套餐单次最长协助�
     flag: 120 * 60 * 1000,
 };
 const HEARTBEAT_TIMEOUT_MS = 70 * 1000;         // 心跳 30s，超时 ~2 次判离线
+const RECONNECT_GRACE_MS = 45 * 1000;          // 断线宽限期：45s 内重连则保持会话不终止
 
 // 内存态：deviceId -> ws（在线表）；sid -> session 对象（便于定时器访问）
 const online = new Map();
 const sessions = new Map();
+// sid -> setTimeout 句柄（设备断线后的宽限定时器，重连则取消）
+const pendingDisconnects = new Map();
 
 // ---- 工具 ----
 function gen6() {
@@ -241,6 +246,9 @@ async function forceTerminate(sid, reason) {
         }
     });
     sessions.delete(sid);
+    // 清理 UDP 端点表和宽限定时器
+    udpEndpoints.delete(computeSidHash(sid));
+    if (pendingDisconnects.has(sid)) { clearTimeout(pendingDisconnects.get(sid)); pendingDisconnects.delete(sid); }
 }
 
 // ---- 转发辅助 ----
@@ -261,7 +269,7 @@ function relayTo(deviceId, obj) {
 // 实时流允许"丢旧帧保新帧"以提升流畅度与降低端到端延迟。
 // 原画档单帧可达 300~560KB，阈值设 256KB 即可在缓冲刚开始积压时就丢非关键帧，
 // 避免缓冲区被超大帧快速撑爆导致对端永久冻结。
-const RELAY_BACKPRESSURE_BYTES = 256 * 1024; // 256KB
+const RELAY_BACKPRESSURE_BYTES = 128 * 1024; // 128KB（高延迟下需更低阈值快速泄压）
 
 // 调试日志开关：默认关闭，避免每帧 BINARY 日志狂刷拖垮服务器。
 // 设置环境变量 REMOTE_DEBUG=1 可重新开启（仅排查问题时临时开启）。
@@ -315,6 +323,90 @@ function relayBinary(deviceId, buf) {
     }
 }
 
+// ---- UDP 中继（CS 中继模式增强：视频流走 UDP，消除 TCP HOL 阻塞）----
+// UDP 包格式：[1B magic=0xFC][4B sidHash][4B seq][2B fragIdx][2B fragCount][payload...]
+// Hello/Keepalive 包：fragIdx=0xFFFF, fragCount=0xFFFF, 额外 1B role(0=host,1=controller)
+// 服务端不解析视频负载，仅按 sidHash 找到对端 UDP 端点并原样转发整包。
+const UDP_MAGIC = 0xFC;
+const UDP_HEADER_SIZE = 13;
+// UDP 端口自动启用：优先与 HTTP 同端口；冲突则用 OS 随机端口；再失败则静默回退 TCP。
+// 仍支持 UDP_PORT 环境变量显式指定（向后兼容）。
+let udpPort = process.env.UDP_PORT ? parseInt(process.env.UDP_PORT) : 0;
+let udpServer = null;
+let udpAvailable = false;
+// sidHash -> { sid, host: {addr,port}, controller: {addr,port}, notified }
+const udpEndpoints = new Map();
+
+function computeSidHash(sid) {
+    return crypto.createHash('sha1').update(sid).digest().readUInt32BE(0);
+}
+
+function initUdpRelay(preferredPort) {
+    // 已显式指定端口则只用它；否则依次尝试 preferredPort、0(随机)
+    const tryPorts = udpPort ? [udpPort] : (preferredPort ? [preferredPort, 0] : [0]);
+    let idx = 0;
+    const tryBind = () => {
+        if (idx >= tryPorts.length) {
+            console.log('[remote] UDP 绑定全部失败，视频走 TCP（WebSocket）');
+            return;
+        }
+        const port = tryPorts[idx++];
+        const sock = dgram.createSocket('udp4');
+        sock.on('message', (msg, rinfo) => {
+            if (msg.length < UDP_HEADER_SIZE || msg[0] !== UDP_MAGIC) return;
+            const sidHash = msg.readUInt32BE(1);
+            const fragIdx = msg.readUInt16BE(9);
+            const fragCount = msg.readUInt16BE(11);
+            const ep = udpEndpoints.get(sidHash);
+            if (!ep) return;
+
+            // Hello/Keepalive：记录端点并尝试通知双方就绪
+            if (fragIdx === 0xFFFF && fragCount === 0xFFFF) {
+                if (msg.length >= 14) {
+                    const role = msg[13];
+                    if (role === 0) ep.host = { addr: rinfo.address, port: rinfo.port };
+                    else ep.controller = { addr: rinfo.address, port: rinfo.port };
+                    if (ep.host && ep.controller && !ep.notified) {
+                        ep.notified = true;
+                        const session = sessions.get(ep.sid);
+                        if (session) {
+                            relayTo(session.controller, { op: 'udp.ready', sid: ep.sid });
+                            relayTo(session.host, { op: 'udp.ready', sid: ep.sid });
+                            console.log(`[remote] 传输切换: UDP 就绪 sid=${ep.sid} host=${ep.host.addr}:${ep.host.port} ctrl=${ep.controller.addr}:${ep.controller.port}`);
+                        }
+                    }
+                }
+                return;
+            }
+
+            // 视频包：转发给对端（按发送者地址判断角色）
+            const fromHost = ep.host && ep.host.addr === rinfo.address && ep.host.port === rinfo.port;
+            const peer = fromHost ? ep.controller : ep.host;
+            if (peer) {
+                try { sock.send(msg, peer.port, peer.addr); } catch (e) { /* ignore */ }
+            }
+        });
+        sock.on('error', (e) => {
+            // 绑定阶段错误：尝试下一个端口；运行期错误：回退 TCP
+            if (!udpAvailable) {
+                console.warn(`[remote] UDP 绑定端口 ${port} 失败: ${e.message}，尝试下一个`);
+                try { sock.close(); } catch (_) {}
+                tryBind();
+            } else {
+                console.warn(`[remote] UDP 运行错误，回退 TCP: ${e.message}`);
+                udpAvailable = false;
+            }
+        });
+        sock.bind(port, () => {
+            udpServer = sock;
+            udpPort = sock.address().port;
+            udpAvailable = true;
+            console.log(`[remote] UDP 中继已启动 端口=${udpPort}${port === 0 ? '(随机)' : ''}`);
+        });
+    };
+    tryBind();
+}
+
 // ---- 认证（复用 server.js 的 deviceId token 思路） ----
 // 这里采用轻量方案：WebSocket 连接时通过 query ?token=xxx&deviceId=xxx 传递；
 // token 校验交由调用方提供的 verify 函数（server.js 注入），默认放行 demo。
@@ -324,6 +416,17 @@ function registerVerify(fn) { verifyToken = fn; }
 
 // ---- 主入口：在一个已存在的 http.Server 上挂载 WebSocket ----
 function attach(httpServer) {
+    // UDP 自动启用：HTTP listening 后尝试同端口绑定 UDP，失败回退 TCP
+    if (!udpAvailable && !udpServer) {
+        const startUdp = () => {
+            const addr = httpServer.address();
+            const httpPort = (addr && typeof addr === 'object') ? addr.port : 0;
+            try { initUdpRelay(httpPort); } catch (e) { console.warn(`[remote] UDP 自动启用失败: ${e.message}`); }
+        };
+        if (httpServer.listening) startUdp();
+        else httpServer.once('listening', startUdp);
+    }
+
     const wss = new WebSocketServer({ server: httpServer, path: '/ws/remote' });
 
     wss.on('connection', (ws, req) => {
@@ -342,6 +445,16 @@ function attach(httpServer) {
         ws.isAlive = true;
         online.set(deviceId, ws);
         console.log(`[remote] 设备上线: ${deviceId}, 在线数: ${online.size}`);
+
+        // 设备重连恢复：若该设备参与的活动会话有宽限定时器，取消它，会话无缝继续
+        for (const [sid, session] of sessions) {
+            if (session.status === 'terminated') continue;
+            if ((session.controller === deviceId || session.host === deviceId) && pendingDisconnects.has(sid)) {
+                clearTimeout(pendingDisconnects.get(sid));
+                pendingDisconnects.delete(sid);
+                console.log(`[remote] 设备 ${deviceId} 重连，恢复会话 ${sid}`);
+            }
+        }
 
         ws.on('pong', () => { ws.isAlive = true; });
 
@@ -394,15 +507,28 @@ function attach(httpServer) {
         });
 
         ws.on('close', () => {
-            online.delete(deviceId);
+            // 仅当 online 仍指向自己时才删除（避免删掉已重连的新连接）
+            if (online.get(deviceId) === ws) online.delete(deviceId);
             console.log(`[remote] 设备离线: ${deviceId}, 在线数: ${online.size}`);
-            // 若该设备参与了 session，通知对端终止
+            // 设备已通过新连接重连：无需宽限期
+            if (online.has(deviceId)) return;
+            // 若该设备参与了活动 session，启动宽限定时器（而非立即终止）
             for (const [sid, session] of sessions) {
+                if (session.status === 'terminated') continue;
                 if (session.controller === deviceId || session.host === deviceId) {
-                    const peer = peerOf(session, deviceId);
-                    forceTerminate(sid, 'peer_offline').then(() => {
-                        relayTo(peer, { op: 'terminate', sid, payload: { reason: 'peer_offline' } });
-                    });
+                    if (pendingDisconnects.has(sid)) continue; // 已有宽限定时器
+                    console.log(`[remote] 设备 ${deviceId} 断线，会话 ${sid} 进入 ${RECONNECT_GRACE_MS / 1000}s 宽限期`);
+                    const timer = setTimeout(() => {
+                        pendingDisconnects.delete(sid);
+                        const s = sessions.get(sid);
+                        if (!s || s.status === 'terminated') return;
+                        const peer = peerOf(s, deviceId);
+                        console.log(`[remote] 设备 ${deviceId} 宽限期超时未重连，终止会话 ${sid}`);
+                        forceTerminate(sid, 'peer_offline').then(() => {
+                            relayTo(peer, { op: 'terminate', sid, payload: { reason: 'peer_offline' } });
+                        });
+                    }, RECONNECT_GRACE_MS);
+                    pendingDisconnects.set(sid, timer);
                 }
             }
         });
@@ -462,9 +588,16 @@ async function handleMessage(ws, m) {
             await persistSession(session, 'connecting');
             await audit(sidNew, deviceId, 'connect', `code=${code}`);
 
-            // 通知双方开始 WebRTC 协商
-            relayTo(hostId, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: deviceId, plan } });
-            ws.send(JSON.stringify({ op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: hostId, plan } }));
+            // 注册 UDP 端点表（sidHash -> session），供 UDP 中继路由
+            if (udpAvailable) {
+                udpEndpoints.set(computeSidHash(sidNew), { sid: sidNew, host: null, controller: null, notified: false });
+            }
+            const udpInfo = udpAvailable ? { udpPort: udpPort } : {};
+
+            // 通知双方匹配成功（含 UDP 端口信息，客户端据此决定是否走 UDP）
+            relayTo(hostId, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: deviceId, plan, ...udpInfo } });
+            ws.send(JSON.stringify({ op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: hostId, plan, ...udpInfo } }));
+            console.log(`[remote] 会话建立 sid=${sidNew} 传输=${udpAvailable ? 'UDP' : 'TCP'}${udpAvailable ? '(端口=' + udpPort + ')' : ''} plan=${plan}`);
             break;
         }
 
@@ -557,6 +690,16 @@ async function handleMessage(ws, m) {
             const peer = peerOf(session, deviceId);
             relayTo(peer, { op: 'terminate', sid, payload: { reason: (m.payload && m.payload.reason) || 'user' } });
             await expireCode(session.code);
+            break;
+        }
+
+        case 'udp.fallback': {
+            // 控制端通知：UDP 不可用，回退 TCP。转发给对端（被控端）切换回 WebSocket 发送。
+            const session = sessions.get(sid);
+            if (!session) break;
+            const peer = peerOf(session, deviceId);
+            relayTo(peer, { op: 'udp.fallback', sid });
+            console.log(`[remote] 传输切换: UDP->TCP 回退 sid=${sid} from=${deviceId}`);
             break;
         }
 

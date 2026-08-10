@@ -952,6 +952,8 @@ async function handleMessage(ws, m) {
         case 'rtc.quality':
         case 'rtc.connected':
         case 'rtc.encres':
+        // 控制端「声音」开关 -> 被控端据此启停音频采集编码（声音同步）
+        case 'rtc.audio':
         // 控制端上报解码能力上限 -> 被控端据此钳制编码分辨率（原画质自适应）
         case 'rtc.deccap': {
             const session = sessions.get(sid);

@@ -69,7 +69,7 @@ function writeJson(file, data) {
 }
 
 // ---- 业务常量 ----
-const CODE_TTL_MS = 10 * 60 * 1000;            // 控制码有效期 10 分钟
+const CODE_TTL_MS = 10 * 60 * 1000;            // 控制码有效期（待命绑定码仍为 10 分钟，仅作"等待匹配"窗口）
 const PLAN_LIMITS = {                           // 各套餐单次最长协助时长
     free: 10 * 60 * 1000,
     pro: 60 * 60 * 1000,
@@ -77,20 +77,54 @@ const PLAN_LIMITS = {                           // 各套餐单次最长协助�
 };
 const HEARTBEAT_TIMEOUT_MS = 70 * 1000;         // 心跳 30s，超时 ~2 次判离线
 const RECONNECT_GRACE_MS = 45 * 1000;          // 断线宽限期：45s 内重连则保持会话不终止
+const TRUST_FILE = path.join(DATA_DIR, 'trust.json');
 
-// 内存态：deviceId -> ws（在线表）；sid -> session 对象（便于定时器访问）
-const online = new Map();
+// 内存态：deviceId -> 该设备的所有活动 ws 连接集合（同一设备可能同时有
+//   ①前台 UI 远控页连接 ②RemoteSignalingService 常驻信令连接，二者都应计为"在线"）。
+// 采用 Set 而非单值，close 时只移除自身 ws，避免常驻连接被另一条连接的关闭误删导致误判离线。
+const online = new Map(); // deviceId -> Set<ws>
 const sessions = new Map();
 // sid -> setTimeout 句柄（设备断线后的宽限定时器，重连则取消）
 const pendingDisconnects = new Map();
+// deviceId -> { standby:Boolean, code:String }  被控端待命状态（授权录屏后常驻在线等待）
+const standbyMap = new Map();
+// deviceId -> { deviceName:String }  系统设备名称（连接时上报），供信任列表默认展示
+const deviceInfo = new Map();
+// deviceId -> 信任对象集合  { "对方deviceId": { name, addedAt } }  持久化于 TRUST_FILE
+let trustCache = readJson(TRUST_FILE, {});
+
+function saveTrustCache() {
+    writeJson(TRUST_FILE, trustCache);
+}
+
+// 待确认的连接请求 / 待确认的信任绑定：key = code + ':' + 发起方deviceId
+const pendingConfirms = new Map();
+const pendingTrust = new Map();
+
+// 建立会话（信任直连 / 确认后直连共用）
+async function establishSession(controller, host, code, tag) {
+    const sidNew = genSessionId();
+    const plan = getPlan(controller);
+    const session = makeSession(sidNew, controller, host, code, plan);
+    sessions.set(sidNew, session);
+    await persistSession(session, 'connecting');
+    await audit(sidNew, controller, 'connect', `code=${code} via=${tag}`);
+    if (udpAvailable) {
+        udpEndpoints.set(computeSidHash(sidNew), { sid: sidNew, host: null, controller: null, notified: false });
+    }
+    const udpInfo = udpAvailable ? { udpPort: udpPort } : {};
+    relayTo(host, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: controller, plan, ...udpInfo } });
+    relayTo(controller, { op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: host, plan, ...udpInfo } });
+    console.log(`[remote] 会话建立(${tag}) sid=${sidNew} 传输=${udpAvailable ? 'UDP' : 'TCP'} plan=${plan}`);
+}
 
 // ---- 工具 ----
-function gen6() {
-    // 去掉易混淆字符 0/O/1/I/L，使用 6 位大写
-    const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-    let s = '';
-    for (let i = 0; i < 6; i++) s += chars[Math.floor(Math.random() * chars.length)];
-    return s;
+// 固定控制码：基于 deviceId 哈希生成稳定 6 位纯数字（000000-999999），重启服务器不丢。
+// 个人/情侣场景：每台设备有唯一且永久的控制码，无需每次重启用 APP 都重新生成。
+function genFixedCode(deviceId) {
+    const h = crypto.createHash('sha256').update('starclick:' + deviceId).digest('hex');
+    const n = parseInt(h.substring(0, 8), 16) % 1000000;
+    return n.toString().padStart(6, '0');
 }
 function nowMs() { return Date.now(); }
 
@@ -159,14 +193,17 @@ async function audit(sessionId, actor, action, detail) {
     auditStream.write(line);
 }
 
-// ---- 控制码 ----
+// ---- 控制码（固定码：每台设备一个永久 6 位纯数字码，由 deviceId 派生）----
+// 设计：
+//  - 被控端开启"被控/待命"时，服务端登记 code -> hostId 映射（status=waiting，10 分钟窗口，
+//    仅表示"当前可匹配"，过期只影响"等待中"状态，不影响码本身——码永久有效）。
+//  - 控制端输码：码存在即匹配，无需随机生成；重启服务器从 JSON 恢复映射不丢。
 async function createControlCode(hostId) {
+    const code = genFixedCode(hostId);
     return await withFileLock(CONTROL_CODE_FILE, async () => {
         const list = readJson(CONTROL_CODE_FILE, []);
-        // 清理该 host 旧等待中的码（一个 host 同时只挂一个）
-        const filtered = list.filter(c => !(c.hostId === hostId && c.status === 'waiting'));
-        let code;
-        do { code = gen6(); } while (filtered.some(c => c.code === code));
+        // 清理该 host 旧记录（一个 host 同时只挂一个），再写入最新
+        const filtered = list.filter(c => !(c.hostId === hostId));
         const rec = {
             code,
             hostId,
@@ -176,7 +213,49 @@ async function createControlCode(hostId) {
         };
         filtered.push(rec);
         writeJson(CONTROL_CODE_FILE, filtered);
+        console.log(`[remote] 登记固定控制码 code=${code} host=${hostId}`);
         return rec;
+    });
+}
+
+// 从持久化文件恢复所有已登记的固定控制码（重启服务器不丢映射）
+function restoreControlCodes() {
+    const raw = readJson(CONTROL_CODE_FILE, []);
+    // 迁移清理：丢弃旧随机码方案遗留的记录（与该 hostId 的固定码不符），
+    // 并按 hostId 去重，避免文件无限增长导致每次读写全量解析。
+    const byHost = new Map();
+    for (const rec of raw) {
+        if (!rec || !rec.code || !rec.hostId) continue;
+        if (rec.code !== genFixedCode(rec.hostId)) continue;
+        rec.status = 'waiting';
+        rec.expiresAt = nowMs() + CODE_TTL_MS;
+        byHost.set(rec.hostId, rec);
+    }
+    const list = [...byHost.values()];
+    const dropped = raw.length - list.length;
+    writeJson(CONTROL_CODE_FILE, list);
+    if (list.length) console.log(`[remote] 已恢复 ${list.length} 个固定控制码`);
+    if (dropped > 0) console.log(`[remote] 已清理 ${dropped} 条失效/重复的旧控制码记录`);
+}
+restoreControlCodes();
+
+// 只查询不占用：用于信任绑定等"仅需解析 code -> hostId"的场景。
+// 不会把 status 置为 connected，避免一次绑定后该码被标记占用导致后续匹配返回 used。
+async function lookupControlCode(code) {
+    return await withFileLock(CONTROL_CODE_FILE, async () => {
+        const list = readJson(CONTROL_CODE_FILE, []);
+        const rec = list.find(c => c.code === code);
+        if (!rec) return { ok: false, reason: 'not_found' };
+        // 固定码永久有效：只要被控端在线待命就续期，不因过期窗口拒绝绑定
+        if (rec.expiresAt < nowMs()) {
+            if (standbyMap.has(rec.hostId) && standbyMap.get(rec.hostId).standby) {
+                rec.expiresAt = nowMs() + CODE_TTL_MS;
+                writeJson(CONTROL_CODE_FILE, list);
+            } else {
+                return { ok: false, reason: 'expired' };
+            }
+        }
+        return { ok: true, rec };
     });
 }
 
@@ -187,9 +266,14 @@ async function consumeControlCode(code) {
         if (!rec) return { ok: false, reason: 'not_found' };
         if (rec.status !== 'waiting') return { ok: false, reason: 'used' };
         if (rec.expiresAt < nowMs()) {
-            rec.status = 'expired';
-            writeJson(CONTROL_CODE_FILE, list);
-            return { ok: false, reason: 'expired' };
+            // 固定控制码：只要被控端当前在线且处于待命，就续期并允许连接（码本身永久有效）
+            if (standbyMap.has(rec.hostId) && standbyMap.get(rec.hostId).standby) {
+                rec.expiresAt = nowMs() + CODE_TTL_MS;
+            } else {
+                rec.status = 'expired';
+                writeJson(CONTROL_CODE_FILE, list);
+                return { ok: false, reason: 'expired' };
+            }
         }
         rec.status = 'connected';
         writeJson(CONTROL_CODE_FILE, list);
@@ -206,6 +290,51 @@ async function expireCode(code) {
             writeJson(CONTROL_CODE_FILE, list);
         }
     });
+}
+
+// ---- 信任关系 ----
+// 双向持久化：trustCache[deviceId][peerId] = { name, deviceName, addedAt }
+function isTrusted(a, b) {
+    return !!(trustCache[a] && trustCache[a][b]);
+}
+function addTrust(a, b, nameA, nameB) {
+    if (!trustCache[a]) trustCache[a] = {};
+    if (!trustCache[b]) trustCache[b] = {};
+    // 优先用对方上报的系统设备名（deviceInfo），回退到已存设备名，最后空串
+    const dnA = (deviceInfo.get(a) && deviceInfo.get(a).deviceName) || (trustCache[a][b] && trustCache[a][b].deviceName) || '';
+    const dnB = (deviceInfo.get(b) && deviceInfo.get(b).deviceName) || (trustCache[b][a] && trustCache[b][a].deviceName) || '';
+    trustCache[a][b] = { name: nameB || b, deviceName: dnB, addedAt: nowMs() };
+    trustCache[b][a] = { name: nameA || a, deviceName: dnA, addedAt: nowMs() };
+    saveTrustCache();
+}
+function getTrustList(deviceId) {
+    const m = trustCache[deviceId] || {};
+    return Object.keys(m).map(peerId => ({
+        deviceId: peerId,
+        name: m[peerId].name,
+        deviceName: m[peerId].deviceName || (deviceInfo.get(peerId) && deviceInfo.get(peerId).deviceName) || '',
+        // 在线且处于待命状态才视为"可一键连接"
+        online: online.has(peerId) && online.get(peerId).size > 0,
+        standby: !!(standbyMap.get(peerId) && standbyMap.get(peerId).standby),
+    }));
+}
+
+/**
+ * 设备在线/待命状态变化时，主动把最新信任列表推给"信任了该设备"的在线对端。
+ * 这样控制端进入页面后无需轮询即可实时看到对方上线/下线。
+ */
+function notifyTrustPeers(deviceId) {
+    try {
+        for (const peerId of Object.keys(trustCache)) {
+            if (peerId === deviceId) continue;
+            // 只推给确实信任了该设备、且当前在线的对端
+            if (!trustCache[peerId] || !trustCache[peerId][deviceId]) continue;
+            if (!online.has(peerId) || online.get(peerId).size === 0) continue;
+            relayTo(peerId, { op: 'trust.list', payload: { list: getTrustList(peerId) } });
+        }
+    } catch (e) {
+        console.warn('[remote] notifyTrustPeers 失败:', e && e.message);
+    }
 }
 
 // ---- 会话落盘 ----
@@ -240,9 +369,12 @@ async function forceTerminate(sid, reason) {
 
     const msg = JSON.stringify({ op: 'terminate', sid, payload: { reason: reason || 'server_force' } });
     [session.controller, session.host].forEach(peer => {
-        const ws = online.get(peer);
-        if (ws && ws.readyState === ws.OPEN) {
-            try { ws.send(msg); } catch (e) { /* ignore */ }
+        const set = online.get(peer);
+        if (!set) return;
+        for (const ws of set) {
+            if (ws && ws.readyState === ws.OPEN) {
+                try { ws.send(msg); } catch (e) { /* ignore */ }
+            }
         }
     });
     sessions.delete(sid);
@@ -253,11 +385,15 @@ async function forceTerminate(sid, reason) {
 
 // ---- 转发辅助 ----
 function relayTo(deviceId, obj) {
-    const ws = online.get(deviceId);
-    if (ws && ws.readyState === ws.OPEN) {
-        try { ws.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
+    const set = online.get(deviceId);
+    if (!set || set.size === 0) return false;
+    let sent = false;
+    for (const ws of set) {
+        if (ws && ws.readyState === ws.OPEN) {
+            try { ws.send(JSON.stringify(obj)); sent = true; } catch (e) { /* 忽略单连接失败，继续其余连接 */ }
+        }
     }
-    return false;
+    return sent;
 }
 
 // ---- 二进制视频帧中转（CS 中继模式）----
@@ -305,8 +441,12 @@ function relayBinary(deviceId, buf) {
     const session = sessions.get(sid);
     if (!session || session.status === 'terminated') return;
     const peer = peerOf(session, deviceId);
-    const peerWs = online.get(peer);
-    if (peerWs && peerWs.readyState === peerWs.OPEN) {
+    const set = online.get(peer);
+    if (!set) return;
+    // 视频流只发送给对端第一个可用的连接（同一设备多连接时避免重复推流）
+    let peerWs = null;
+    for (const w of set) { if (w && w.readyState === w.OPEN) { peerWs = w; break; } }
+    if (peerWs) {
         // 背压丢帧：缓冲区积压时，仅丢弃非关键帧(P帧)，保留关键帧(IDR/SPS/PPS)，
         // 否则对端解码器失去参考帧会花屏/卡死。原画大帧易触发，故阈值调低至 256KB。
         try {
@@ -325,9 +465,13 @@ function relayBinary(deviceId, buf) {
 
 // ---- UDP 中继（CS 中继模式增强：视频流走 UDP，消除 TCP HOL 阻塞）----
 // UDP 包格式：[1B magic=0xFC][4B sidHash][4B seq][2B fragIdx][2B fragCount][payload...]
-// Hello/Keepalive 包：fragIdx=0xFFFF, fragCount=0xFFFF, 额外 1B role(0=host,1=controller)
+// FEC 冗余包：[1B magic=0xFD][4B sidHash][4B seq][2B fecIdx][2B fragCount]
+//             [2B groupStart][2B groupLen][2B payloadLen][xorPayload...]
+// Hello/Keepalive 包：magic=0xFC, fragIdx=0xFFFF, fragCount=0xFFFF, 额外 1B role(0=host,1=controller)
 // 服务端不解析视频负载，仅按 sidHash 找到对端 UDP 端点并原样转发整包。
 const UDP_MAGIC = 0xFC;
+// FEC 冗余包魔数：服务端需与数据包同样中继，否则 FEC 永远无法生效。
+const UDP_MAGIC_FEC = 0xFD;
 const UDP_HEADER_SIZE = 13;
 // UDP 端口自动启用：优先与 HTTP 同端口；冲突则用 OS 随机端口；再失败则静默回退 TCP。
 // 仍支持 UDP_PORT 环境变量显式指定（向后兼容）。
@@ -353,15 +497,20 @@ function initUdpRelay(preferredPort) {
         const port = tryPorts[idx++];
         const sock = dgram.createSocket('udp4');
         sock.on('message', (msg, rinfo) => {
-            if (msg.length < UDP_HEADER_SIZE || msg[0] !== UDP_MAGIC) return;
+            const magic = msg[0];
+            if (msg.length < UDP_HEADER_SIZE) return;
+            // 同时接受数据包(0xFC)与 FEC 冗余包(0xFD)；FEC 包必须原样中继，
+            // 否则控制端收不到冗余数据，分组 XOR 恢复完全失效。
+            if (magic !== UDP_MAGIC && magic !== UDP_MAGIC_FEC) return;
+            const isFec = magic === UDP_MAGIC_FEC;
             const sidHash = msg.readUInt32BE(1);
             const fragIdx = msg.readUInt16BE(9);
             const fragCount = msg.readUInt16BE(11);
             const ep = udpEndpoints.get(sidHash);
             if (!ep) return;
 
-            // Hello/Keepalive：记录端点并尝试通知双方就绪
-            if (fragIdx === 0xFFFF && fragCount === 0xFFFF) {
+            // Hello/Keepalive：记录端点并尝试通知双方就绪（仅数据包魔数携带 hello）
+            if (!isFec && fragIdx === 0xFFFF && fragCount === 0xFFFF) {
                 if (msg.length >= 14) {
                     const role = msg[13];
                     if (role === 0) ep.host = { addr: rinfo.address, port: rinfo.port };
@@ -433,18 +582,32 @@ function attach(httpServer) {
         const url = new URL(req.url, 'http://localhost');
         const deviceId = url.searchParams.get('deviceId');
         const token = url.searchParams.get('token');
+        const dname = (url.searchParams.get('dname') || '').trim();
 
         if (!deviceId || !verifyToken(deviceId, token)) {
             console.warn(`[remote] 连接被拒 unauthorized deviceId=${deviceId} token=${token ? '***' : '(空)'}`);
             try { ws.close(4001, 'unauthorized'); } catch (e) {}
             return;
         }
-        console.log(`[remote] 新 WebSocket 连接建立 deviceId=${deviceId}（此时在线 ${online.size} 台）`);
+        // 记录系统设备名称（设置→关于手机→设备名称，如「荣耀60SE」「妈妈的手机」），
+        // 供信任列表默认展示（无需备注即可区分不同设备）
+        if (dname) deviceInfo.set(deviceId, { deviceName: dname });
+        console.log(`[remote] 新 WebSocket 连接建立 deviceId=${deviceId}${dname ? ' deviceName=' + dname : ''}（此时在线 ${online.size} 台）`);
 
         ws.deviceId = deviceId;
         ws.isAlive = true;
-        online.set(deviceId, ws);
+        // 同一设备可有多个连接（常驻信令 + 远控页），全部计入在线集合
+        if (!online.has(deviceId)) online.set(deviceId, new Set());
+        online.get(deviceId).add(ws);
+        // 若此前处于待命（授权录屏常驻等待），重新上线后恢复待命状态并续期控制码
+        if (standbyMap.has(deviceId)) {
+            const st = standbyMap.get(deviceId);
+            st.ws = ws;
+            createControlCode(deviceId).catch(e => console.error('[remote] 待命续期失败', e));
+        }
         console.log(`[remote] 设备上线: ${deviceId}, 在线数: ${online.size}`);
+        // 通知信任对端：该设备已上线，控制端列表实时点亮
+        notifyTrustPeers(deviceId);
 
         // 设备重连恢复：若该设备参与的活动会话有宽限定时器，取消它，会话无缝继续
         for (const [sid, session] of sessions) {
@@ -507,11 +670,23 @@ function attach(httpServer) {
         });
 
         ws.on('close', () => {
-            // 仅当 online 仍指向自己时才删除（避免删掉已重连的新连接）
-            if (online.get(deviceId) === ws) online.delete(deviceId);
-            console.log(`[remote] 设备离线: ${deviceId}, 在线数: ${online.size}`);
-            // 设备已通过新连接重连：无需宽限期
+            // 多连接集合：只移除自身这条 ws，保留同一设备的其它连接（如常驻信令），
+            // 避免远控页关闭时把"仍在后台保活"的常驻信令连接误判为离线。
+            const set = online.get(deviceId);
+            if (set) {
+                set.delete(ws);
+                if (set.size === 0) online.delete(deviceId);
+            }
+            // 待命设备在"该连接"为待命连接且已无其他连接时才清除（待命前提是保持连接在线）
+            // 注：standbyMap.ws 指向的是发起待命的那条连接；若常驻信令连接仍存在则保留待命态。
+            if (standbyMap.has(deviceId) && standbyMap.get(deviceId).ws === ws && (!online.has(deviceId))) {
+                standbyMap.delete(deviceId);
+            }
+            console.log(`[remote] 连接关闭 deviceId=${deviceId}, 该设备剩余在线连接: ${online.has(deviceId) ? online.get(deviceId).size : 0}, 总在线设备数: ${online.size}`);
+            // 设备已通过其它连接（如常驻信令）保持在线：无需通知离线
             if (online.has(deviceId)) return;
+            // 通知信任对端：该设备已离线，控制端列表实时置灰
+            notifyTrustPeers(deviceId);
             // 若该设备参与了活动 session，启动宽限定时器（而非立即终止）
             for (const [sid, session] of sessions) {
                 if (session.status === 'terminated') continue;
@@ -569,7 +744,7 @@ async function handleMessage(ws, m) {
         }
 
         case 'code.connect': {
-            const code = (m.payload && m.payload.code || '').toUpperCase().trim();
+            const code = (m.payload && m.payload.code || '').trim();
             if (!code) { ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'empty' } })); break; }
             const r = await consumeControlCode(code);
             if (!r.ok) {
@@ -581,23 +756,192 @@ async function handleMessage(ws, m) {
                 ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'self' } }));
                 break;
             }
-            const sidNew = genSessionId();
-            const plan = getPlan(deviceId);
-            const session = makeSession(sidNew, deviceId, hostId, code, plan);
-            sessions.set(sidNew, session);
-            await persistSession(session, 'connecting');
-            await audit(sidNew, deviceId, 'connect', `code=${code}`);
-
-            // 注册 UDP 端点表（sidHash -> session），供 UDP 中继路由
-            if (udpAvailable) {
-                udpEndpoints.set(computeSidHash(sidNew), { sid: sidNew, host: null, controller: null, notified: false });
+            // 被控端必须在线且处于待命（授权录屏后常驻等待），否则无法连接
+            if (!online.has(hostId) || online.get(hostId).size === 0 || !(standbyMap.get(hostId) && standbyMap.get(hostId).standby)) {
+                ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'host_offline' } }));
+                break;
             }
-            const udpInfo = udpAvailable ? { udpPort: udpPort } : {};
+            // 信任设备：免确认，直接匹配
+            if (isTrusted(deviceId, hostId)) {
+                establishSession(deviceId, hostId, code, 'trust');
+                break;
+            }
+            // 非信任设备：向被控端推送"连接请求确认"弹窗，由被控端决定是否允许
+            pendingConfirms.set(code + ':' + deviceId, { controller: deviceId, host: hostId, code });
+            const ok = relayTo(hostId, {
+                op: 'incoming', sid: '', payload: {
+                    controller: deviceId,
+                    code,
+                    controllerName: (m.payload && m.payload.name) || '',
+                }
+            });
+            if (!ok) {
+                ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'host_offline' } }));
+                break;
+            }
+            // 控制端先收到"等待确认"提示
+            ws.send(JSON.stringify({ op: 'code.waiting', payload: { code, host: hostId } }));
+            console.log(`[remote] 连接请求待确认 controller=${deviceId} -> host=${hostId} code=${code}`);
+            break;
+        }
 
-            // 通知双方匹配成功（含 UDP 端口信息，客户端据此决定是否走 UDP）
-            relayTo(hostId, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: deviceId, plan, ...udpInfo } });
-            ws.send(JSON.stringify({ op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: hostId, plan, ...udpInfo } }));
-            console.log(`[remote] 会话建立 sid=${sidNew} 传输=${udpAvailable ? 'UDP' : 'TCP'}${udpAvailable ? '(端口=' + udpPort + ')' : ''} plan=${plan}`);
+        // 被控端在待命页面对"连接请求确认"弹窗的回应
+        case 'incoming.confirm': {
+            const code = (m.payload && m.payload.code || '').trim();
+            const controller = m.payload && m.payload.controller;
+            const key = code + ':' + controller;
+            const pend = pendingConfirms.get(key);
+            if (!pend || pend.host !== deviceId) {
+                ws.send(JSON.stringify({ op: 'error', payload: { msg: 'no_pending' } }));
+                break;
+            }
+            pendingConfirms.delete(key);
+            establishSession(controller, deviceId, code, 'confirm');
+            break;
+        }
+
+        case 'incoming.reject': {
+            const code = (m.payload && m.payload.code || '').trim();
+            const controller = m.payload && m.payload.controller;
+            const key = code + ':' + controller;
+            const pend = pendingConfirms.get(key);
+            if (!pend || pend.host !== deviceId) {
+                ws.send(JSON.stringify({ op: 'error', payload: { msg: 'no_pending' } }));
+                break;
+            }
+            pendingConfirms.delete(key);
+            relayTo(controller, { op: 'code.reject', payload: { reason: 'rejected' } });
+            console.log(`[remote] 连接请求被拒绝 host=${deviceId} -> controller=${controller}`);
+            break;
+        }
+
+        // 被控端授权录屏后进入"待命"：保持在线并等待控制端连接（无需每次进页面点开始）
+        case 'standby': {
+            const on = !!(m.payload && m.payload.on);
+            if (on) {
+                standbyMap.set(deviceId, { standby: true, ws, code: genFixedCode(deviceId), since: nowMs() });
+                const rec = await createControlCode(deviceId);
+                relayTo(deviceId, { op: 'standby.ok', payload: { code: rec.code } });
+                console.log(`[remote] 设备进入待命 deviceId=${deviceId} code=${rec.code}`);
+            } else {
+                standbyMap.delete(deviceId);
+                console.log(`[remote] 设备退出待命 deviceId=${deviceId}`);
+            }
+            // 待命状态变化时主动推给信任我的对端，使其列表实时显示在线/离线
+            notifyTrustPeers(deviceId);
+            break;
+        }
+
+        // 信任绑定：控制端输入对方控制码发起绑定请求，对方弹窗确认
+        case 'trust.bind': {
+            const code = (m.payload && m.payload.code || '').trim();
+            const peerName = (m.payload && m.payload.name) || '';
+            // 绑定只需解析出对方 deviceId，不占用控制码（否则该码会被置为 connected）
+            const r = await lookupControlCode(code);
+            if (!r.ok) {
+                ws.send(JSON.stringify({ op: 'trust.bind.fail', payload: { reason: r.reason } }));
+                break;
+            }
+            const peerId = r.rec.hostId;
+            if (peerId === deviceId) {
+                ws.send(JSON.stringify({ op: 'trust.bind.fail', payload: { reason: 'self' } }));
+                break;
+            }
+            if (!online.has(peerId) || online.get(peerId).size === 0 || !(standbyMap.get(peerId) && standbyMap.get(peerId).standby)) {
+                ws.send(JSON.stringify({ op: 'trust.bind.fail', payload: { reason: 'peer_offline' } }));
+                break;
+            }
+            pendingTrust.set(code + ':' + deviceId, { from: deviceId, fromName: peerName, to: peerId, code });
+            relayTo(peerId, {
+                op: 'trust.incoming', payload: {
+                    from: deviceId,
+                    fromName: peerName,
+                    code,
+                }
+            });
+            ws.send(JSON.stringify({ op: 'trust.bind.waiting', payload: { code } }));
+            console.log(`[remote] 信任绑定请求 from=${deviceId} -> to=${peerId} code=${code}`);
+            break;
+        }
+
+        case 'trust.confirm': {
+            const code = (m.payload && m.payload.code || '').trim();
+            const from = m.payload && m.payload.from;
+            const key = code + ':' + from;
+            const pend = pendingTrust.get(key);
+            if (!pend || pend.to !== deviceId) {
+                ws.send(JSON.stringify({ op: 'error', payload: { msg: 'no_pending' } }));
+                break;
+            }
+            pendingTrust.delete(key);
+            addTrust(pend.from, pend.to, pend.fromName, (m.payload && m.payload.name) || '');
+            relayTo(pend.from, { op: 'trust.confirmed', payload: { peer: pend.to, name: (m.payload && m.payload.name) || pend.to } });
+            ws.send(JSON.stringify({ op: 'trust.confirmed', payload: { peer: pend.from, name: pend.fromName || pend.from } }));
+            console.log(`[remote] 信任绑定确认 from=${pend.from} <-> to=${pend.to}`);
+            // 绑定成功后主动把最新信任列表推给双方，确保控制端实时看到对方"在线·可连接"，
+            // 而不依赖控制端收到 trust.confirmed 后再主动拉取（主动拉取可能因连接抖动丢失回包）。
+            notifyTrustPeers(pend.from);
+            notifyTrustPeers(pend.to);
+            break;
+        }
+
+        case 'trust.reject': {
+            const code = (m.payload && m.payload.code || '').trim();
+            const from = m.payload && m.payload.from;
+            const key = code + ':' + from;
+            const pend = pendingTrust.get(key);
+            if (!pend || pend.to !== deviceId) break;
+            pendingTrust.delete(key);
+            relayTo(pend.from, { op: 'trust.bind.fail', payload: { reason: 'rejected' } });
+            break;
+        }
+
+        // 查询我的信任设备列表（含在线/待命状态）
+        case 'trust.list': {
+            const list = getTrustList(deviceId);
+            ws.send(JSON.stringify({ op: 'trust.list', payload: { list } }));
+            break;
+        }
+
+        // 信任设备一键连接：免确认直接匹配（前提对方在线且待命）
+        case 'trust.request': {
+            const peerId = (m.payload && m.payload.peer) || '';
+            const code = genFixedCode(peerId);
+            if (!isTrusted(deviceId, peerId)) {
+                ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'not_trusted' } }));
+                break;
+            }
+            if (!online.has(peerId) || online.get(peerId).size === 0 || !(standbyMap.get(peerId) && standbyMap.get(peerId).standby)) {
+                ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'host_offline' } }));
+                break;
+            }
+            const r = await consumeControlCode(code);
+            if (!r.ok) {
+                ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: r.reason } }));
+                break;
+            }
+            establishSession(deviceId, peerId, code, 'trust');
+            break;
+        }
+
+        case 'trust.remove': {
+            const peerId = (m.payload && m.payload.peer) || '';
+            if (trustCache[deviceId] && trustCache[deviceId][peerId]) {
+                delete trustCache[deviceId][peerId];
+                saveTrustCache();
+            }
+            ws.send(JSON.stringify({ op: 'trust.removed', payload: { peer: peerId } }));
+            // 删除成功后主动把最新信任列表推回本端，确保 UI 实时刷新（不依赖客户端主动拉取，
+            // 规避"未连接时拉取请求被丢弃/连接抖动导致删除界面无反应"的情况）。
+            relayTo(deviceId, { op: 'trust.list', payload: { list: getTrustList(deviceId) } });
+            // 同时同步通知对端（被删方）清理该信任关系，保持双向一致
+            if (trustCache[peerId] && trustCache[peerId][deviceId]) {
+                delete trustCache[peerId][deviceId];
+                saveTrustCache();
+                relayTo(peerId, { op: 'trust.removed', payload: { peer: deviceId } });
+                relayTo(peerId, { op: 'trust.list', payload: { list: getTrustList(peerId) } });
+            }
+            console.log(`[remote] 移除信任 deviceId=${deviceId} peer=${peerId}`);
             break;
         }
 
@@ -705,6 +1049,10 @@ async function handleMessage(ws, m) {
 
         case 'ping': {
             ws.send(JSON.stringify({ op: 'pong' }));
+            // 待命设备：心跳时续期固定控制码，确保长期在线期间码持续有效
+            if (standbyMap.has(deviceId) && standbyMap.get(deviceId).standby) {
+                createControlCode(deviceId).catch(e => console.error('[remote] 待命心跳续期失败', e));
+            }
             break;
         }
 
@@ -772,5 +1120,5 @@ module.exports = {
     getPlan,
     getIceConfig,
     startTimeoutWatchdog,
-    _internal: { online, sessions, consumeControlCode, createControlCode },
+    _internal: { online, sessions, consumeControlCode, lookupControlCode, createControlCode },
 };

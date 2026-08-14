@@ -529,9 +529,50 @@ function initUdpRelay(preferredPort) {
             }
 
             // 视频包：转发给对端（按发送者地址判断角色）
-            const fromHost = ep.host && ep.host.addr === rinfo.address && ep.host.port === rinfo.port;
+            // 注意：客户端用随机端口 DatagramSocket + NAT 映射，rinfo.port 在重连/重映射后会变化，
+            // 若仍用固定端口判定角色，会把一方的包错误地发回自己或对端错乱 → 解码花屏/卡死。
+            // 因此这里做"端点自愈"：来源地址不匹配已记录端点时，先把它归位到未匹配的端点，再转发。
+            let fromHost = !!(ep.host && ep.host.addr === rinfo.address && ep.host.port === rinfo.port);
+            let fromController = !!(ep.controller && ep.controller.addr === rinfo.address && ep.controller.port === rinfo.port);
+
+            if (!fromHost && !fromController) {
+                // 来源端口已变（NAT 重映射 / 客户端重启 socket）：归位到那个尚未匹配的端点
+                const hostMatch = !!(ep.host && ep.host.addr === rinfo.address && ep.host.port === rinfo.port);
+                const ctrlMatch = !!(ep.controller && ep.controller.addr === rinfo.address && ep.controller.port === rinfo.port);
+                // 该来源不是已记录的 host → 视为刷新后的 controller 端点
+                if (!hostMatch && (!ctrlMatch)) {
+                    if (!ep.controller || ep.controller.addr !== rinfo.address || ep.controller.port !== rinfo.port) {
+                        ep.controller = { addr: rinfo.address, port: rinfo.port };
+                    }
+                    fromController = true;
+                } else if (!ctrlMatch && !hostMatch) {
+                    if (!ep.host || ep.host.addr !== rinfo.address || ep.host.port !== rinfo.port) {
+                        ep.host = { addr: rinfo.address, port: rinfo.port };
+                    }
+                    fromHost = true;
+                } else {
+                    // 来源地址与某端点相同但端口变了：刷新该端点端口
+                    if (ep.host && ep.host.addr === rinfo.address && ep.host.port !== rinfo.port) {
+                        ep.host = { addr: rinfo.address, port: rinfo.port };
+                        fromHost = true;
+                    } else if (ep.controller && ep.controller.addr === rinfo.address && ep.controller.port !== rinfo.port) {
+                        ep.controller = { addr: rinfo.address, port: rinfo.port };
+                        fromController = true;
+                    }
+                }
+                if (!ep.notified && ep.host && ep.controller) {
+                    ep.notified = true;
+                    const session = sessions.get(ep.sid);
+                    if (session) {
+                        relayTo(session.controller, { op: 'udp.ready', sid: ep.sid });
+                        relayTo(session.host, { op: 'udp.ready', sid: ep.sid });
+                    }
+                }
+            }
+
             const peer = fromHost ? ep.controller : ep.host;
-            if (peer) {
+            // 防止环回：来源与目标不能是同一地址端口
+            if (peer && !(peer.addr === rinfo.address && peer.port === rinfo.port)) {
                 try { sock.send(msg, peer.port, peer.addr); } catch (e) { /* ignore */ }
             }
         });

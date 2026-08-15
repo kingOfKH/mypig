@@ -20,6 +20,7 @@ const path = require('path');
 const crypto = require('crypto');
 const dgram = require('dgram');
 const { WebSocketServer } = require('ws');
+const { xorBase64 } = require('./crypto-util');
 
 // ---- 路径与存储 ----
 const DATA_DIR = path.join(__dirname, 'data', 'remote');
@@ -102,20 +103,23 @@ const pendingConfirms = new Map();
 const pendingTrust = new Map();
 
 // 建立会话（信任直连 / 确认后直连共用）
-async function establishSession(controller, host, code, tag) {
+// mode：控制端发起连接时携带的传输模式（'webrtc' | 'cs'），由控制端最终决定，被控端跟随。
+async function establishSession(controller, host, code, tag, mode) {
     const sidNew = genSessionId();
     const plan = getPlan(controller);
-    const session = makeSession(sidNew, controller, host, code, plan);
+    const session = makeSession(sidNew, controller, host, code, plan, mode);
     sessions.set(sidNew, session);
     await persistSession(session, 'connecting');
-    await audit(sidNew, controller, 'connect', `code=${code} via=${tag}`);
+    await audit(sidNew, controller, 'connect', `code=${code} via=${tag} mode=${session.mode}`);
     if (udpAvailable) {
         udpEndpoints.set(computeSidHash(sidNew), { sid: sidNew, host: null, controller: null, notified: false });
     }
     const udpInfo = udpAvailable ? { udpPort: udpPort } : {};
-    relayTo(host, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: controller, plan, ...udpInfo } });
-    relayTo(controller, { op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: host, plan, ...udpInfo } });
-    console.log(`[remote] 会话建立(${tag}) sid=${sidNew} 传输=${udpAvailable ? 'UDP' : 'TCP'} plan=${plan}`);
+    // 把选定的传输模式权威下发给两端（被控端必须跟随，控制端也以服务端下发为准消除本地竞态）
+    const modeInfo = { mode: session.mode };
+    relayTo(host, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: controller, plan, ...udpInfo, ...modeInfo } });
+    relayTo(controller, { op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: host, plan, ...udpInfo, ...modeInfo } });
+    console.log(`[remote] 会话建立(${tag}) sid=${sidNew} 传输模式=${session.mode} 链路=${udpAvailable ? 'UDP' : 'TCP'} plan=${plan}`);
 }
 
 // ---- 工具 ----
@@ -152,13 +156,16 @@ function genSessionId() {
 }
 
 // 内存 session 对象
-function makeSession(sid, controller, host, code, plan) {
+function makeSession(sid, controller, host, code, plan, mode) {
     return {
         sessionId: sid,
         controller,          // deviceId（控制端）
         host,                // deviceId（被控端）
         code,
         plan,
+        // 传输模式：由控制端发起连接时携带（'webrtc' | 'cs'），服务端作为权威下发给被控端。
+        // 被控端必须无条件跟随，自己本机的后台开关不参与决策，避免两端开关不一致导致协商失败黑屏。
+        mode: mode || 'cs',  // 默认自研 CS 中继（兼容旧版控制端未携带该字段）
         status: 'connecting', // connecting | streaming | terminated
         startedAt: nowMs(),
         endedAt: null,
@@ -750,6 +757,8 @@ async function handleMessage(ws, m) {
 
         case 'code.connect': {
             const code = (m.payload && m.payload.code || '').trim();
+            // 传输模式由控制端决定（'webrtc' | 'cs'）。被控端无条件跟随，自己本机开关不参与决策。
+            const mode = (m.payload && m.payload.mode === 'webrtc') ? 'webrtc' : 'cs';
             if (!code) { ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'empty' } })); break; }
             const r = await consumeControlCode(code);
             if (!r.ok) {
@@ -768,11 +777,12 @@ async function handleMessage(ws, m) {
             }
             // 信任设备：免确认，直接匹配
             if (isTrusted(deviceId, hostId)) {
-                establishSession(deviceId, hostId, code, 'trust');
+                establishSession(deviceId, hostId, code, 'trust', mode);
                 break;
             }
             // 非信任设备：向被控端推送"连接请求确认"弹窗，由被控端决定是否允许
-            pendingConfirms.set(code + ':' + deviceId, { controller: deviceId, host: hostId, code });
+            // 记录控制端决定的传输模式，待被控端确认后建立会话时沿用（被控端必须跟随）
+            pendingConfirms.set(code + ':' + deviceId, { controller: deviceId, host: hostId, code, mode });
             const ok = relayTo(hostId, {
                 op: 'incoming', sid: '', payload: {
                     controller: deviceId,
@@ -801,7 +811,7 @@ async function handleMessage(ws, m) {
                 break;
             }
             pendingConfirms.delete(key);
-            establishSession(controller, deviceId, code, 'confirm');
+            establishSession(controller, deviceId, code, 'confirm', pend.mode || 'cs');
             break;
         }
 
@@ -911,6 +921,8 @@ async function handleMessage(ws, m) {
         // 信任设备一键连接：免确认直接匹配（前提对方在线且待命）
         case 'trust.request': {
             const peerId = (m.payload && m.payload.peer) || '';
+            // 传输模式由控制端决定（'webrtc' | 'cs'），被控端无条件跟随
+            const mode = (m.payload && m.payload.mode === 'webrtc') ? 'webrtc' : 'cs';
             const code = genFixedCode(peerId);
             if (!isTrusted(deviceId, peerId)) {
                 ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'not_trusted' } }));
@@ -925,7 +937,7 @@ async function handleMessage(ws, m) {
                 ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: r.reason } }));
                 break;
             }
-            establishSession(deviceId, peerId, code, 'trust');
+            establishSession(deviceId, peerId, code, 'trust', mode);
             break;
         }
 
@@ -1109,27 +1121,54 @@ function startTimeoutWatchdog() {
 //   TURN_URL        可多个，用 | 分隔，例如 turn:turn.example.com:3478?transport=udp|turns:turn.example.com:5349
 //   TURN_USERNAME   长期凭证用户名
 //   TURN_CREDENTIAL 长期凭证密码
+//   ENCRYPT_KEY     与 APP 后台「加密秘钥」一致；配合 TURN_PRE_ENCRYPTED=false（默认）时，服务端子
+//                   端用此密钥把明文 TURN 凭证加密后下发，APP 端用同一秘钥解密。
+//   TURN_PRE_ENCRYPTED=true  表示 .env 里的 TURN_URL/USERNAME/CREDENTIAL「已经是」用同一密钥加密后的值，
+//                   服务端不再二次加密，直接原样作为 payload 下发（APP 端解密即用）。
+//                   适用于：不想在 .env 明文存放 TURN 凭证的场景（推荐个人部署使用此模式）。
+//                   未配置 ENCRYPT_KEY 且非 PRE_ENCRYPTED 时：若配了 TURN 则拒绝明文下发凭证（返回空 TURN），
+//                   避免长期凭证以明文暴露在 /api/ice-config 接口。
+// 加密算法与 APP 端 ApiListManager.encryptUrl/decryptUrl 一致：XOR + Base64（见 crypto-util.js）。
 function getIceConfig() {
-    const servers = [
+    // STUN 为公共服务，无需加密，始终下发（用于 P2P 打洞）
+    const stun = [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
     ];
     const turnUrl = process.env.TURN_URL;
-    if (turnUrl && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
-        for (const raw of turnUrl.split('|')) {
-            const u = raw.trim();
-            if (!u) continue;
-            servers.push({
-                urls: u,
-                username: process.env.TURN_USERNAME,
-                credential: process.env.TURN_CREDENTIAL,
-            });
-        }
-        console.log(`[ice] 已加载 TURN 配置，共 ${turnUrl.split('|').filter(Boolean).length} 个 TURN 服务器`);
-    } else {
+    if (!turnUrl || !process.env.TURN_USERNAME || !process.env.TURN_CREDENTIAL) {
         console.log('[ice] 未配置 TURN 环境变量，仅使用公共 STUN（跨网络可能无法直连）');
+        return { encrypted: false, stun, turn: [] };
     }
-    return { iceServers: servers };
+    const key = process.env.ENCRYPT_KEY;
+    const preEncrypted = process.env.TURN_PRE_ENCRYPTED === 'true';
+    if (!preEncrypted) {
+        // ---- 明文模式：服务端用 ENCRYPT_KEY 加密后再下发 ----
+        if (!key) {
+            console.warn('[ice] 已配置 TURN 但未配置 ENCRYPT_KEY，拒绝明文下发长期凭证，仅返回 STUN');
+            return { encrypted: false, stun, turn: [] };
+        }
+        const turnList = turnUrl.split('|').filter(Boolean).map(raw => ({
+            urls: raw.trim(),
+            username: process.env.TURN_USERNAME,
+            credential: process.env.TURN_CREDENTIAL,
+        }));
+        const payload = xorBase64(JSON.stringify({ turn: turnList }), key);
+        console.log(`[ice] 已加密(明文模式) TURN 配置下发，共 ${turnList.length} 个（凭证已加密）`);
+        return { encrypted: true, payload, stun };
+    }
+    // ---- 预加密模式（TURN_PRE_ENCRYPTED=true）----
+    // 约定：TURN_URL 直接填「用 ENCRYPT_KEY 加密整个 {turn:[{urls,username,credential}]} JSON 后的密文」，
+    // 服务端原样作为 payload 下发，APP 端用同一秘钥解密即得 {turn:[...]}。USERNAME/CREDENTIAL 无需填写。
+    // 这样 .env 里不出现明文 TURN 凭证（个人部署推荐）。
+    try {
+        const payload = turnUrl.trim();
+        console.log('[ice] 预加密模式：TURN_URL 直接作为加密 payload 下发（长度=%d）', payload.length);
+        return { encrypted: true, payload, stun };
+    } catch (e) {
+        console.error('[ice] 预加密模式处理失败，仅返回 STUN：', e.message);
+        return { encrypted: false, stun, turn: [] };
+    }
 }
 
 module.exports = {

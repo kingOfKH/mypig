@@ -528,52 +528,16 @@ function initUdpRelay(preferredPort) {
                 return;
             }
 
-            // 视频包：转发给对端（按发送者地址判断角色）
-            // 注意：客户端用随机端口 DatagramSocket + NAT 映射，rinfo.port 在重连/重映射后会变化，
-            // 若仍用固定端口判定角色，会把一方的包错误地发回自己或对端错乱 → 解码花屏/卡死。
-            // 因此这里做"端点自愈"：来源地址不匹配已记录端点时，先把它归位到未匹配的端点，再转发。
-            let fromHost = !!(ep.host && ep.host.addr === rinfo.address && ep.host.port === rinfo.port);
-            let fromController = !!(ep.controller && ep.controller.addr === rinfo.address && ep.controller.port === rinfo.port);
-
-            if (!fromHost && !fromController) {
-                // 来源端口已变（NAT 重映射 / 客户端重启 socket）：归位到那个尚未匹配的端点
-                const hostMatch = !!(ep.host && ep.host.addr === rinfo.address && ep.host.port === rinfo.port);
-                const ctrlMatch = !!(ep.controller && ep.controller.addr === rinfo.address && ep.controller.port === rinfo.port);
-                // 该来源不是已记录的 host → 视为刷新后的 controller 端点
-                if (!hostMatch && (!ctrlMatch)) {
-                    if (!ep.controller || ep.controller.addr !== rinfo.address || ep.controller.port !== rinfo.port) {
-                        ep.controller = { addr: rinfo.address, port: rinfo.port };
-                    }
-                    fromController = true;
-                } else if (!ctrlMatch && !hostMatch) {
-                    if (!ep.host || ep.host.addr !== rinfo.address || ep.host.port !== rinfo.port) {
-                        ep.host = { addr: rinfo.address, port: rinfo.port };
-                    }
-                    fromHost = true;
-                } else {
-                    // 来源地址与某端点相同但端口变了：刷新该端点端口
-                    if (ep.host && ep.host.addr === rinfo.address && ep.host.port !== rinfo.port) {
-                        ep.host = { addr: rinfo.address, port: rinfo.port };
-                        fromHost = true;
-                    } else if (ep.controller && ep.controller.addr === rinfo.address && ep.controller.port !== rinfo.port) {
-                        ep.controller = { addr: rinfo.address, port: rinfo.port };
-                        fromController = true;
-                    }
-                }
-                if (!ep.notified && ep.host && ep.controller) {
-                    ep.notified = true;
-                    const session = sessions.get(ep.sid);
-                    if (session) {
-                        relayTo(session.controller, { op: 'udp.ready', sid: ep.sid });
-                        relayTo(session.host, { op: 'udp.ready', sid: ep.sid });
-                    }
-                }
-            }
-
-            const peer = fromHost ? ep.controller : ep.host;
-            // 防止环回：来源与目标不能是同一地址端口
-            if (peer && !(peer.addr === rinfo.address && peer.port === rinfo.port)) {
-                try { sock.send(msg, peer.port, peer.addr); } catch (e) { /* ignore */ }
+            // 视频/FEC 包：直接按包头 [13] 的 role 转发，不再靠地址猜测角色。
+            // role 由客户端权威写入（host=0 / controller=1），彻底消除 NAT 端口重映射 /
+            // 同源公网 IP 场景下「按地址猜角色」导致的端点错乱（花屏 + 周期性 4-8s 卡顿根因）。
+            // 端点地址端口仍由 hello 包（role 已知）建立，role 仅决定「这个包该发给谁」。
+            if (msg.length < 14) return;
+            const role = msg[13];
+            // role 0 = host 发出的包 → 转发给 controller；role 1 = controller 发出的包 → 转发给 host
+            const target = role === 0 ? ep.controller : ep.host;
+            if (target && !(target.addr === rinfo.address && target.port === rinfo.port)) {
+                try { sock.send(msg, target.port, target.addr); } catch (e) { /* ignore */ }
             }
         });
         sock.on('error', (e) => {
@@ -1084,9 +1048,21 @@ async function handleMessage(ws, m) {
             // 控制端通知：UDP 不可用，回退 TCP。转发给对端（被控端）切换回 WebSocket 发送。
             const session = sessions.get(sid);
             if (!session) break;
+            // 关键修复：重置 UDP 端点状态，允许双方重新通过 hello 建立 UDP 传输。
+            // 【原问题】notified 一旦置 true 永不复位，回退后即使双端 hello 保活包持续到达，
+            // 服务端也不会再发 udp.ready → useUdpVideo 永远无法重新置 true → UDP 永久不可恢复。
+            // 重置后，双端 UdpVideoTransport 仍在运行（未停止），hello 保活包会重新注册端点，
+            // 服务端收到双端 hello 后再次发 udp.ready，UDP 自动恢复。
+            const sidHash = computeSidHash(sid);
+            const ep = udpEndpoints.get(sidHash);
+            if (ep) {
+                ep.host = null;
+                ep.controller = null;
+                ep.notified = false;
+            }
             const peer = peerOf(session, deviceId);
             relayTo(peer, { op: 'udp.fallback', sid });
-            console.log(`[remote] 传输切换: UDP->TCP 回退 sid=${sid} from=${deviceId}`);
+            console.log(`[remote] 传输切换: UDP->TCP 回退 sid=${sid} from=${deviceId}（已重置端点，允许重新激活）`);
             break;
         }
 

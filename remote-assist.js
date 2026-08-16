@@ -418,10 +418,14 @@ const RELAY_BACKPRESSURE_BYTES = 128 * 1024; // 128KB（高延迟下需更低阈
 // 设置环境变量 REMOTE_DEBUG=1 可重新开启（仅排查问题时临时开启）。
 const REMOTE_DEBUG = process.env.REMOTE_DEBUG === '1';
 
-// 判断 NALU 流首帧是否为关键帧（IDR=5 / SPS=7 / PPS=8）。
-// 客户端统一 type=1 承载所有视频帧，故不能再用 type 区分关键帧，
-// 必须从 NALU 数据本身解析第一个 NALU 的单元类型（低5位）。
-// 起始码为 00 00 00 01 或 00 00 01。
+// 关键帧判定方案（修复 HEVC 关键帧误判根因）：
+// 旧逻辑 isKeyFrameBuffer 用 AVC 的 NALU 单元类型算法 ((byte&0x1F)!=1) 解析关键帧，
+// 但本项目实际编码为 HEVC（H.265），该算法在 HEVC 下会把 P 帧也误判为"关键帧"
+// （HEVC 的 NALU type 在高 6 位而非低 5 位），导致背压丢帧策略完全失效——
+// bufferedAmount 无限堆积→延迟 3-10s，且控制端 TCP 的 P 帧不被过滤而与 UDP P 帧重复。
+// 现改为：帧头 type 字段直接携带关键帧语义（type=1 普通视频/P，type=3 关键视频/IDR，type=2 音频），
+// 发送端编码器已精确知道 BUFFER_FLAG_KEY_FRAME，直接打标，权威且无歧义。
+// 这里保留 isKeyFrameBuffer 仅作 type 缺失(old client)的保守兜底，新协议一律按 type 判定。
 function isKeyFrameBuffer(buf) {
     const len = buf.length;
     let i = 0;
@@ -454,17 +458,18 @@ function relayBinary(deviceId, buf) {
     let peerWs = null;
     for (const w of set) { if (w && w.readyState === w.OPEN) { peerWs = w; break; } }
     if (peerWs) {
-        // 背压丢帧：缓冲区积压时，仅丢弃非关键帧(P帧)，保留关键帧(IDR/SPS/PPS)，
-        // 否则对端解码器失去参考帧会花屏/卡死。原画大帧易触发，故阈值调低至 256KB。
+        // 背压丢帧：缓冲区积压时，仅丢弃普通视频帧(P帧, type=1)，保留关键帧(type=3)与音频(type=2)，
+        // 否则对端解码器失去参考帧会花屏/卡死。
+        // 关键帧语义直接由 type 区分（type=3），不再解析 NALU（HEVC 下旧算法误判导致策略失效）。
         try {
             if (peerWs.bufferedAmount > RELAY_BACKPRESSURE_BYTES && type === 1) {
-                // type 固定为 1，需解析 NALU 判断是否为关键帧
-                const nalu = buf.subarray(5 + sidLen);
-                if (!isKeyFrameBuffer(nalu)) {
-                    session.droppedFrames = (session.droppedFrames || 0) + 1;
-                    return;
-                }
+                // type=1 普通视频帧：背压时直接丢弃（不可靠增量帧，丢一帧不影响后续参考）
+                session.droppedFrames = (session.droppedFrames || 0) + 1;
+                return;
             }
+            // type=3 关键帧或 type=2 音频：背压时仍尽量发送（关键帧必达，音频体积小）。
+            // 极端情况下若关键帧也堆满（bufferedAmount 远超阈值），为避免连接彻底阻塞，
+            // 仍放行发送（WebSocket 背压有自身上限，超时由客户端看门狗兜底请求 IDR）。
             peerWs.send(buf);
         } catch (e) { /* 忽略单次发送失败 */ }
     }

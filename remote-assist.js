@@ -55,7 +55,7 @@ function readJson(file, def) {
         if (!c || !c.trim()) return def;
         return JSON.parse(c);
     } catch (e) {
-        console.error('[remote] 读取失败', file, e);
+        logError('[remote] 读取失败', file, e);
         return def;
     }
 }
@@ -64,7 +64,7 @@ function writeJson(file, data) {
         fs.writeFileSync(file, JSON.stringify(data, null, 2));
         return true;
     } catch (e) {
-        console.error('[remote] 写入失败', file, e);
+        logError('[remote] 写入失败', file, e);
         return false;
     }
 }
@@ -119,7 +119,7 @@ async function establishSession(controller, host, code, tag, mode) {
     const modeInfo = { mode: session.mode };
     relayTo(host, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: controller, plan, ...udpInfo, ...modeInfo } });
     relayTo(controller, { op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: host, plan, ...udpInfo, ...modeInfo } });
-    console.log(`[remote] 会话建立(${tag}) sid=${sidNew} 传输模式=${session.mode} 链路=${udpAvailable ? 'UDP' : 'TCP'} plan=${plan}`);
+    logInfo(`会话建立(${tag}) sid=${sidNew} 传输模式=${session.mode} 链路=${udpAvailable ? 'UDP' : 'TCP'} plan=${plan}`);
 }
 
 // ---- 工具 ----
@@ -132,6 +132,30 @@ function genFixedCode(deviceId) {
 }
 function nowMs() { return Date.now(); }
 
+// ================ 【日志系统重构：带时分秒 + 级别 + 去高频重复】 ================
+// 所有 console.log/warn/error 一律走这三个包装函数，确保每条日志自带 HH:MM:SS.sss 时间戳
+// 和级别标识（INFO/WARN/ERR），便于 grep + 时序对齐分析。
+function pad(n, w = 2) { return String(n).padStart(w, '0'); }
+function tsTag() {
+    const d = new Date();
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+}
+const logInfo  = (...a) => console.log (`[${tsTag()}] [INFO]  `, ...a);
+const logWarn  = (...a) => console.warn(`[${tsTag()}] [WARN]  `, ...a);
+const logError = (...a) => console.error(`[${tsTag()}] [ERROR] `, ...a);
+// 节流日志：同一 key 在 Nms 内只允许打一次（防止心跳/信令类高频日志刷屏）
+const throttleMap = new Map();
+function logThrottled(key, intervalMs, fn) {
+    const now = nowMs();
+    const last = throttleMap.get(key) || 0;
+    if (now - last < intervalMs) return;
+    throttleMap.set(key, now);
+    fn();
+}
+// 高频信令 op（心跳、cmd、rtc.quality 等）白名单：超过一次/秒的不重复打印，
+// 避免这些每秒 1-2 次的信令覆盖真正关键的二进制丢帧/IDR风暴日志。
+const NOISY_OP_RE = /^(heartbeat|rtc\.quality|rtc\.deccap|rtc\.codec|cmd\.ack|udp\.fallback)$/;
+
 // ---- 订阅缓存（避免每次 code.connect 都同步读文件阻塞事件循环）----
 let subscriptionCache = null;
 function loadSubscriptionCache() {
@@ -141,7 +165,7 @@ function loadSubscriptionCache() {
             if (c && c.trim()) subscriptionCache = JSON.parse(c);
         }
     } catch (e) {
-        console.error('[remote] 订阅缓存加载失败', e);
+        logError('[remote] 订阅缓存加载失败', e);
     }
     if (!subscriptionCache) subscriptionCache = {};
 }
@@ -185,7 +209,7 @@ let auditStream = null;
 try {
     auditStream = fs.createWriteStream(AUDIT_LOG_FILE, { flags: 'a' });
 } catch (e) {
-    console.error('[remote] 审计日志流创建失败', e);
+    logError('[remote] 审计日志流创建失败', e);
 }
 
 async function audit(sessionId, actor, action, detail) {
@@ -220,7 +244,7 @@ async function createControlCode(hostId) {
         };
         filtered.push(rec);
         writeJson(CONTROL_CODE_FILE, filtered);
-        console.log(`[remote] 登记固定控制码 code=${code} host=${hostId}`);
+        logInfo(`登记固定控制码 code=${code} host=${hostId}`);
         return rec;
     });
 }
@@ -241,8 +265,8 @@ function restoreControlCodes() {
     const list = [...byHost.values()];
     const dropped = raw.length - list.length;
     writeJson(CONTROL_CODE_FILE, list);
-    if (list.length) console.log(`[remote] 已恢复 ${list.length} 个固定控制码`);
-    if (dropped > 0) console.log(`[remote] 已清理 ${dropped} 条失效/重复的旧控制码记录`);
+    if (list.length) logInfo(`已恢复 ${list.length} 个固定控制码`);
+    if (dropped > 0) logInfo(`已清理 ${dropped} 条失效/重复的旧控制码记录`);
 }
 restoreControlCodes();
 
@@ -340,7 +364,7 @@ function notifyTrustPeers(deviceId) {
             relayTo(peerId, { op: 'trust.list', payload: { list: getTrustList(peerId) } });
         }
     } catch (e) {
-        console.warn('[remote] notifyTrustPeers 失败:', e && e.message);
+        logWarn('notifyTrustPeers 失败:', e && e.message);
     }
 }
 
@@ -414,6 +438,105 @@ function relayTo(deviceId, obj) {
 // 避免缓冲区被超大帧快速撑爆导致对端永久冻结。
 const RELAY_BACKPRESSURE_BYTES = 128 * 1024; // 128KB（高延迟下需更低阈值快速泄压）
 
+// ---- TCP 视频中继运行统计（滚动窗口，非阻塞：每 10s 仅输出一次汇总，绝不每帧打印）----
+// 这些统计直接反映"花屏/延迟"的服务端侧根因：
+//   - droppedFrames：背压丢帧数（服务端缓冲区满丢弃 P 帧）→ 直接对应控制端花屏/卡顿
+//   - idrRelayed：关键帧转发数（IDR 是否真到达控制端）
+//   - 当前对端 bufferedAmount：实时背压水位
+const relayStats = { relayed: 0, dropped: 0, idr: 0, lastLogMs: 0 };
+
+// ============== 【关键诊断：会话级全链路指标字典(汇总才打印，绝不刷屏)】 ==============
+// 每个 session 独立存储以下 7 类采样：
+//   tcp / udp：TCP中继、UDP中继的收/发/丢/IDR统计
+//   ba：TCP对端bufferedAmount峰值、采样次数
+//   idr：IDR到达间隔分布、爆体积计数(>100KB)
+//   frameSize：帧字节数直方图 [0-16KB,16-64KB,64-128KB,128KB+] + 爆尺寸帧计数
+//   loss：P帧背压丢帧数/突发次数、突发最大连续丢
+//   rtt：ping/pong最近RTT、RTT P50/P90近似
+//   lastSummaryAt：上一次汇总打印时间戳（每10s才打1次）
+const sessionDiag = new Map();
+function getDiag(sid) {
+    let d = sessionDiag.get(sid);
+    if (!d) {
+        d = {
+            // ===== 原始关键采样（保留原逻辑的事件触发） =====
+            lastIdrAt: 0, burstIdrCount: 0,
+            lastDropAt: 0, burstDropCount: 0,
+            lastBaSampleAt: 0, peakBa: 0,
+            // ===== 新增会话级滚动窗口汇总（10s一打印，非阻塞） =====
+            wStart: nowMs(),
+            tcp: { relayed: 0, dropped: 0, idr: 0, baPeak10s: 0 },
+            udp: { recv: 0, fwd: 0, fec: 0, dropped: 0, hostPkts: 0, ctrlPkts: 0 },
+            idrStat: { total: 0, sizeGt100KB: 0, sizeGt64KB: 0, minGapMs: 99999, avgGapSum: 0, avgGapN: 0, lastSize: 0 },
+            fsz: { hist: [0,0,0,0], hugeFrames: 0, totalBytes: 0, totalFrames: 0 },
+            loss: { pDrops: 0, bursts: 0, maxBurst: 0, curBurst: 0 },
+            rtt: { samples: 0, pings: 0, pongs: 0, recent: 0, sum: 0, max: 0 },
+            role: { host: '', ctrl: '' },
+            lastSummaryAt: 0,
+        };
+        sessionDiag.set(sid, d);
+    }
+    return d;
+}
+// 打印会话级10s汇总（所有有效指标一次输出，格式统一便于grep）
+function printSessionSummary(sid, now) {
+    const d = sessionDiag.get(sid);
+    if (!d) return;
+    const dt = now - d.wStart;
+    if (dt < 10000) return;
+    const sess = sessions.get(sid);
+    const tag = sess ? `${sess.controller.slice(-8)}→${sess.host.slice(-8)}` : '';
+    const fs = d.fsz;
+    const idrS = d.idrStat;
+    const totalF = fs.totalFrames || 1;
+    const avgFB = (fs.totalBytes / totalF) | 0;
+    const avgIdrGap = idrS.avgGapN > 0 ? ((idrS.avgGapSum / idrS.avgGapN) | 0) : 0;
+    const avgRtt = d.rtt.samples > 0 ? ((d.rtt.sum / d.rtt.samples) | 0) : 0;
+    const udpDrop = d.udp.recv - d.udp.fwd;
+    const lossRate = (d.tcp.relayed + d.tcp.dropped) > 0
+        ? ((d.tcp.dropped * 1000 / (d.tcp.relayed + d.tcp.dropped)) / 10).toFixed(1) : '0.0';
+    logInfo(`[会话汇总] sid=${sid.slice(-12)} 对端=${tag} 窗口=${dt}ms`
+        + ` | TCP:转${d.tcp.relayed} 丢${d.tcp.dropped}(${lossRate}%) IDR=${d.tcp.idr} TCP背压峰=${d.tcp.baPeak10s}B`
+        + ` | UDP:收${d.udp.recv} 转${d.udp.fwd} 丢${udpDrop} FEC=${d.udp.fec} H/C=${d.udp.hostPkts}/${d.udp.ctrlPkts}`
+        + ` | 帧:总=${totalF} 均=${avgFB}B 尺寸分[0-16K]=${fs.hist[0]} [16-64K]=${fs.hist[1]} [64-128K]=${fs.hist[2]} [>128K]=${fs.hist[3]} 爆帧=${fs.hugeFrames}`
+        + ` | IDR:总=${idrS.total} >64KB=${idrS.sizeGt64KB} >100KB=${idrS.sizeGt100KB} 距上次均=${avgIdrGap}ms 最小=${idrS.minGapMs===99999?-1:idrS.minGapMs}ms 最近=${idrS.lastSize}B`
+        + ` | P丢:总=${d.loss.pDrops} 突发=${d.loss.bursts} 最长连续=${d.loss.maxBurst}`
+        + ` | RTT:均=${avgRtt}ms 最糟=${d.rtt.max}ms 最近=${d.rtt.recent}ms ping/pong=${d.rtt.pings}/${d.rtt.pongs}`);
+    // 异常指标单独打 WARN，方便告警
+    if (d.tcp.baPeak10s >= RELAY_BACKPRESSURE_BYTES * 0.8)
+        logWarn(`[会话异常:TCP背压爆表] sid=${sid.slice(-12)} baPeak=${d.tcp.baPeak10s}B 阈值=${RELAY_BACKPRESSURE_BYTES}B —— 控制端解码/网络跟不上=花屏/延迟`);
+    if (d.loss.maxBurst >= 50)
+        logWarn(`[会话异常:连续丢P帧] sid=${sid.slice(-12)} 最长连续丢P=${d.loss.maxBurst} 总数=${d.loss.pDrops} —— 马赛克/花屏直接根因`);
+    if (idrS.sizeGt100KB >= 2 && idrS.minGapMs < 2000)
+        logWarn(`[会话异常:超大IDR风暴] sid=${sid.slice(-12)} >100KB的IDR=${idrS.sizeGt100KB}个 最小间隔=${idrS.minGapMs}ms —— IDR占满带宽=P帧全丢=全屏马赛克`);
+    if (udpDrop > d.udp.recv * 0.1 && d.udp.recv > 100)
+        logWarn(`[会话异常:UDP高丢包] sid=${sid.slice(-12)} 丢包率=${((udpDrop*100/d.udp.recv)|0)}% —— 控制端收不齐=局部花屏`);
+    // 重置滚动窗口
+    d.wStart = now;
+    d.tcp.relayed = 0; d.tcp.dropped = 0; d.tcp.idr = 0; d.tcp.baPeak10s = 0;
+    d.udp.recv = 0; d.udp.fwd = 0; d.udp.fec = 0; d.udp.dropped = 0; d.udp.hostPkts = 0; d.udp.ctrlPkts = 0;
+    d.idrStat.total = 0; d.idrStat.sizeGt100KB = 0; d.idrStat.sizeGt64KB = 0;
+    d.idrStat.minGapMs = 99999; d.idrStat.avgGapSum = 0; d.idrStat.avgGapN = 0; d.idrStat.lastSize = 0;
+    d.fsz.hist = [0,0,0,0]; d.fsz.hugeFrames = 0; d.fsz.totalBytes = 0; d.fsz.totalFrames = 0;
+    d.loss.pDrops = 0; d.loss.bursts = 0; d.loss.maxBurst = 0; d.loss.curBurst = 0;
+    d.lastSummaryAt = now;
+}
+// 统一帧大小直方图分桶（供TCP/UDP共用，非阻塞：O(1)分桶+计数，绝不打印逐帧）
+function bucketFrameSize(bytes) {
+    if (bytes < 16 * 1024) return 0;
+    if (bytes < 64 * 1024) return 1;
+    if (bytes < 128 * 1024) return 2;
+    return 3;
+}
+
+// ---- UDP 中继运行统计（滚动窗口，非阻塞：每 10s 仅输出一次汇总）----
+// 直接反映 UDP 链路健康度：
+//   - recv：服务端收到的总包数（含 FEC）
+//   - fwd：成功转发出去的包数（转发失败=对端地址未知/未就绪，对应控制端收不到=花屏）
+//   - fec：冗余包数（FEC 是否在工作）
+//   - fromHost / fromCtrl：按方向细分（方向错乱=周期性卡顿根因）
+const udpStats = { recv: 0, fwd: 0, fec: 0, fromHost: 0, fromCtrl: 0, lastLogMs: 0 };
+
 // 调试日志开关：默认关闭，避免每帧 BINARY 日志狂刷拖垮服务器。
 // 设置环境变量 REMOTE_DEBUG=1 可重新开启（仅排查问题时临时开启）。
 const REMOTE_DEBUG = process.env.REMOTE_DEBUG === '1';
@@ -454,25 +577,131 @@ function relayBinary(deviceId, buf) {
     const peer = peerOf(session, deviceId);
     const set = online.get(peer);
     if (!set) return;
-    // 视频流只发送给对端第一个可用的连接（同一设备多连接时避免重复推流）
     let peerWs = null;
     for (const w of set) { if (w && w.readyState === w.OPEN) { peerWs = w; break; } }
     if (peerWs) {
-        // 背压丢帧：缓冲区积压时，仅丢弃普通视频帧(P帧, type=1)，保留关键帧(type=3)与音频(type=2)，
-        // 否则对端解码器失去参考帧会花屏/卡死。
-        // 关键帧语义直接由 type 区分（type=3），不再解析 NALU（HEVC 下旧算法误判导致策略失效）。
+        const now = nowMs();
+        const diag = getDiag(sid);
+        const ba = peerWs.bufferedAmount;
+        // 【会话级】TCP背压峰值（滚动窗口10s）
+        if (ba > diag.peakBa) diag.peakBa = ba;
+        if (ba > diag.tcp.baPeak10s) diag.tcp.baPeak10s = ba;
+        if (now - diag.lastBaSampleAt >= 3000) {
+            if (diag.peakBa > RELAY_BACKPRESSURE_BYTES / 2) {
+                logWarn(`[TCP背压采样] sid=${sid} 对端=${peer.slice(-8)} bufferedAmount峰=${diag.peakBa}B 当前=${ba}B 阈值=${RELAY_BACKPRESSURE_BYTES}B —— 若持续偏高=控制端弱网/解码慢=延迟累积/花屏`);
+            }
+            diag.lastBaSampleAt = now;
+            diag.peakBa = 0;
+        }
+
+        const payloadLen = buf.length - 5 - sidLen;
+        // 【会话级】帧尺寸分桶（TCP视频帧，type=1/3）
+        if (type === 1 || type === 3) {
+            const bucket = bucketFrameSize(payloadLen);
+            diag.fsz.hist[bucket]++;
+            diag.fsz.totalFrames++;
+            diag.fsz.totalBytes += payloadLen;
+            if (payloadLen >= 128 * 1024) diag.fsz.hugeFrames++;
+        }
+
         try {
-            if (peerWs.bufferedAmount > RELAY_BACKPRESSURE_BYTES && type === 1) {
-                // type=1 普通视频帧：背压时直接丢弃（不可靠增量帧，丢一帧不影响后续参考）
+            if (ba > RELAY_BACKPRESSURE_BYTES && type === 1) {
+                // 【会话级】P帧背压丢：总数+连续丢检测
+                diag.tcp.dropped++;
+                diag.loss.pDrops++;
+                diag.loss.curBurst++;
+                if (diag.loss.curBurst > diag.loss.maxBurst) diag.loss.maxBurst = diag.loss.curBurst;
                 session.droppedFrames = (session.droppedFrames || 0) + 1;
+                relayStats.dropped++;
+                // 原有事件触发：3s内丢>=30打WARN（但用会话级loss可回溯，不用依赖这条瞬时告警）
+                diag.burstDropCount++;
+                if (now - diag.lastDropAt < 3000 && diag.burstDropCount >= 30) {
+                    diag.loss.bursts++;
+                    logWarn(`[TCP丢帧突发] sid=${sid} 对端=${peer.slice(-8)} 3s内丢P帧=${diag.burstDropCount} ba=${ba}B —— 控制端花屏=对端弱网/解码慢`);
+                    diag.burstDropCount = 0; diag.lastDropAt = now;
+                } else if (now - diag.lastDropAt >= 3000) {
+                    diag.burstDropCount = 1; diag.lastDropAt = now;
+                }
+                relayStatsLog();
+                printSessionSummary(sid, now);  // 丢帧也要尝试汇总（内部10s才打，非阻塞）
                 return;
             }
-            // type=3 关键帧或 type=2 音频：背压时仍尽量发送（关键帧必达，音频体积小）。
-            // 极端情况下若关键帧也堆满（bufferedAmount 远超阈值），为避免连接彻底阻塞，
-            // 仍放行发送（WebSocket 背压有自身上限，超时由客户端看门狗兜底请求 IDR）。
+            // 丢帧中断=本帧未丢，重置连续丢计数
+            diag.loss.curBurst = 0;
+
             peerWs.send(buf);
+            diag.tcp.relayed++;
+            relayStats.relayed++;
+            if (type === 3) {
+                diag.tcp.idr++;
+                relayStats.idr++;
+                diag.idrStat.total++;
+                diag.idrStat.lastSize = payloadLen;
+                if (payloadLen >= 64 * 1024) diag.idrStat.sizeGt64KB++;
+                if (payloadLen >= 100 * 1024) diag.idrStat.sizeGt100KB++;
+                const gap = now - diag.lastIdrAt;
+                if (diag.lastIdrAt > 0) {
+                    if (gap < diag.idrStat.minGapMs) diag.idrStat.minGapMs = gap;
+                    diag.idrStat.avgGapSum += gap;
+                    diag.idrStat.avgGapN++;
+                }
+                diag.burstIdrCount = (gap < 1000) ? (diag.burstIdrCount + 1) : 1;
+                if (diag.burstIdrCount >= 3) {
+                    logWarn(`[!!IDR风暴!!] sid=${sid} 1s内转发 IDR>=${diag.burstIdrCount} 个 当前ba=${ba}B size=${payloadLen}B —— HOST端强制产 IDR 过密，会反向挤没 P 帧=冻结/花屏`);
+                    diag.burstIdrCount = 0;
+                } else if (gap < 500) {
+                    logThrottled('shallow_idr_' + sid, 2000, () =>
+                        logInfo(`[IDR过密] sid=${sid} 距上次 IDR=${gap}ms size=${payloadLen}B —— 若频繁出现=IDR风暴前兆`));
+                }
+                diag.lastIdrAt = now;
+            }
         } catch (e) { /* 忽略单次发送失败 */ }
+        // 每帧都调用汇总（内部10s才打印，非阻塞）
+        printSessionSummary(sid, now);
     }
+}
+
+// TCP 视频中继统计：每 10s 输出一次滚动窗口汇总（增量），避免每帧打印拖垮服务器。
+// 这是服务端侧定位"花屏/延迟"的唯一硬指标：丢帧率 + 对端实时背压水位 + IDR 到达率。
+function relayStatsLog() {
+    const now = nowMs();
+    const dt = now - relayStats.lastLogMs;
+    if (dt < 10000) return;
+    const dRelayed = relayStats.relayed;
+    const dDropped = relayStats.dropped;
+    const dIdr = relayStats.idr;
+    relayStats.relayed = 0; relayStats.dropped = 0; relayStats.idr = 0;
+    relayStats.lastLogMs = now;
+    // 反映"当前"水位的样本：取最近一次被丢弃帧时的 bufferedAmount（已积满）
+    if (dDropped > 0 || dRelayed > 0) {
+        const total = dRelayed + dDropped;
+        const lossRate = total > 0 ? ((dDropped * 1000 / total) / 10).toFixed(1) : '0.0';
+        logInfo(`[TCP中继] 窗口${dt}ms 转发帧=${dRelayed} 背压丢帧=${dDropped} 丢帧率=${lossRate}% IDR转发=${dIdr}`);
+    }
+}
+
+// UDP 中继统计：每 10s 输出一次滚动窗口汇总（增量），绝不每包打印。
+// 转发数 < 收包数（fwd<recv）说明有包因对端地址未就绪被丢弃 → 控制端收不到=花屏/卡顿；
+// 方向计数(fromHost/fromCtrl)异常说明 role 错乱 → 周期性卡顿根因；fec>0 说明冗余通道工作。
+function udpStatsLog() {
+    const now = nowMs();
+    const dt = now - udpStats.lastLogMs;
+    if (dt < 10000) return;
+    const dRecv = udpStats.recv;
+    const dFwd = udpStats.fwd;
+    const dFec = udpStats.fec;
+    const dFromHost = udpStats.fromHost;
+    const dFromCtrl = udpStats.fromCtrl;
+    udpStats.recv = 0; udpStats.fwd = 0; udpStats.fec = 0;
+    udpStats.fromHost = 0; udpStats.fromCtrl = 0;
+    udpStats.lastLogMs = now;
+    if (dRecv <= 0) return;
+    const dropPkts = dRecv - dFwd;
+    logInfo(`[UDP中继] 窗口${dt}ms 收包=${dRecv} 转发=${dFwd} 丢弃=${dropPkts} FEC包=${dFec} fromHost=${dFromHost} fromCtrl=${dFromCtrl}`);
+    // 【关键采样 4: UDP 丢包/方向异常】丢包率>10% 或 方向异常（fromCtrl>fromHost）打 WARN
+    const lossPktRate = (dRecv > 0) ? (dropPkts * 100 / dRecv) : 0;
+    if (lossPktRate >= 10) logWarn(`[UDP高丢包] 丢包率=${lossPktRate.toFixed(1)}% 丢=${dropPkts}/${dRecv} —— 控制端持续花屏/卡顿根因`);
+    if (dFromCtrl > dFromHost * 1.5) logWarn(`[UDP方向异常] fromHost=${dFromHost} fromCtrl=${dFromCtrl} 控制器发包占比过高 —— 可能端点错乱=周期性卡顿`);
 }
 
 // ---- UDP 中继（CS 中继模式增强：视频流走 UDP，消除 TCP HOL 阻塞）----
@@ -503,7 +732,7 @@ function initUdpRelay(preferredPort) {
     let idx = 0;
     const tryBind = () => {
         if (idx >= tryPorts.length) {
-            console.log('[remote] UDP 绑定全部失败，视频走 TCP（WebSocket）');
+            logWarn('UDP 绑定全部失败，视频走 TCP（WebSocket）');
             return;
         }
         const port = tryPorts[idx++];
@@ -533,7 +762,7 @@ function initUdpRelay(preferredPort) {
                         if (session) {
                             relayTo(session.controller, { op: 'udp.ready', sid: ep.sid });
                             relayTo(session.host, { op: 'udp.ready', sid: ep.sid });
-                            console.log(`[remote] 传输切换: UDP 就绪 sid=${ep.sid} host=${ep.host.addr}:${ep.host.port} ctrl=${ep.controller.addr}:${ep.controller.port}`);
+                            logInfo(`传输切换: UDP 就绪 sid=${ep.sid} host=${ep.host.addr}:${ep.host.port} ctrl=${ep.controller.addr}:${ep.controller.port}`);
                         }
                     }
                 }
@@ -548,18 +777,35 @@ function initUdpRelay(preferredPort) {
             const role = msg[13];
             // role 0 = host 发出的包 → 转发给 controller；role 1 = controller 发出的包 → 转发给 host
             const target = role === 0 ? ep.controller : ep.host;
+            if (role === 0) { udpStats.fromHost++; } else { udpStats.fromCtrl++; }
+            // 【会话级】按sid把UDP统计也写入sessionDiag（和TCP同源统一查看）
+            const nowUdp = nowMs();
+            const diagUdp = getDiag(ep.sid);
+            if (role === 0) diagUdp.udp.hostPkts++; else diagUdp.udp.ctrlPkts++;
+            diagUdp.udp.recv++;
+            let thisFwd = false;
             if (target && !(target.addr === rinfo.address && target.port === rinfo.port)) {
-                try { sock.send(msg, target.port, target.addr); } catch (e) { /* ignore */ }
+                try {
+                    sock.send(msg, target.port, target.addr);
+                    udpStats.fwd++;
+                    diagUdp.udp.fwd++;
+                    thisFwd = true;
+                } catch (e) { /* ignore */ }
             }
+            if (!thisFwd) diagUdp.udp.dropped++;
+            if (isFec) { udpStats.fec++; diagUdp.udp.fec++; }
+            udpStatsLog();
+            // 每包调用（内部10s才打印，非阻塞）
+            printSessionSummary(ep.sid, nowUdp);
         });
         sock.on('error', (e) => {
             // 绑定阶段错误：尝试下一个端口；运行期错误：回退 TCP
             if (!udpAvailable) {
-                console.warn(`[remote] UDP 绑定端口 ${port} 失败: ${e.message}，尝试下一个`);
+                logWarn(`UDP 绑定端口 ${port} 失败: ${e.message}，尝试下一个`);
                 try { sock.close(); } catch (_) {}
                 tryBind();
             } else {
-                console.warn(`[remote] UDP 运行错误，回退 TCP: ${e.message}`);
+                logWarn(`UDP 运行错误，回退 TCP: ${e.message}`);
                 udpAvailable = false;
             }
         });
@@ -567,7 +813,7 @@ function initUdpRelay(preferredPort) {
             udpServer = sock;
             udpPort = sock.address().port;
             udpAvailable = true;
-            console.log(`[remote] UDP 中继已启动 端口=${udpPort}${port === 0 ? '(随机)' : ''}`);
+            logInfo(`UDP 中继已启动 端口=${udpPort}${port === 0 ? '(随机)' : ''}`);
         });
     };
     tryBind();
@@ -587,7 +833,7 @@ function attach(httpServer) {
         const startUdp = () => {
             const addr = httpServer.address();
             const httpPort = (addr && typeof addr === 'object') ? addr.port : 0;
-            try { initUdpRelay(httpPort); } catch (e) { console.warn(`[remote] UDP 自动启用失败: ${e.message}`); }
+            try { initUdpRelay(httpPort); } catch (e) { logWarn(`UDP 自动启用失败: ${e.message}`); }
         };
         if (httpServer.listening) startUdp();
         else httpServer.once('listening', startUdp);
@@ -602,14 +848,14 @@ function attach(httpServer) {
         const dname = (url.searchParams.get('dname') || '').trim();
 
         if (!deviceId || !verifyToken(deviceId, token)) {
-            console.warn(`[remote] 连接被拒 unauthorized deviceId=${deviceId} token=${token ? '***' : '(空)'}`);
+            logWarn(`连接被拒 unauthorized device=${deviceId && deviceId.slice(-8)} token=${token ? '***' : '(空)'}`);
             try { ws.close(4001, 'unauthorized'); } catch (e) {}
             return;
         }
         // 记录系统设备名称（设置→关于手机→设备名称，如「荣耀60SE」「妈妈的手机」），
         // 供信任列表默认展示（无需备注即可区分不同设备）
         if (dname) deviceInfo.set(deviceId, { deviceName: dname });
-        console.log(`[remote] 新 WebSocket 连接建立 deviceId=${deviceId}${dname ? ' deviceName=' + dname : ''}（此时在线 ${online.size} 台）`);
+        logInfo(`新 WebSocket 连接建立 device=${deviceId.slice(-8)}${dname ? ' dname=' + dname : ''} 在线=${online.size}`);
 
         ws.deviceId = deviceId;
         ws.isAlive = true;
@@ -620,9 +866,9 @@ function attach(httpServer) {
         if (standbyMap.has(deviceId)) {
             const st = standbyMap.get(deviceId);
             st.ws = ws;
-            createControlCode(deviceId).catch(e => console.error('[remote] 待命续期失败', e));
+            createControlCode(deviceId).catch(e => logError('待命续期失败', e));
         }
-        console.log(`[remote] 设备上线: ${deviceId}, 在线数: ${online.size}`);
+        logInfo(`设备上线: ${deviceId.slice(-8)}, 在线数: ${online.size}`);
         // 通知信任对端：该设备已上线，控制端列表实时点亮
         notifyTrustPeers(deviceId);
 
@@ -632,18 +878,38 @@ function attach(httpServer) {
             if ((session.controller === deviceId || session.host === deviceId) && pendingDisconnects.has(sid)) {
                 clearTimeout(pendingDisconnects.get(sid));
                 pendingDisconnects.delete(sid);
-                console.log(`[remote] 设备 ${deviceId} 重连，恢复会话 ${sid}`);
+                logInfo(`设备 ${deviceId.slice(-8)} 重连，恢复会话 ${sid}`);
             }
         }
 
-        ws.on('pong', () => { ws.isAlive = true; });
+        // 【会话级RTT探针】服务端主动发ping→客户端回pong，测量WS链路真实RTT（ms）
+        // 写入 sessionDiag.rtt：均/最糟/最近 值，每10s会话汇总必打印
+        ws.on('pong', () => {
+            ws.isAlive = true;
+            if (!ws._pingAt) return;
+            const rtt = nowMs() - ws._pingAt;
+            ws._pingAt = 0;
+            // 找到该ws所属所有sid（1个设备可能参与1~2个会话同时期）
+            const deviceId = ws.deviceId;
+            for (const [sid, sess] of sessions.entries()) {
+                if (!sess || sess.status === 'terminated') continue;
+                if (sess.controller !== deviceId && sess.host !== deviceId) continue;
+                const d = getDiag(sid);
+                d.rtt.pongs++;
+                d.rtt.recent = rtt;
+                d.rtt.samples++;
+                d.rtt.sum += rtt;
+                if (rtt > d.rtt.max) d.rtt.max = rtt;
+            }
+        });
 
         ws.on('message', async (raw) => {
             const isBuf = Buffer.isBuffer(raw);
             // 调试：仅当 REMOTE_DEBUG=1 时打印每帧原始消息（平时关闭，避免日志狂刷拖垮服务器）
             if (REMOTE_DEBUG) {
                 const t = isBuf ? `BINARY(${raw.length}B)` : `TEXT(${String(raw).length}ch)`;
-                console.log(`[remote][raw] deviceId=${deviceId} type=${t} head=${isBuf ? raw.slice(0, 12).toString('hex') : String(raw).slice(0, 80)}`);
+                const head = isBuf ? raw.slice(0, 12).toString('hex') : String(raw).slice(0, 80);
+                logInfo(`[DEBUG raw] device=${deviceId.slice(-8)} type=${t} head=${head}`);
             }
 
             // 容错：客户端（OkHttp）可能把 JSON 信令以二进制帧(opcode=0x2)发出，
@@ -657,11 +923,20 @@ function attach(httpServer) {
                 try { m = JSON.parse(buf.toString('utf8')); } catch (e) {
                     return ws.send(JSON.stringify({ op: 'error', payload: { msg: 'invalid_json' } }));
                 }
-                console.log(`[remote] 收到消息(二进制承载的JSON) deviceId=${deviceId} op=${m && m.op} sid=${m && m.sid || ''}`);
+                // 【日志去噪】高频信令(heartbeat/rtc.quality/cmd_ack 等)节流 1s 打一次，
+                // 其余关键 op 每次都打（code.connect/keyframe.request/trust 绑定等）。
+                const op = (m && m.op) || '';
+                const noisy = NOISY_OP_RE.test(op);
+                if (noisy) {
+                    logThrottled('op_' + deviceId + '_' + op, 1000, () =>
+                        logInfo(`[CS信令-高频节流] device=${deviceId.slice(-8)} op=${op} sid=${(m && m.sid) || ''} —— 同类消息已节流，实际每 1s 至多一条`));
+                } else {
+                    logInfo(`[CS信令] device=${deviceId.slice(-8)} op=${op} sid=${(m && m.sid) || ''}`);
+                }
                 try {
                     await handleMessage(ws, m);
                 } catch (e) {
-                    console.error('[remote] 处理消息异常', e);
+                    logError(`[处理消息异常] device=${deviceId.slice(-8)} op=${op} err=${e && e.message} stack=${e && e.stack && e.stack.split('\n')[0] || ''}`);
                     ws.send(JSON.stringify({ op: 'error', payload: { msg: 'internal', detail: String(e && e.message) } }));
                 }
                 return;
@@ -677,11 +952,18 @@ function attach(httpServer) {
             try { m = JSON.parse(raw.toString()); } catch (e) {
                 return ws.send(JSON.stringify({ op: 'error', payload: { msg: 'invalid_json' } }));
             }
-            console.log(`[remote] 收到消息 deviceId=${deviceId} op=${m && m.op} sid=${m && m.sid || ''}`);
+            const op = (m && m.op) || '';
+            const noisy = NOISY_OP_RE.test(op);
+            if (noisy) {
+                logThrottled('op_' + deviceId + '_' + op, 1000, () =>
+                    logInfo(`[WS信令-高频节流] device=${deviceId.slice(-8)} op=${op} sid=${(m && m.sid) || ''}`));
+            } else {
+                logInfo(`[WS信令] device=${deviceId.slice(-8)} op=${op} sid=${(m && m.sid) || ''}`);
+            }
             try {
                 await handleMessage(ws, m);
             } catch (e) {
-                console.error('[remote] 处理消息异常', e);
+                logError(`[处理消息异常] device=${deviceId.slice(-8)} op=${op} err=${e && e.message}`);
                 ws.send(JSON.stringify({ op: 'error', payload: { msg: 'internal', detail: String(e && e.message) } }));
             }
         });
@@ -699,7 +981,7 @@ function attach(httpServer) {
             if (standbyMap.has(deviceId) && standbyMap.get(deviceId).ws === ws && (!online.has(deviceId))) {
                 standbyMap.delete(deviceId);
             }
-            console.log(`[remote] 连接关闭 deviceId=${deviceId}, 该设备剩余在线连接: ${online.has(deviceId) ? online.get(deviceId).size : 0}, 总在线设备数: ${online.size}`);
+            logInfo(`连接关闭 device=${deviceId.slice(-8)} 该设备剩余连接=${online.has(deviceId) ? online.get(deviceId).size : 0} 总在线=${online.size}`);
             // 设备已通过其它连接（如常驻信令）保持在线：无需通知离线
             if (online.has(deviceId)) return;
             // 通知信任对端：该设备已离线，控制端列表实时置灰
@@ -709,13 +991,13 @@ function attach(httpServer) {
                 if (session.status === 'terminated') continue;
                 if (session.controller === deviceId || session.host === deviceId) {
                     if (pendingDisconnects.has(sid)) continue; // 已有宽限定时器
-                    console.log(`[remote] 设备 ${deviceId} 断线，会话 ${sid} 进入 ${RECONNECT_GRACE_MS / 1000}s 宽限期`);
+                    logInfo(`设备 ${deviceId.slice(-8)} 断线，会话 ${sid} 进入 ${RECONNECT_GRACE_MS / 1000}s 宽限期`);
                     const timer = setTimeout(() => {
                         pendingDisconnects.delete(sid);
                         const s = sessions.get(sid);
                         if (!s || s.status === 'terminated') return;
                         const peer = peerOf(s, deviceId);
-                        console.log(`[remote] 设备 ${deviceId} 宽限期超时未重连，终止会话 ${sid}`);
+                        logInfo(`设备 ${deviceId.slice(-8)} 宽限期超时未重连，终止会话 ${sid}`);
                         forceTerminate(sid, 'peer_offline').then(() => {
                             relayTo(peer, { op: 'terminate', sid, payload: { reason: 'peer_offline' } });
                         });
@@ -725,7 +1007,7 @@ function attach(httpServer) {
             }
         });
 
-        ws.on('error', (e) => { console.error('[remote] ws error', deviceId, e.message); });
+        ws.on('error', (e) => { logError('ws error', deviceId && deviceId.slice(-8), e.message); });
     });
 
     // 心跳检测
@@ -736,7 +1018,24 @@ function attach(httpServer) {
                 return;
             }
             ws.isAlive = false;
-            try { ws.ping(); } catch (e) {}
+            try {
+                // 【会话级RTT】ping前记录时间戳，pong回调中算差值=真实WS RTT
+                ws._pingAt = nowMs();
+                const deviceId = ws.deviceId;
+                // 把这次ping也记录到所属会话的rtt.pings（用于pings/pongs比例核对=心跳健康度）
+                if (deviceId) {
+                    for (const [sid, sess] of sessions.entries()) {
+                        if (!sess || sess.status === 'terminated') continue;
+                        if (sess.controller !== deviceId && sess.host !== deviceId) continue;
+                        const d = getDiag(sid);
+                        d.rtt.pings++;
+                        // 会话建立时记录role缩写，便于汇总打印
+                        if (!d.role.host) d.role.host = sess.host && sess.host.slice(-8);
+                        if (!d.role.ctrl) d.role.ctrl = sess.controller && sess.controller.slice(-8);
+                    }
+                }
+                ws.ping();
+            } catch (e) {}
         });
     }, 30 * 1000);
 
@@ -751,11 +1050,11 @@ async function handleMessage(ws, m) {
 
     switch (m.op) {
         case 'code.create': {
-            console.log(`[remote] >>> code.create 来自 deviceId=${deviceId}，开始生成控制码`);
+            logInfo(`>>> code.create 来自 device=${deviceId.slice(-8)}，开始生成控制码`);
             const rec = await createControlCode(deviceId);
             await audit(rec.code, deviceId, 'open', 'create_code');
             const resp = JSON.stringify({ op: 'code.created', payload: { code: rec.code, expiresAt: rec.expiresAt } });
-            console.log(`[remote] <<< 回包 code.created code=${rec.code} -> ${resp}`);
+            logInfo(`<<< 回包 code.created code=${rec.code}`);
             ws.send(resp);
             break;
         }
@@ -801,7 +1100,7 @@ async function handleMessage(ws, m) {
             }
             // 控制端先收到"等待确认"提示
             ws.send(JSON.stringify({ op: 'code.waiting', payload: { code, host: hostId } }));
-            console.log(`[remote] 连接请求待确认 controller=${deviceId} -> host=${hostId} code=${code}`);
+            logInfo(`连接请求待确认 controller=${deviceId.slice(-8)} -> host=${hostId.slice(-8)} code=${code}`);
             break;
         }
 
@@ -831,7 +1130,7 @@ async function handleMessage(ws, m) {
             }
             pendingConfirms.delete(key);
             relayTo(controller, { op: 'code.reject', payload: { reason: 'rejected' } });
-            console.log(`[remote] 连接请求被拒绝 host=${deviceId} -> controller=${controller}`);
+            logInfo(`连接请求被拒绝 host=${deviceId.slice(-8)} -> controller=${controller && controller.slice(-8)}`);
             break;
         }
 
@@ -842,10 +1141,10 @@ async function handleMessage(ws, m) {
                 standbyMap.set(deviceId, { standby: true, ws, code: genFixedCode(deviceId), since: nowMs() });
                 const rec = await createControlCode(deviceId);
                 relayTo(deviceId, { op: 'standby.ok', payload: { code: rec.code } });
-                console.log(`[remote] 设备进入待命 deviceId=${deviceId} code=${rec.code}`);
+                logInfo(`设备进入待命 device=${deviceId.slice(-8)} code=${rec.code}`);
             } else {
                 standbyMap.delete(deviceId);
-                console.log(`[remote] 设备退出待命 deviceId=${deviceId}`);
+                logInfo(`设备退出待命 device=${deviceId.slice(-8)}`);
             }
             // 待命状态变化时主动推给信任我的对端，使其列表实时显示在线/离线
             notifyTrustPeers(deviceId);
@@ -880,7 +1179,7 @@ async function handleMessage(ws, m) {
                 }
             });
             ws.send(JSON.stringify({ op: 'trust.bind.waiting', payload: { code } }));
-            console.log(`[remote] 信任绑定请求 from=${deviceId} -> to=${peerId} code=${code}`);
+            logInfo(`信任绑定请求 from=${deviceId.slice(-8)} -> to=${peerId.slice(-8)} code=${code}`);
             break;
         }
 
@@ -897,7 +1196,7 @@ async function handleMessage(ws, m) {
             addTrust(pend.from, pend.to, pend.fromName, (m.payload && m.payload.name) || '');
             relayTo(pend.from, { op: 'trust.confirmed', payload: { peer: pend.to, name: (m.payload && m.payload.name) || pend.to } });
             ws.send(JSON.stringify({ op: 'trust.confirmed', payload: { peer: pend.from, name: pend.fromName || pend.from } }));
-            console.log(`[remote] 信任绑定确认 from=${pend.from} <-> to=${pend.to}`);
+            logInfo(`信任绑定确认 from=${pend.from && pend.from.slice(-8)} <-> to=${pend.to && pend.to.slice(-8)}`);
             // 绑定成功后主动把最新信任列表推给双方，确保控制端实时看到对方"在线·可连接"，
             // 而不依赖控制端收到 trust.confirmed 后再主动拉取（主动拉取可能因连接抖动丢失回包）。
             notifyTrustPeers(pend.from);
@@ -963,7 +1262,7 @@ async function handleMessage(ws, m) {
                 relayTo(peerId, { op: 'trust.removed', payload: { peer: deviceId } });
                 relayTo(peerId, { op: 'trust.list', payload: { list: getTrustList(peerId) } });
             }
-            console.log(`[remote] 移除信任 deviceId=${deviceId} peer=${peerId}`);
+            logInfo(`移除信任 device=${deviceId.slice(-8)} peer=${peerId.slice(-8)}`);
             break;
         }
 
@@ -1013,7 +1312,10 @@ async function handleMessage(ws, m) {
             }
             session.lastActivity = nowMs();
             relayTo(session.host, { op: 'keyframe.request', sid, payload: m.payload || {} });
-            console.log(`[remote] keyframe.request controller=${deviceId} -> host=${session.host} sid=${sid}`);
+            // 【关键采样 5: IDR 请求】控制端每次发起 IDR 请求都打 INFO，
+            // 结合 relayStats 的"IDR转发数"可以算出：请求了多少 / 实际到达多少。
+            // 若控制端连续请求 >3 次但 IDR 转发 < 对应的被控端真实输出 = 被控端仍在熔断。
+            logInfo(`keyframe.request ctrl=${deviceId.slice(-8)} -> host=${session.host.slice(-8)} sid=${sid}`);
             break;
         }
 
@@ -1051,6 +1353,39 @@ async function handleMessage(ws, m) {
             break;
         }
 
+        // 信任设备间指令：控制端向"在线"的受控端（未必处于活动会话中）下发指令（如锁屏）。
+        // 受控端处理完后通过 trust.cmd_ack 回执，服务器再转发回控制端。
+        // 约定：peer 一律放在 payload 内，便于客户端统一用 payload.peer 读取。
+        case 'trust.cmd': {
+            const payload = m.payload || {};
+            const peerId = payload.peer;
+            const peerSet = online.get(peerId);
+            if (!peerSet || peerSet.size === 0) {
+                // 对方不在线，直接回执失败
+                relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: false, reason: '对方不在线' } });
+                break;
+            }
+            if (!isTrusted(deviceId, peerId)) {
+                relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: false, reason: '非信任设备' } });
+                break;
+            }
+            // 透传给受控端（relayTo 按 deviceId 遍历其所有在线连接发送），
+            // 携来源 deviceId（控制端，写入 payload.peer）以便其回执；action 为编码后的 ActionJson 字符串
+            relayTo(peerId, { op: 'trust.cmd', payload: { peer: deviceId, action: payload.action } });
+            break;
+        }
+
+        // 受控端处理 trust.cmd 后的回执：payload.peer 为下发时服务器填入的控制端 deviceId
+        case 'trust.cmd_ack': {
+            const payload = m.payload || {};
+            const controllerId = payload.peer;
+            const targetSet = online.get(controllerId);
+            if (targetSet && targetSet.size > 0) {
+                relayTo(controllerId, { op: 'trust.cmd_ack', payload: { peer: deviceId, ok: !!payload.ok, reason: payload.reason || '' } });
+            }
+            break;
+        }
+
         case 'terminate': {
             const session = sessions.get(sid);
             if (!session) break;
@@ -1079,7 +1414,7 @@ async function handleMessage(ws, m) {
             }
             const peer = peerOf(session, deviceId);
             relayTo(peer, { op: 'udp.fallback', sid });
-            console.log(`[remote] 传输切换: UDP->TCP 回退 sid=${sid} from=${deviceId}（已重置端点，允许重新激活）`);
+            logInfo(`传输切换: UDP->TCP 回退 sid=${sid} from=${deviceId.slice(-8)}（已重置端点，允许重新激活）`);
             break;
         }
 
@@ -1087,7 +1422,7 @@ async function handleMessage(ws, m) {
             ws.send(JSON.stringify({ op: 'pong' }));
             // 待命设备：心跳时续期固定控制码，确保长期在线期间码持续有效
             if (standbyMap.has(deviceId) && standbyMap.get(deviceId).standby) {
-                createControlCode(deviceId).catch(e => console.error('[remote] 待命心跳续期失败', e));
+                createControlCode(deviceId).catch(e => logError('待命心跳续期失败', e));
             }
             break;
         }
@@ -1101,7 +1436,7 @@ async function handleMessage(ws, m) {
 function setSubscription(deviceId, plan) {
     subscriptionCache[deviceId] = plan;
     fs.writeFile(SUBSCRIPTION_FILE, JSON.stringify(subscriptionCache, null, 2), (e) => {
-        if (e) console.error('[remote] 订阅缓存刷盘失败', e);
+        if (e) logError('订阅缓存刷盘失败', e);
     });
 }
 
@@ -1113,7 +1448,7 @@ function startTimeoutWatchdog() {
             if (session.status === 'terminated') { sessions.delete(sid); continue; }
             const elapsed = t - session.startedAt;
             if (elapsed > session.limitMs) {
-                console.log(`[remote] 会话超时强断: ${sid}, plan=${session.plan}, elapsed=${elapsed}ms`);
+                logInfo(`会话超时强断: ${sid}, plan=${session.plan}, elapsed=${elapsed}ms`);
                 await forceTerminate(sid, 'timeout');
             }
         }
@@ -1142,7 +1477,7 @@ function getIceConfig() {
     ];
     const turnUrl = process.env.TURN_URL;
     if (!turnUrl || !process.env.TURN_USERNAME || !process.env.TURN_CREDENTIAL) {
-        console.log('[ice] 未配置 TURN 环境变量，仅使用公共 STUN（跨网络可能无法直连）');
+        logInfo('[ice] 未配置 TURN 环境变量，仅使用公共 STUN（跨网络可能无法直连）');
         return { encrypted: false, stun, turn: [] };
     }
     const key = process.env.ENCRYPT_KEY;
@@ -1150,7 +1485,7 @@ function getIceConfig() {
     if (!preEncrypted) {
         // ---- 明文模式：服务端用 ENCRYPT_KEY 加密后再下发 ----
         if (!key) {
-            console.warn('[ice] 已配置 TURN 但未配置 ENCRYPT_KEY，拒绝明文下发长期凭证，仅返回 STUN');
+            logWarn('[ice] 已配置 TURN 但未配置 ENCRYPT_KEY，拒绝明文下发长期凭证，仅返回 STUN');
             return { encrypted: false, stun, turn: [] };
         }
         const turnList = turnUrl.split('|').filter(Boolean).map(raw => ({
@@ -1159,7 +1494,7 @@ function getIceConfig() {
             credential: process.env.TURN_CREDENTIAL,
         }));
         const payload = xorBase64(JSON.stringify({ turn: turnList }), key);
-        console.log(`[ice] 已加密(明文模式) TURN 配置下发，共 ${turnList.length} 个（凭证已加密）`);
+        logInfo(`[ice] 已加密(明文模式) TURN 配置下发，共 ${turnList.length} 个（凭证已加密）`);
         return { encrypted: true, payload, stun };
     }
     // ---- 预加密模式（TURN_PRE_ENCRYPTED=true）----
@@ -1168,10 +1503,10 @@ function getIceConfig() {
     // 这样 .env 里不出现明文 TURN 凭证（个人部署推荐）。
     try {
         const payload = turnUrl.trim();
-        console.log('[ice] 预加密模式：TURN_URL 直接作为加密 payload 下发（长度=%d）', payload.length);
+        logInfo('[ice] 预加密模式：TURN_URL 直接作为加密 payload 下发（长度=%d）', payload.length);
         return { encrypted: true, payload, stun };
     } catch (e) {
-        console.error('[ice] 预加密模式处理失败，仅返回 STUN：', e.message);
+        logError('[ice] 预加密模式处理失败，仅返回 STUN：', e.message);
         return { encrypted: false, stun, turn: [] };
     }
 }

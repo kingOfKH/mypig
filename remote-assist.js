@@ -18,7 +18,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const dgram = require('dgram');
+
 const { WebSocketServer } = require('ws');
 const { xorBase64 } = require('./crypto-util');
 
@@ -111,15 +111,18 @@ async function establishSession(controller, host, code, tag, mode) {
     sessions.set(sidNew, session);
     await persistSession(session, 'connecting');
     await audit(sidNew, controller, 'connect', `code=${code} via=${tag} mode=${session.mode}`);
-    if (udpAvailable) {
-        udpEndpoints.set(computeSidHash(sidNew), { sid: sidNew, host: null, controller: null, notified: false });
-    }
-    const udpInfo = udpAvailable ? { udpPort: udpPort } : {};
     // 把选定的传输模式权威下发给两端（被控端必须跟随，控制端也以服务端下发为准消除本地竞态）
     const modeInfo = { mode: session.mode };
-    relayTo(host, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: controller, plan, ...udpInfo, ...modeInfo } });
-    relayTo(controller, { op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: host, plan, ...udpInfo, ...modeInfo } });
-    logInfo(`会话建立(${tag}) sid=${sidNew} 传输模式=${session.mode} 链路=${udpAvailable ? 'UDP' : 'TCP'} plan=${plan}`);
+    // MediaMTX WHIP/WHEP 端点：被控端推流用 /whip，控制端拉流用 /whep，path 同为 sid。
+    // 用被控端连接到的服务端 IP 构建 base，避免 localhost 在手机上指向手机自身。
+    const mtxBase = getMediamtxBaseForDevice(host);
+    const mtxInfo = {
+        mediamtxWhip: `${mtxBase}/${sidNew}/whip`,
+        mediamtxWhep: `${mtxBase}/${sidNew}/whep`
+    };
+    relayTo(host, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: controller, plan, ...modeInfo, ...mtxInfo } });
+    relayTo(controller, { op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: host, plan, ...modeInfo, ...mtxInfo } });
+    logInfo(`会话建立(${tag}) sid=${sidNew} 传输模式=${session.mode} plan=${plan} mtx=${mtxInfo.mediamtxWhip}`);
 }
 
 // ---- 工具 ----
@@ -154,7 +157,7 @@ function logThrottled(key, intervalMs, fn) {
 }
 // 高频信令 op（心跳、cmd、rtc.quality 等）白名单：超过一次/秒的不重复打印，
 // 避免这些每秒 1-2 次的信令覆盖真正关键的二进制丢帧/IDR风暴日志。
-const NOISY_OP_RE = /^(heartbeat|rtc\.quality|rtc\.deccap|rtc\.codec|cmd\.ack|udp\.fallback)$/;
+const NOISY_OP_RE = /^(heartbeat|rtc\.quality|rtc\.deccap|rtc\.codec|cmd\.ack)$/;
 
 // ---- 订阅缓存（避免每次 code.connect 都同步读文件阻塞事件循环）----
 let subscriptionCache = null;
@@ -409,8 +412,7 @@ async function forceTerminate(sid, reason) {
         }
     });
     sessions.delete(sid);
-    // 清理 UDP 端点表和宽限定时器
-    udpEndpoints.delete(computeSidHash(sid));
+
     if (pendingDisconnects.has(sid)) { clearTimeout(pendingDisconnects.get(sid)); pendingDisconnects.delete(sid); }
 }
 
@@ -427,396 +429,39 @@ function relayTo(deviceId, obj) {
     return sent;
 }
 
-// ---- 二进制视频帧中转（CS 中继模式）----
-// 帧格式：[1B type][4B sidLen(大端)][sid UTF8][NALU 原始字节]
-// 服务端不解析 NALU，仅按 sid 找到对端 session 并原样转发整段 Buffer（含帧头，
-// 由客户端自行解析 type/sid 后取 NALU）。type 目前固定 1=视频，预留扩展音频/控制。
-// 中继背压阈值：对端发送缓冲区超过该字节数，说明客户端消费慢（弱网/卡顿），
-// 此时丢弃非关键帧(P帧)，只保关键帧(IDR/SPS-PPS)与最新帧，避免延迟无限堆积。
-// 实时流允许"丢旧帧保新帧"以提升流畅度与降低端到端延迟。
-// 原画档单帧可达 300~560KB，阈值设 256KB 即可在缓冲刚开始积压时就丢非关键帧，
-// 避免缓冲区被超大帧快速撑爆导致对端永久冻结。
-const RELAY_BACKPRESSURE_BYTES = 128 * 1024; // 128KB（高延迟下需更低阈值快速泄压）
+// MediaMTX WHIP/WHEP 端点 base：code.matched 时随信令下发给两端，被控端 /whip 推流、控制端 /whep 拉流。
+// 默认与信令服务同机 8889 端口；生产环境用 MEDIAMTX_BASE 覆盖（如 https://mtx.example.com/starclick）。
+const mediamtxBase = (process.env.MEDIAMTX_BASE || 'http://localhost:8889/starclick').replace(/\/+$/, '');
 
-// ---- TCP 视频中继运行统计（滚动窗口，非阻塞：每 10s 仅输出一次汇总，绝不每帧打印）----
-// 这些统计直接反映"花屏/延迟"的服务端侧根因：
-//   - droppedFrames：背压丢帧数（服务端缓冲区满丢弃 P 帧）→ 直接对应控制端花屏/卡顿
-//   - idrRelayed：关键帧转发数（IDR 是否真到达控制端）
-//   - 当前对端 bufferedAmount：实时背压水位
-const relayStats = { relayed: 0, dropped: 0, idr: 0, lastLogMs: 0 };
-
-// ============== 【关键诊断：会话级全链路指标字典(汇总才打印，绝不刷屏)】 ==============
-// 每个 session 独立存储以下 7 类采样：
-//   tcp / udp：TCP中继、UDP中继的收/发/丢/IDR统计
-//   ba：TCP对端bufferedAmount峰值、采样次数
-//   idr：IDR到达间隔分布、爆体积计数(>100KB)
-//   frameSize：帧字节数直方图 [0-16KB,16-64KB,64-128KB,128KB+] + 爆尺寸帧计数
-//   loss：P帧背压丢帧数/突发次数、突发最大连续丢
-//   rtt：ping/pong最近RTT、RTT P50/P90近似
-//   lastSummaryAt：上一次汇总打印时间戳（每10s才打1次）
-const sessionDiag = new Map();
-function getDiag(sid) {
-    let d = sessionDiag.get(sid);
-    if (!d) {
-        d = {
-            // ===== 原始关键采样（保留原逻辑的事件触发） =====
-            lastIdrAt: 0, burstIdrCount: 0,
-            lastDropAt: 0, burstDropCount: 0,
-            lastBaSampleAt: 0, peakBa: 0,
-            // ===== 新增会话级滚动窗口汇总（10s一打印，非阻塞） =====
-            wStart: nowMs(),
-            tcp: { relayed: 0, dropped: 0, idr: 0, baPeak10s: 0 },
-            udp: { recv: 0, fwd: 0, fec: 0, dropped: 0, hostPkts: 0, ctrlPkts: 0 },
-            idrStat: { total: 0, sizeGt100KB: 0, sizeGt64KB: 0, minGapMs: 99999, avgGapSum: 0, avgGapN: 0, lastSize: 0 },
-            fsz: { hist: [0,0,0,0], hugeFrames: 0, totalBytes: 0, totalFrames: 0 },
-            loss: { pDrops: 0, bursts: 0, maxBurst: 0, curBurst: 0 },
-            rtt: { samples: 0, pings: 0, pongs: 0, recent: 0, sum: 0, max: 0 },
-            role: { host: '', ctrl: '' },
-            lastSummaryAt: 0,
-        };
-        sessionDiag.set(sid, d);
-    }
-    return d;
-}
-// 打印会话级10s汇总（所有有效指标一次输出，格式统一便于grep）
-function printSessionSummary(sid, now) {
-    const d = sessionDiag.get(sid);
-    if (!d) return;
-    const dt = now - d.wStart;
-    if (dt < 10000) return;
-    const sess = sessions.get(sid);
-    const tag = sess ? `${sess.controller.slice(-8)}→${sess.host.slice(-8)}` : '';
-    const fs = d.fsz;
-    const idrS = d.idrStat;
-    const totalF = fs.totalFrames || 1;
-    const avgFB = (fs.totalBytes / totalF) | 0;
-    const avgIdrGap = idrS.avgGapN > 0 ? ((idrS.avgGapSum / idrS.avgGapN) | 0) : 0;
-    const avgRtt = d.rtt.samples > 0 ? ((d.rtt.sum / d.rtt.samples) | 0) : 0;
-    const udpDrop = d.udp.recv - d.udp.fwd;
-    const lossRate = (d.tcp.relayed + d.tcp.dropped) > 0
-        ? ((d.tcp.dropped * 1000 / (d.tcp.relayed + d.tcp.dropped)) / 10).toFixed(1) : '0.0';
-    logInfo(`[会话汇总] sid=${sid.slice(-12)} 对端=${tag} 窗口=${dt}ms`
-        + ` | TCP:转${d.tcp.relayed} 丢${d.tcp.dropped}(${lossRate}%) IDR=${d.tcp.idr} TCP背压峰=${d.tcp.baPeak10s}B`
-        + ` | UDP:收${d.udp.recv} 转${d.udp.fwd} 丢${udpDrop} FEC=${d.udp.fec} H/C=${d.udp.hostPkts}/${d.udp.ctrlPkts}`
-        + ` | 帧:总=${totalF} 均=${avgFB}B 尺寸分[0-16K]=${fs.hist[0]} [16-64K]=${fs.hist[1]} [64-128K]=${fs.hist[2]} [>128K]=${fs.hist[3]} 爆帧=${fs.hugeFrames}`
-        + ` | IDR:总=${idrS.total} >64KB=${idrS.sizeGt64KB} >100KB=${idrS.sizeGt100KB} 距上次均=${avgIdrGap}ms 最小=${idrS.minGapMs===99999?-1:idrS.minGapMs}ms 最近=${idrS.lastSize}B`
-        + ` | P丢:总=${d.loss.pDrops} 突发=${d.loss.bursts} 最长连续=${d.loss.maxBurst}`
-        + ` | RTT:均=${avgRtt}ms 最糟=${d.rtt.max}ms 最近=${d.rtt.recent}ms ping/pong=${d.rtt.pings}/${d.rtt.pongs}`);
-    // 异常指标单独打 WARN，方便告警
-    if (d.tcp.baPeak10s >= RELAY_BACKPRESSURE_BYTES * 0.8)
-        logWarn(`[会话异常:TCP背压爆表] sid=${sid.slice(-12)} baPeak=${d.tcp.baPeak10s}B 阈值=${RELAY_BACKPRESSURE_BYTES}B —— 控制端解码/网络跟不上=花屏/延迟`);
-    if (d.loss.maxBurst >= 50)
-        logWarn(`[会话异常:连续丢P帧] sid=${sid.slice(-12)} 最长连续丢P=${d.loss.maxBurst} 总数=${d.loss.pDrops} —— 马赛克/花屏直接根因`);
-    if (idrS.sizeGt100KB >= 2 && idrS.minGapMs < 2000)
-        logWarn(`[会话异常:超大IDR风暴] sid=${sid.slice(-12)} >100KB的IDR=${idrS.sizeGt100KB}个 最小间隔=${idrS.minGapMs}ms —— IDR占满带宽=P帧全丢=全屏马赛克`);
-    if (udpDrop > d.udp.recv * 0.1 && d.udp.recv > 100)
-        logWarn(`[会话异常:UDP高丢包] sid=${sid.slice(-12)} 丢包率=${((udpDrop*100/d.udp.recv)|0)}% —— 控制端收不齐=局部花屏`);
-    // 重置滚动窗口
-    d.wStart = now;
-    d.tcp.relayed = 0; d.tcp.dropped = 0; d.tcp.idr = 0; d.tcp.baPeak10s = 0;
-    d.udp.recv = 0; d.udp.fwd = 0; d.udp.fec = 0; d.udp.dropped = 0; d.udp.hostPkts = 0; d.udp.ctrlPkts = 0;
-    d.idrStat.total = 0; d.idrStat.sizeGt100KB = 0; d.idrStat.sizeGt64KB = 0;
-    d.idrStat.minGapMs = 99999; d.idrStat.avgGapSum = 0; d.idrStat.avgGapN = 0; d.idrStat.lastSize = 0;
-    d.fsz.hist = [0,0,0,0]; d.fsz.hugeFrames = 0; d.fsz.totalBytes = 0; d.fsz.totalFrames = 0;
-    d.loss.pDrops = 0; d.loss.bursts = 0; d.loss.maxBurst = 0; d.loss.curBurst = 0;
-    d.lastSummaryAt = now;
-}
-// 统一帧大小直方图分桶（供TCP/UDP共用，非阻塞：O(1)分桶+计数，绝不打印逐帧）
-function bucketFrameSize(bytes) {
-    if (bytes < 16 * 1024) return 0;
-    if (bytes < 64 * 1024) return 1;
-    if (bytes < 128 * 1024) return 2;
-    return 3;
-}
-
-// ---- UDP 中继运行统计（滚动窗口，非阻塞：每 10s 仅输出一次汇总）----
-// 直接反映 UDP 链路健康度：
-//   - recv：服务端收到的总包数（含 FEC）
-//   - fwd：成功转发出去的包数（转发失败=对端地址未知/未就绪，对应控制端收不到=花屏）
-//   - fec：冗余包数（FEC 是否在工作）
-//   - fromHost / fromCtrl：按方向细分（方向错乱=周期性卡顿根因）
-const udpStats = { recv: 0, fwd: 0, fec: 0, fromHost: 0, fromCtrl: 0, lastLogMs: 0 };
-
-// 调试日志开关：默认关闭，避免每帧 BINARY 日志狂刷拖垮服务器。
-// 设置环境变量 REMOTE_DEBUG=1 可重新开启（仅排查问题时临时开启）。
-const REMOTE_DEBUG = process.env.REMOTE_DEBUG === '1';
-
-// 关键帧判定方案（修复 HEVC 关键帧误判根因）：
-// 旧逻辑 isKeyFrameBuffer 用 AVC 的 NALU 单元类型算法 ((byte&0x1F)!=1) 解析关键帧，
-// 但本项目实际编码为 HEVC（H.265），该算法在 HEVC 下会把 P 帧也误判为"关键帧"
-// （HEVC 的 NALU type 在高 6 位而非低 5 位），导致背压丢帧策略完全失效——
-// bufferedAmount 无限堆积→延迟 3-10s，且控制端 TCP 的 P 帧不被过滤而与 UDP P 帧重复。
-// 现改为：帧头 type 字段直接携带关键帧语义（type=1 普通视频/P，type=3 关键视频/IDR，type=2 音频），
-// 发送端编码器已精确知道 BUFFER_FLAG_KEY_FRAME，直接打标，权威且无歧义。
-// 这里保留 isKeyFrameBuffer 仅作 type 缺失(old client)的保守兜底，新协议一律按 type 判定。
-function isKeyFrameBuffer(buf) {
-    const len = buf.length;
-    let i = 0;
-    while (i < len - 3) {
-        if (buf[i] === 0x00 && buf[i + 1] === 0x00) {
-            if (buf[i + 2] === 0x00 && i + 4 < len && buf[i + 3] === 0x01) {
-                return (buf[i + 4] & 0x1F) !== 1; // 4 字节起始码：type 1=P(非关键)，其余(5/7/8)为关键
-            }
-            if (buf[i + 2] === 0x01 && i + 3 < len) {
-                return (buf[i + 3] & 0x1F) !== 1; // 3 字节起始码
-            }
+// 从 WebSocket 升级请求中提取服务端可达地址（手机连接时用的 IP/域名，而非 localhost）。
+function extractServerHost(req) {
+    // 优先用 Host 头：客户端连接时实际使用的主机名，最可靠（支持域名+IP）
+    const hostHeader = req.headers && req.headers.host;
+    if (hostHeader) {
+        const host = hostHeader.split(':')[0]; // 去掉端口
+        if (host && host !== 'localhost' && host !== '127.0.0.1' && host !== '::1') {
+            logInfo(`[MTX-BASE] 从 Host 头提取服务端地址: ${host} (完整 Host: ${hostHeader})`);
+            return host;
         }
-        i++;
     }
-    return false; // 无法识别，保守按非关键帧处理（可被背压丢弃）
+    // 兜底：用 socket 本机 IP（手机连接到的网卡 IP）
+    let ip = req.socket.localAddress || 'localhost';
+    if (ip.startsWith('::ffff:')) ip = ip.substring(7); // 剥离 IPv4-mapped-IPv6 前缀
+    if (ip === '::1') ip = 'localhost';
+    logInfo(`[MTX-BASE] 从 socket.localAddress 提取服务端地址: ${ip} (Host 头: ${hostHeader || '(无)'})`);
+    return ip;
 }
 
-function relayBinary(deviceId, buf) {
-    if (!Buffer.isBuffer(buf) || buf.length < 5) return;
-    const type = buf.readUInt8(0);
-    const sidLen = buf.readUInt32BE(1);
-    if (buf.length < 5 + sidLen) return;
-    const sid = buf.toString('utf8', 5, 5 + sidLen);
-    const session = sessions.get(sid);
-    if (!session || session.status === 'terminated') return;
-    const peer = peerOf(session, deviceId);
-    const set = online.get(peer);
-    if (!set) return;
-    let peerWs = null;
-    for (const w of set) { if (w && w.readyState === w.OPEN) { peerWs = w; break; } }
-    if (peerWs) {
-        const now = nowMs();
-        const diag = getDiag(sid);
-        const ba = peerWs.bufferedAmount;
-        // 【会话级】TCP背压峰值（滚动窗口10s）
-        if (ba > diag.peakBa) diag.peakBa = ba;
-        if (ba > diag.tcp.baPeak10s) diag.tcp.baPeak10s = ba;
-        if (now - diag.lastBaSampleAt >= 3000) {
-            if (diag.peakBa > RELAY_BACKPRESSURE_BYTES / 2) {
-                logWarn(`[TCP背压采样] sid=${sid} 对端=${peer.slice(-8)} bufferedAmount峰=${diag.peakBa}B 当前=${ba}B 阈值=${RELAY_BACKPRESSURE_BYTES}B —— 若持续偏高=控制端弱网/解码慢=延迟累积/花屏`);
-            }
-            diag.lastBaSampleAt = now;
-            diag.peakBa = 0;
+// 为指定设备构建 mediamtx base URL：优先用该设备 WebSocket 连接时记录的服务端 IP，避免 localhost 在手机上指向手机自身。
+function getMediamtxBaseForDevice(deviceId) {
+    if (process.env.MEDIAMTX_BASE) return mediamtxBase; // 生产环境显式配置，直接用
+    const set = online.get(deviceId);
+    if (set) for (const ws of set) {
+        if (ws && ws.readyState === ws.OPEN && ws.serverHost) {
+            return `http://${ws.serverHost}:8889/starclick`;
         }
-
-        const payloadLen = buf.length - 5 - sidLen;
-        // 【会话级】帧尺寸分桶（TCP视频帧，type=1/3）
-        if (type === 1 || type === 3) {
-            const bucket = bucketFrameSize(payloadLen);
-            diag.fsz.hist[bucket]++;
-            diag.fsz.totalFrames++;
-            diag.fsz.totalBytes += payloadLen;
-            if (payloadLen >= 128 * 1024) diag.fsz.hugeFrames++;
-        }
-
-        try {
-            if (ba > RELAY_BACKPRESSURE_BYTES && type === 1) {
-                // 【会话级】P帧背压丢：总数+连续丢检测
-                diag.tcp.dropped++;
-                diag.loss.pDrops++;
-                diag.loss.curBurst++;
-                if (diag.loss.curBurst > diag.loss.maxBurst) diag.loss.maxBurst = diag.loss.curBurst;
-                session.droppedFrames = (session.droppedFrames || 0) + 1;
-                relayStats.dropped++;
-                // 原有事件触发：3s内丢>=30打WARN（但用会话级loss可回溯，不用依赖这条瞬时告警）
-                diag.burstDropCount++;
-                if (now - diag.lastDropAt < 3000 && diag.burstDropCount >= 30) {
-                    diag.loss.bursts++;
-                    logWarn(`[TCP丢帧突发] sid=${sid} 对端=${peer.slice(-8)} 3s内丢P帧=${diag.burstDropCount} ba=${ba}B —— 控制端花屏=对端弱网/解码慢`);
-                    diag.burstDropCount = 0; diag.lastDropAt = now;
-                } else if (now - diag.lastDropAt >= 3000) {
-                    diag.burstDropCount = 1; diag.lastDropAt = now;
-                }
-                relayStatsLog();
-                printSessionSummary(sid, now);  // 丢帧也要尝试汇总（内部10s才打，非阻塞）
-                return;
-            }
-            // 丢帧中断=本帧未丢，重置连续丢计数
-            diag.loss.curBurst = 0;
-
-            peerWs.send(buf);
-            diag.tcp.relayed++;
-            relayStats.relayed++;
-            if (type === 3) {
-                diag.tcp.idr++;
-                relayStats.idr++;
-                diag.idrStat.total++;
-                diag.idrStat.lastSize = payloadLen;
-                if (payloadLen >= 64 * 1024) diag.idrStat.sizeGt64KB++;
-                if (payloadLen >= 100 * 1024) diag.idrStat.sizeGt100KB++;
-                const gap = now - diag.lastIdrAt;
-                if (diag.lastIdrAt > 0) {
-                    if (gap < diag.idrStat.minGapMs) diag.idrStat.minGapMs = gap;
-                    diag.idrStat.avgGapSum += gap;
-                    diag.idrStat.avgGapN++;
-                }
-                diag.burstIdrCount = (gap < 1000) ? (diag.burstIdrCount + 1) : 1;
-                if (diag.burstIdrCount >= 3) {
-                    logWarn(`[!!IDR风暴!!] sid=${sid} 1s内转发 IDR>=${diag.burstIdrCount} 个 当前ba=${ba}B size=${payloadLen}B —— HOST端强制产 IDR 过密，会反向挤没 P 帧=冻结/花屏`);
-                    diag.burstIdrCount = 0;
-                } else if (gap < 500) {
-                    logThrottled('shallow_idr_' + sid, 2000, () =>
-                        logInfo(`[IDR过密] sid=${sid} 距上次 IDR=${gap}ms size=${payloadLen}B —— 若频繁出现=IDR风暴前兆`));
-                }
-                diag.lastIdrAt = now;
-            }
-        } catch (e) { /* 忽略单次发送失败 */ }
-        // 每帧都调用汇总（内部10s才打印，非阻塞）
-        printSessionSummary(sid, now);
     }
-}
-
-// TCP 视频中继统计：每 10s 输出一次滚动窗口汇总（增量），避免每帧打印拖垮服务器。
-// 这是服务端侧定位"花屏/延迟"的唯一硬指标：丢帧率 + 对端实时背压水位 + IDR 到达率。
-function relayStatsLog() {
-    const now = nowMs();
-    const dt = now - relayStats.lastLogMs;
-    if (dt < 10000) return;
-    const dRelayed = relayStats.relayed;
-    const dDropped = relayStats.dropped;
-    const dIdr = relayStats.idr;
-    relayStats.relayed = 0; relayStats.dropped = 0; relayStats.idr = 0;
-    relayStats.lastLogMs = now;
-    // 反映"当前"水位的样本：取最近一次被丢弃帧时的 bufferedAmount（已积满）
-    if (dDropped > 0 || dRelayed > 0) {
-        const total = dRelayed + dDropped;
-        const lossRate = total > 0 ? ((dDropped * 1000 / total) / 10).toFixed(1) : '0.0';
-        logInfo(`[TCP中继] 窗口${dt}ms 转发帧=${dRelayed} 背压丢帧=${dDropped} 丢帧率=${lossRate}% IDR转发=${dIdr}`);
-    }
-}
-
-// UDP 中继统计：每 10s 输出一次滚动窗口汇总（增量），绝不每包打印。
-// 转发数 < 收包数（fwd<recv）说明有包因对端地址未就绪被丢弃 → 控制端收不到=花屏/卡顿；
-// 方向计数(fromHost/fromCtrl)异常说明 role 错乱 → 周期性卡顿根因；fec>0 说明冗余通道工作。
-function udpStatsLog() {
-    const now = nowMs();
-    const dt = now - udpStats.lastLogMs;
-    if (dt < 10000) return;
-    const dRecv = udpStats.recv;
-    const dFwd = udpStats.fwd;
-    const dFec = udpStats.fec;
-    const dFromHost = udpStats.fromHost;
-    const dFromCtrl = udpStats.fromCtrl;
-    udpStats.recv = 0; udpStats.fwd = 0; udpStats.fec = 0;
-    udpStats.fromHost = 0; udpStats.fromCtrl = 0;
-    udpStats.lastLogMs = now;
-    if (dRecv <= 0) return;
-    const dropPkts = dRecv - dFwd;
-    logInfo(`[UDP中继] 窗口${dt}ms 收包=${dRecv} 转发=${dFwd} 丢弃=${dropPkts} FEC包=${dFec} fromHost=${dFromHost} fromCtrl=${dFromCtrl}`);
-    // 【关键采样 4: UDP 丢包/方向异常】丢包率>10% 或 方向异常（fromCtrl>fromHost）打 WARN
-    const lossPktRate = (dRecv > 0) ? (dropPkts * 100 / dRecv) : 0;
-    if (lossPktRate >= 10) logWarn(`[UDP高丢包] 丢包率=${lossPktRate.toFixed(1)}% 丢=${dropPkts}/${dRecv} —— 控制端持续花屏/卡顿根因`);
-    if (dFromCtrl > dFromHost * 1.5) logWarn(`[UDP方向异常] fromHost=${dFromHost} fromCtrl=${dFromCtrl} 控制器发包占比过高 —— 可能端点错乱=周期性卡顿`);
-}
-
-// ---- UDP 中继（CS 中继模式增强：视频流走 UDP，消除 TCP HOL 阻塞）----
-// UDP 包格式：[1B magic=0xFC][4B sidHash][4B seq][2B fragIdx][2B fragCount][payload...]
-// FEC 冗余包：[1B magic=0xFD][4B sidHash][4B seq][2B fecIdx][2B fragCount]
-//             [2B groupStart][2B groupLen][2B payloadLen][xorPayload...]
-// Hello/Keepalive 包：magic=0xFC, fragIdx=0xFFFF, fragCount=0xFFFF, 额外 1B role(0=host,1=controller)
-// 服务端不解析视频负载，仅按 sidHash 找到对端 UDP 端点并原样转发整包。
-const UDP_MAGIC = 0xFC;
-// FEC 冗余包魔数：服务端需与数据包同样中继，否则 FEC 永远无法生效。
-const UDP_MAGIC_FEC = 0xFD;
-const UDP_HEADER_SIZE = 13;
-// UDP 端口自动启用：优先与 HTTP 同端口；冲突则用 OS 随机端口；再失败则静默回退 TCP。
-// 仍支持 UDP_PORT 环境变量显式指定（向后兼容）。
-let udpPort = process.env.UDP_PORT ? parseInt(process.env.UDP_PORT) : 0;
-let udpServer = null;
-let udpAvailable = false;
-// sidHash -> { sid, host: {addr,port}, controller: {addr,port}, notified }
-const udpEndpoints = new Map();
-
-function computeSidHash(sid) {
-    return crypto.createHash('sha1').update(sid).digest().readUInt32BE(0);
-}
-
-function initUdpRelay(preferredPort) {
-    // 已显式指定端口则只用它；否则依次尝试 preferredPort、0(随机)
-    const tryPorts = udpPort ? [udpPort] : (preferredPort ? [preferredPort, 0] : [0]);
-    let idx = 0;
-    const tryBind = () => {
-        if (idx >= tryPorts.length) {
-            logWarn('UDP 绑定全部失败，视频走 TCP（WebSocket）');
-            return;
-        }
-        const port = tryPorts[idx++];
-        const sock = dgram.createSocket('udp4');
-        sock.on('message', (msg, rinfo) => {
-            const magic = msg[0];
-            if (msg.length < UDP_HEADER_SIZE) return;
-            // 同时接受数据包(0xFC)与 FEC 冗余包(0xFD)；FEC 包必须原样中继，
-            // 否则控制端收不到冗余数据，分组 XOR 恢复完全失效。
-            if (magic !== UDP_MAGIC && magic !== UDP_MAGIC_FEC) return;
-            const isFec = magic === UDP_MAGIC_FEC;
-            const sidHash = msg.readUInt32BE(1);
-            const fragIdx = msg.readUInt16BE(9);
-            const fragCount = msg.readUInt16BE(11);
-            const ep = udpEndpoints.get(sidHash);
-            if (!ep) return;
-
-            // Hello/Keepalive：记录端点并尝试通知双方就绪（仅数据包魔数携带 hello）
-            if (!isFec && fragIdx === 0xFFFF && fragCount === 0xFFFF) {
-                if (msg.length >= 14) {
-                    const role = msg[13];
-                    if (role === 0) ep.host = { addr: rinfo.address, port: rinfo.port };
-                    else ep.controller = { addr: rinfo.address, port: rinfo.port };
-                    if (ep.host && ep.controller && !ep.notified) {
-                        ep.notified = true;
-                        const session = sessions.get(ep.sid);
-                        if (session) {
-                            relayTo(session.controller, { op: 'udp.ready', sid: ep.sid });
-                            relayTo(session.host, { op: 'udp.ready', sid: ep.sid });
-                            logInfo(`传输切换: UDP 就绪 sid=${ep.sid} host=${ep.host.addr}:${ep.host.port} ctrl=${ep.controller.addr}:${ep.controller.port}`);
-                        }
-                    }
-                }
-                return;
-            }
-
-            // 视频/FEC 包：直接按包头 [13] 的 role 转发，不再靠地址猜测角色。
-            // role 由客户端权威写入（host=0 / controller=1），彻底消除 NAT 端口重映射 /
-            // 同源公网 IP 场景下「按地址猜角色」导致的端点错乱（花屏 + 周期性 4-8s 卡顿根因）。
-            // 端点地址端口仍由 hello 包（role 已知）建立，role 仅决定「这个包该发给谁」。
-            if (msg.length < 14) return;
-            const role = msg[13];
-            // role 0 = host 发出的包 → 转发给 controller；role 1 = controller 发出的包 → 转发给 host
-            const target = role === 0 ? ep.controller : ep.host;
-            if (role === 0) { udpStats.fromHost++; } else { udpStats.fromCtrl++; }
-            // 【会话级】按sid把UDP统计也写入sessionDiag（和TCP同源统一查看）
-            const nowUdp = nowMs();
-            const diagUdp = getDiag(ep.sid);
-            if (role === 0) diagUdp.udp.hostPkts++; else diagUdp.udp.ctrlPkts++;
-            diagUdp.udp.recv++;
-            let thisFwd = false;
-            if (target && !(target.addr === rinfo.address && target.port === rinfo.port)) {
-                try {
-                    sock.send(msg, target.port, target.addr);
-                    udpStats.fwd++;
-                    diagUdp.udp.fwd++;
-                    thisFwd = true;
-                } catch (e) { /* ignore */ }
-            }
-            if (!thisFwd) diagUdp.udp.dropped++;
-            if (isFec) { udpStats.fec++; diagUdp.udp.fec++; }
-            udpStatsLog();
-            // 每包调用（内部10s才打印，非阻塞）
-            printSessionSummary(ep.sid, nowUdp);
-        });
-        sock.on('error', (e) => {
-            // 绑定阶段错误：尝试下一个端口；运行期错误：回退 TCP
-            if (!udpAvailable) {
-                logWarn(`UDP 绑定端口 ${port} 失败: ${e.message}，尝试下一个`);
-                try { sock.close(); } catch (_) {}
-                tryBind();
-            } else {
-                logWarn(`UDP 运行错误，回退 TCP: ${e.message}`);
-                udpAvailable = false;
-            }
-        });
-        sock.bind(port, () => {
-            udpServer = sock;
-            udpPort = sock.address().port;
-            udpAvailable = true;
-            logInfo(`UDP 中继已启动 端口=${udpPort}${port === 0 ? '(随机)' : ''}`);
-        });
-    };
-    tryBind();
+    return mediamtxBase; // 兜底
 }
 
 // ---- 认证（复用 server.js 的 deviceId token 思路） ----
@@ -828,20 +473,20 @@ function registerVerify(fn) { verifyToken = fn; }
 
 // ---- 主入口：在一个已存在的 http.Server 上挂载 WebSocket ----
 function attach(httpServer) {
-    // UDP 自动启用：HTTP listening 后尝试同端口绑定 UDP，失败回退 TCP
-    if (!udpAvailable && !udpServer) {
-        const startUdp = () => {
-            const addr = httpServer.address();
-            const httpPort = (addr && typeof addr === 'object') ? addr.port : 0;
-            try { initUdpRelay(httpPort); } catch (e) { logWarn(`UDP 自动启用失败: ${e.message}`); }
-        };
-        if (httpServer.listening) startUdp();
-        else httpServer.once('listening', startUdp);
-    }
 
     const wss = new WebSocketServer({ server: httpServer, path: '/ws/remote' });
 
+    // 诊断：监听 WebSocket 升级请求（TCP 连接到达服务端的最早时机）
+    httpServer.on('upgrade', (req, socket, head) => {
+        logInfo(`[WS-UPGRADE] 收到升级请求 url=${req.url} remote=${req.socket.remoteAddress}:${req.socket.remotePort}`);
+    });
+
+    wss.on('error', (e) => {
+        logError('[WSS-ERROR] WebSocketServer 错误:', e.message, e.stack);
+    });
+
     wss.on('connection', (ws, req) => {
+        logInfo(`[WS-CONN] 连接事件触发 remote=${req.socket.remoteAddress}:${req.socket.remotePort} url=${req.url}`);
         const url = new URL(req.url, 'http://localhost');
         const deviceId = url.searchParams.get('deviceId');
         const token = url.searchParams.get('token');
@@ -858,6 +503,7 @@ function attach(httpServer) {
         logInfo(`新 WebSocket 连接建立 device=${deviceId.slice(-8)}${dname ? ' dname=' + dname : ''} 在线=${online.size}`);
 
         ws.deviceId = deviceId;
+        ws.serverHost = extractServerHost(req);
         ws.isAlive = true;
         // 同一设备可有多个连接（常驻信令 + 远控页），全部计入在线集合
         if (!online.has(deviceId)) online.set(deviceId, new Set());
@@ -882,35 +528,12 @@ function attach(httpServer) {
             }
         }
 
-        // 【会话级RTT探针】服务端主动发ping→客户端回pong，测量WS链路真实RTT（ms）
-        // 写入 sessionDiag.rtt：均/最糟/最近 值，每10s会话汇总必打印
         ws.on('pong', () => {
             ws.isAlive = true;
-            if (!ws._pingAt) return;
-            const rtt = nowMs() - ws._pingAt;
-            ws._pingAt = 0;
-            // 找到该ws所属所有sid（1个设备可能参与1~2个会话同时期）
-            const deviceId = ws.deviceId;
-            for (const [sid, sess] of sessions.entries()) {
-                if (!sess || sess.status === 'terminated') continue;
-                if (sess.controller !== deviceId && sess.host !== deviceId) continue;
-                const d = getDiag(sid);
-                d.rtt.pongs++;
-                d.rtt.recent = rtt;
-                d.rtt.samples++;
-                d.rtt.sum += rtt;
-                if (rtt > d.rtt.max) d.rtt.max = rtt;
-            }
         });
 
         ws.on('message', async (raw) => {
             const isBuf = Buffer.isBuffer(raw);
-            // 调试：仅当 REMOTE_DEBUG=1 时打印每帧原始消息（平时关闭，避免日志狂刷拖垮服务器）
-            if (REMOTE_DEBUG) {
-                const t = isBuf ? `BINARY(${raw.length}B)` : `TEXT(${String(raw).length}ch)`;
-                const head = isBuf ? raw.slice(0, 12).toString('hex') : String(raw).slice(0, 80);
-                logInfo(`[DEBUG raw] device=${deviceId.slice(-8)} type=${t} head=${head}`);
-            }
 
             // 容错：客户端（OkHttp）可能把 JSON 信令以二进制帧(opcode=0x2)发出，
             // 此时 raw 是 Buffer 但内容其实是 UTF-8 的 JSON 文本（以 '{' 开头）。
@@ -924,7 +547,7 @@ function attach(httpServer) {
                     return ws.send(JSON.stringify({ op: 'error', payload: { msg: 'invalid_json' } }));
                 }
                 // 【日志去噪】高频信令(heartbeat/rtc.quality/cmd_ack 等)节流 1s 打一次，
-                // 其余关键 op 每次都打（code.connect/keyframe.request/trust 绑定等）。
+                // 其余关键 op 每次都打（code.connect/trust 绑定等）。
                 const op = (m && m.op) || '';
                 const noisy = NOISY_OP_RE.test(op);
                 if (noisy) {
@@ -942,11 +565,7 @@ function attach(httpServer) {
                 return;
             }
 
-            // 二进制帧 = 视频流（CS 中继模式）：[1B type][4B sidLen][sid UTF8][NALU bytes]
-            if (isBuf) {
-                relayBinary(deviceId, raw);
-                return;
-            }
+
             // 其余文本（理论上不会到这，纯文本信令也已在上面 JSON 分支处理）
             let m;
             try { m = JSON.parse(raw.toString()); } catch (e) {
@@ -1019,21 +638,7 @@ function attach(httpServer) {
             }
             ws.isAlive = false;
             try {
-                // 【会话级RTT】ping前记录时间戳，pong回调中算差值=真实WS RTT
-                ws._pingAt = nowMs();
-                const deviceId = ws.deviceId;
-                // 把这次ping也记录到所属会话的rtt.pings（用于pings/pongs比例核对=心跳健康度）
-                if (deviceId) {
-                    for (const [sid, sess] of sessions.entries()) {
-                        if (!sess || sess.status === 'terminated') continue;
-                        if (sess.controller !== deviceId && sess.host !== deviceId) continue;
-                        const d = getDiag(sid);
-                        d.rtt.pings++;
-                        // 会话建立时记录role缩写，便于汇总打印
-                        if (!d.role.host) d.role.host = sess.host && sess.host.slice(-8);
-                        if (!d.role.ctrl) d.role.ctrl = sess.controller && sess.controller.slice(-8);
-                    }
-                }
+
                 ws.ping();
             } catch (e) {}
         });
@@ -1297,27 +902,6 @@ async function handleMessage(ws, m) {
             break;
         }
 
-        case 'keyframe.request': {
-            // 控制端检测到卡顿/丢包，请求被控端立即输出 IDR 关键帧以快速恢复解码。
-            // 仅允许控制端发起，转发给对端被控端。
-            const session = sessions.get(sid);
-            if (!session || session.status === 'terminated') {
-                ws.send(JSON.stringify({ op: 'error', sid, payload: { msg: 'no_session' } }));
-                break;
-            }
-            if (session.controller !== deviceId) {
-                // 仅控制端可发起关键帧请求
-                ws.send(JSON.stringify({ op: 'error', sid, payload: { msg: 'not_controller' } }));
-                break;
-            }
-            session.lastActivity = nowMs();
-            relayTo(session.host, { op: 'keyframe.request', sid, payload: m.payload || {} });
-            // 【关键采样 5: IDR 请求】控制端每次发起 IDR 请求都打 INFO，
-            // 结合 relayStats 的"IDR转发数"可以算出：请求了多少 / 实际到达多少。
-            // 若控制端连续请求 >3 次但 IDR 转发 < 对应的被控端真实输出 = 被控端仍在熔断。
-            logInfo(`keyframe.request ctrl=${deviceId.slice(-8)} -> host=${session.host.slice(-8)} sid=${sid}`);
-            break;
-        }
 
         case 'cmd': {
             const session = sessions.get(sid);
@@ -1359,18 +943,22 @@ async function handleMessage(ws, m) {
         case 'trust.cmd': {
             const payload = m.payload || {};
             const peerId = payload.peer;
+            console.log(`[trust.cmd] === 入口: from=${deviceId} payload.peer=${peerId} hasAction=${!!payload.action} peerOnline=${!!(online.get(peerId) && online.get(peerId).size > 0)} controllerIdKnown=${!!payload.action}`);
             const peerSet = online.get(peerId);
             if (!peerSet || peerSet.size === 0) {
                 // 对方不在线，直接回执失败
+                console.log(`[trust.cmd] 被控端 ${peerId} 不在线，回执失败`);
                 relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: false, reason: '对方不在线' } });
                 break;
             }
             if (!isTrusted(deviceId, peerId)) {
+                console.log(`[trust.cmd] ${deviceId} 不信任 ${peerId}，回执失败`);
                 relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: false, reason: '非信任设备' } });
                 break;
             }
             // 透传给受控端（relayTo 按 deviceId 遍历其所有在线连接发送），
             // 携来源 deviceId（控制端，写入 payload.peer）以便其回执；action 为编码后的 ActionJson 字符串
+            console.log(`[trust.cmd] 转发 -> 被控端 ${peerId} action=${(payload.action || '').slice(0, 80)}`);
             relayTo(peerId, { op: 'trust.cmd', payload: { peer: deviceId, action: payload.action } });
             break;
         }
@@ -1379,9 +967,14 @@ async function handleMessage(ws, m) {
         case 'trust.cmd_ack': {
             const payload = m.payload || {};
             const controllerId = payload.peer;
+            console.log(`[trust.cmd_ack] === 入口: from=${deviceId} controllerId=${controllerId} ok=${payload.ok} reason=${payload.reason || ''} url=${(payload.url || '').slice(0, 80)} isReal=${payload.isReal}`);
             const targetSet = online.get(controllerId);
             if (targetSet && targetSet.size > 0) {
-                relayTo(controllerId, { op: 'trust.cmd_ack', payload: { peer: deviceId, ok: !!payload.ok, reason: payload.reason || '' } });
+                // 透传完整 payload（含 ok/reason/url 等快照字段），仅覆盖 peer 为回执来源设备（被控端）
+                console.log(`[trust.cmd_ack] 转发 -> 控制端 ${controllerId}`);
+                relayTo(controllerId, { op: 'trust.cmd_ack', payload: { ...payload, peer: deviceId } });
+            } else {
+                console.log(`[trust.cmd_ack] 控制端 ${controllerId} 不在线，丢弃回执`);
             }
             break;
         }
@@ -1396,27 +989,6 @@ async function handleMessage(ws, m) {
             break;
         }
 
-        case 'udp.fallback': {
-            // 控制端通知：UDP 不可用，回退 TCP。转发给对端（被控端）切换回 WebSocket 发送。
-            const session = sessions.get(sid);
-            if (!session) break;
-            // 关键修复：重置 UDP 端点状态，允许双方重新通过 hello 建立 UDP 传输。
-            // 【原问题】notified 一旦置 true 永不复位，回退后即使双端 hello 保活包持续到达，
-            // 服务端也不会再发 udp.ready → useUdpVideo 永远无法重新置 true → UDP 永久不可恢复。
-            // 重置后，双端 UdpVideoTransport 仍在运行（未停止），hello 保活包会重新注册端点，
-            // 服务端收到双端 hello 后再次发 udp.ready，UDP 自动恢复。
-            const sidHash = computeSidHash(sid);
-            const ep = udpEndpoints.get(sidHash);
-            if (ep) {
-                ep.host = null;
-                ep.controller = null;
-                ep.notified = false;
-            }
-            const peer = peerOf(session, deviceId);
-            relayTo(peer, { op: 'udp.fallback', sid });
-            logInfo(`传输切换: UDP->TCP 回退 sid=${sid} from=${deviceId.slice(-8)}（已重置端点，允许重新激活）`);
-            break;
-        }
 
         case 'ping': {
             ws.send(JSON.stringify({ op: 'pong' }));

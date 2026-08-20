@@ -12,6 +12,7 @@ const PORT = process.env.PORT || 10000;
 const HOST = '0.0.0.0';
 
 app.use(cors());
+app.use(express.json({ limit: '15mb' }));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
@@ -23,9 +24,10 @@ app.get('/api/health', (req, res) => {
 const DATA_DIR = path.join(__dirname, 'data');
 const DEVICES_DIR = path.join(DATA_DIR, 'devices');
 const USAGE_DIR = path.join(DATA_DIR, 'usage');
+const SNAPSHOT_DIR = path.join(DATA_DIR, 'snapshots');
 
 function ensureDirectories() {
-    [DATA_DIR, DEVICES_DIR, USAGE_DIR].forEach(dir => {
+    [DATA_DIR, DEVICES_DIR, USAGE_DIR, SNAPSHOT_DIR].forEach(dir => {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
@@ -451,6 +453,51 @@ apiRouter.post('/remote/subscription', (req, res) => {
 });
 
 app.use('/api', apiRouter);
+
+// ---- 远程快照：图片静态托管 + 上传接口 ----
+// 静态托管：/snapshots/<deviceId>/<file> 可直接访问
+app.use('/snapshots', (req, res, next) => {
+    console.log(`[snapshot.get] ${req.method} ${req.originalUrl}`);
+    next();
+});
+app.use('/snapshots', express.static(SNAPSHOT_DIR, {
+    setHeaders: (res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'no-cache');
+    }
+}));
+
+// 被控端上传快照（base64 JSON，零额外依赖）：{ deviceId, peerId, data, ext }
+app.post('/api/remote/snapshot/upload', (req, res) => {
+    try {
+        const { deviceId, data, ext } = req.body || {};
+        if (!deviceId || !data) {
+            res.status(400).json({ ok: false, reason: '缺少 deviceId 或 data' });
+            return;
+        }
+        const base64 = String(data).replace(/^data:image\/\w+;base64,/, '');
+        const buf = Buffer.from(base64, 'base64');
+        if (!buf || buf.length === 0) {
+            res.status(400).json({ ok: false, reason: '图片数据为空' });
+            return;
+        }
+        const safeDevice = String(deviceId).replace(/[^a-zA-Z0-9_-]/g, '_');
+        const deviceDir = path.join(SNAPSHOT_DIR, safeDevice);
+        if (!fs.existsSync(deviceDir)) fs.mkdirSync(deviceDir, { recursive: true });
+        const ts = Date.now();
+        const extension = (ext === 'png') ? 'png' : 'jpg';
+        const fileName = `snap_${ts}.${extension}`;
+        const filePath = path.join(deviceDir, fileName);
+        fs.writeFileSync(filePath, buf);
+        // 返回相对路径，由客户端用其 baseUrl 拼接完整访问地址
+        const url = `/snapshots/${safeDevice}/${fileName}`;
+        console.log(`[snapshot] 收到快照 device=${safeDevice} size=${buf.length} url=${url}`);
+        res.json({ ok: true, url });
+    } catch (e) {
+        console.error('[snapshot] 上传失败:', e);
+        res.status(500).json({ ok: false, reason: '服务端保存失败: ' + e.message });
+    }
+});
 
 // ICE 配置下发（含 TURN 中继），供客户端在建立 WebRTC 前拉取，避免 TURN 凭证硬编码到客户端
 // 注意：必须放在 404 兜底中间件（app.use((req,res)=>...)）之前，否则会被拦截返回"未找到该接口"

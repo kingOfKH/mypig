@@ -12,9 +12,9 @@ const PORT = process.env.PORT || 10000;
 const HOST = '0.0.0.0';
 
 app.use(cors());
-app.use(express.json({ limit: '15mb' }));
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 
 // 健康检查端点（供 App "测试连接" 功能使用）
 app.get('/api/health', (req, res) => {
@@ -25,9 +25,10 @@ const DATA_DIR = path.join(__dirname, 'data');
 const DEVICES_DIR = path.join(DATA_DIR, 'devices');
 const USAGE_DIR = path.join(DATA_DIR, 'usage');
 const SNAPSHOT_DIR = path.join(DATA_DIR, 'snapshots');
+const CLIPBOARD_DIR = path.join(DATA_DIR, 'clipboards');
 
 function ensureDirectories() {
-    [DATA_DIR, DEVICES_DIR, USAGE_DIR, SNAPSHOT_DIR].forEach(dir => {
+    [DATA_DIR, DEVICES_DIR, USAGE_DIR, SNAPSHOT_DIR, CLIPBOARD_DIR].forEach(dir => {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
@@ -495,6 +496,49 @@ app.post('/api/remote/snapshot/upload', (req, res) => {
         res.json({ ok: true, url });
     } catch (e) {
         console.error('[snapshot] 上传失败:', e);
+        res.status(500).json({ ok: false, reason: '服务端保存失败: ' + e.message });
+    }
+});
+
+// 静态托管：/clipboards/<deviceId>/<file> 可直接访问（远程协助-获取实时剪切板内容）
+app.use('/clipboards', (req, res, next) => {
+    console.log(`[clipboard.get] ${req.method} ${req.originalUrl}`);
+    next();
+});
+app.use('/clipboards', express.static(CLIPBOARD_DIR, {
+    setHeaders: (res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'no-cache');
+    }
+}));
+
+// 被控端上传剪切板文本（base64 JSON，零额外依赖）：{ deviceId, data }
+app.post('/api/remote/clipboard/upload', (req, res) => {
+    try {
+        const { deviceId, data } = req.body || {};
+        if (!deviceId || !data) {
+            res.status(400).json({ ok: false, reason: '缺少 deviceId 或 data' });
+            return;
+        }
+        const base64 = String(data).replace(/^data:text\/plain;base64,/, '');
+        const buf = Buffer.from(base64, 'base64');
+        if (!buf || buf.length === 0) {
+            res.status(400).json({ ok: false, reason: '剪切板数据为空' });
+            return;
+        }
+        const safeDevice = String(deviceId).replace(/[^a-zA-Z0-9_-]/g, '_');
+        const deviceDir = path.join(CLIPBOARD_DIR, safeDevice);
+        if (!fs.existsSync(deviceDir)) fs.mkdirSync(deviceDir, { recursive: true });
+        const ts = Date.now();
+        const fileName = `clip_${ts}.txt`;
+        const filePath = path.join(deviceDir, fileName);
+        fs.writeFileSync(filePath, buf);
+        // 返回相对路径，由客户端用其 baseUrl 拼接完整访问地址
+        const url = `/clipboards/${safeDevice}/${fileName}`;
+        console.log(`[clipboard] 收到剪切板 device=${safeDevice} size=${buf.length} url=${url}`);
+        res.json({ ok: true, url });
+    } catch (e) {
+        console.error('[clipboard] 上传失败:', e);
         res.status(500).json({ ok: false, reason: '服务端保存失败: ' + e.message });
     }
 });

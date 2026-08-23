@@ -876,6 +876,10 @@ async function handleMessage(ws, m) {
         case 'rtc.ice':
         case 'rtc.meta':
         case 'rtc.quality':
+        // MediaMTX 推流参数热更新/重建（分辨率/码率/帧率/编码）
+        case 'rtc.mtxcfg':
+        // 编码方式切换（客户端统一走 rtc.mtxcfg，保留转发兼容）
+        case 'rtc.codec':
         case 'rtc.connected':
         case 'rtc.encres':
         // 控制端「声音」开关 -> 被控端据此启停音频采集编码（声音同步）

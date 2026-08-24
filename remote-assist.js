@@ -876,10 +876,6 @@ async function handleMessage(ws, m) {
         case 'rtc.ice':
         case 'rtc.meta':
         case 'rtc.quality':
-        // MediaMTX 推流参数热更新/重建（分辨率/码率/帧率/编码）
-        case 'rtc.mtxcfg':
-        // 编码方式切换（客户端统一走 rtc.mtxcfg，保留转发兼容）
-        case 'rtc.codec':
         case 'rtc.connected':
         case 'rtc.encres':
         // 控制端「声音」开关 -> 被控端据此启停音频采集编码（声音同步）
@@ -947,22 +943,18 @@ async function handleMessage(ws, m) {
         case 'trust.cmd': {
             const payload = m.payload || {};
             const peerId = payload.peer;
-            console.log(`[trust.cmd] === 入口: from=${deviceId} payload.peer=${peerId} hasAction=${!!payload.action} peerOnline=${!!(online.get(peerId) && online.get(peerId).size > 0)} controllerIdKnown=${!!payload.action}`);
             const peerSet = online.get(peerId);
             if (!peerSet || peerSet.size === 0) {
                 // 对方不在线，直接回执失败
-                console.log(`[trust.cmd] 被控端 ${peerId} 不在线，回执失败`);
                 relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: false, reason: '对方不在线' } });
                 break;
             }
             if (!isTrusted(deviceId, peerId)) {
-                console.log(`[trust.cmd] ${deviceId} 不信任 ${peerId}，回执失败`);
                 relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: false, reason: '非信任设备' } });
                 break;
             }
             // 透传给受控端（relayTo 按 deviceId 遍历其所有在线连接发送），
             // 携来源 deviceId（控制端，写入 payload.peer）以便其回执；action 为编码后的 ActionJson 字符串
-            console.log(`[trust.cmd] 转发 -> 被控端 ${peerId} action=${(payload.action || '').slice(0, 80)}`);
             relayTo(peerId, { op: 'trust.cmd', payload: { peer: deviceId, action: payload.action } });
             break;
         }
@@ -971,14 +963,10 @@ async function handleMessage(ws, m) {
         case 'trust.cmd_ack': {
             const payload = m.payload || {};
             const controllerId = payload.peer;
-            console.log(`[trust.cmd_ack] === 入口: from=${deviceId} controllerId=${controllerId} ok=${payload.ok} reason=${payload.reason || ''} url=${(payload.url || '').slice(0, 80)} isReal=${payload.isReal}`);
             const targetSet = online.get(controllerId);
             if (targetSet && targetSet.size > 0) {
                 // 透传完整 payload（含 ok/reason/url 等快照字段），仅覆盖 peer 为回执来源设备（被控端）
-                console.log(`[trust.cmd_ack] 转发 -> 控制端 ${controllerId}`);
                 relayTo(controllerId, { op: 'trust.cmd_ack', payload: { ...payload, peer: deviceId } });
-            } else {
-                console.log(`[trust.cmd_ack] 控制端 ${controllerId} 不在线，丢弃回执`);
             }
             break;
         }

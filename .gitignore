@@ -1,16 +1,7 @@
-# 依赖（体积大、可重新安装，绝不提交）
-node_modules/
-
-# 运行时生成的数据（设备/会话/用量/审计/信任状态等，勿提交）
+# 信任设备异步操作状态（运行时生成，含历史结果，勿提交）
+data/remote/trust-op-store.json
 data/
-
-# 环境变量（含密钥，勿提交）
+node_modules/
+.git/
 .env
-.env.local
-
-# 日志
-*.log
-
-# 系统/编辑器
-.DS_Store
-Thumbs.db
+.env*

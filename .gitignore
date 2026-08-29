@@ -5,3 +5,6 @@ node_modules/
 .git/
 .env
 .env*
+
+# 发布的安装包与每版本元数据（运行时生成，勿提交）
+updates/

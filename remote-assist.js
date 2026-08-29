@@ -104,15 +104,19 @@ const pendingTrust = new Map();
 
 // 建立会话（信任直连 / 确认后直连共用）
 // mode：控制端发起连接时携带的传输模式（'webrtc' | 'cs'），由控制端最终决定，被控端跟随。
-async function establishSession(controller, host, code, tag, mode) {
+// content：控制端发起连接时携带的内容源（'screen' | 'camera'），标识被控端推流内容类型。
+async function establishSession(controller, host, code, tag, mode, content) {
+    logInfo(`[DIAG] establishSession controller=${controller} host=${host} mode=${mode} content=${content}`);
     const sidNew = genSessionId();
     const plan = getPlan(controller);
-    const session = makeSession(sidNew, controller, host, code, plan, mode);
+    const session = makeSession(sidNew, controller, host, code, plan, mode, content);
     sessions.set(sidNew, session);
     await persistSession(session, 'connecting');
-    await audit(sidNew, controller, 'connect', `code=${code} via=${tag} mode=${session.mode}`);
+    await audit(sidNew, controller, 'connect', `code=${code} via=${tag} mode=${session.mode} content=${session.content}`);
     // 把选定的传输模式权威下发给两端（被控端必须跟随，控制端也以服务端下发为准消除本地竞态）
     const modeInfo = { mode: session.mode };
+    // 内容源：屏幕录屏或相机实况，客户端据此决定被控端采集源与控制端 UI。
+    const contentInfo = { content: session.content };
     // MediaMTX WHIP/WHEP 端点：被控端推流用 /whip，控制端拉流用 /whep，path 同为 sid。
     // 用被控端连接到的服务端 IP 构建 base，避免 localhost 在手机上指向手机自身。
     const mtxBase = getMediamtxBaseForDevice(host);
@@ -120,9 +124,9 @@ async function establishSession(controller, host, code, tag, mode) {
         mediamtxWhip: `${mtxBase}/${sidNew}/whip`,
         mediamtxWhep: `${mtxBase}/${sidNew}/whep`
     };
-    relayTo(host, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: controller, plan, ...modeInfo, ...mtxInfo } });
-    relayTo(controller, { op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: host, plan, ...modeInfo, ...mtxInfo } });
-    logInfo(`会话建立(${tag}) sid=${sidNew} 传输模式=${session.mode} plan=${plan} mtx=${mtxInfo.mediamtxWhip}`);
+    relayTo(host, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: controller, plan, ...modeInfo, ...contentInfo, ...mtxInfo } });
+    relayTo(controller, { op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: host, plan, ...modeInfo, ...contentInfo, ...mtxInfo } });
+    logInfo(`会话建立(${tag}) sid=${sidNew} 传输模式=${session.mode} 内容源=${session.content} plan=${plan} mtx=${mtxInfo.mediamtxWhip}`);
 }
 
 // ---- 工具 ----
@@ -183,7 +187,7 @@ function genSessionId() {
 }
 
 // 内存 session 对象
-function makeSession(sid, controller, host, code, plan, mode) {
+function makeSession(sid, controller, host, code, plan, mode, content) {
     return {
         sessionId: sid,
         controller,          // deviceId（控制端）
@@ -193,6 +197,9 @@ function makeSession(sid, controller, host, code, plan, mode) {
         // 传输模式：由控制端发起连接时携带（'webrtc' | 'cs'），服务端作为权威下发给被控端。
         // 被控端必须无条件跟随，自己本机的后台开关不参与决策，避免两端开关不一致导致协商失败黑屏。
         mode: mode || 'cs',  // 默认自研 CS 中继（兼容旧版控制端未携带该字段）
+        // 内容源：由控制端发起连接时携带（'screen' | 'camera'），标识被控端推流内容类型。
+        // 'screen' 走屏幕录屏（MediaProjection）；'camera' 走相机实况（Camera2，无需录屏授权、后台静默）。
+        content: content || 'screen',  // 默认屏幕
         status: 'connecting', // connecting | streaming | terminated
         startedAt: nowMs(),
         endedAt: null,
@@ -209,13 +216,28 @@ function peerOf(session, deviceId) {
 // ---- 审计（append-only，避免每条 cmd 都 read-modify-write 整个文件阻塞事件循环）----
 const AUDIT_LOG_FILE = path.join(DATA_DIR, 'audit.log');
 let auditStream = null;
-try {
-    auditStream = fs.createWriteStream(AUDIT_LOG_FILE, { flags: 'a' });
-} catch (e) {
-    logError('[remote] 审计日志流创建失败', e);
+
+// 创建审计日志写入流，并挂上 error 监听。
+// 关键：WriteStream 的 I/O 错误是异步以 'error' 事件抛出的，创建时的 try/catch 捕获不到；
+// 若缺少 error 监听器，未捕获的 error 事件会直接 throw 并杀死 Node 进程（EBADF 崩溃根因）。
+function createAuditStream() {
+    try {
+        auditStream = fs.createWriteStream(AUDIT_LOG_FILE, { flags: 'a' });
+        auditStream.on('error', (e) => {
+            logError('[remote] 审计日志写入错误', e.code, e.message);
+            try { auditStream.destroy(); } catch (_) {}
+            auditStream = null; // 标记失效，下次 audit 时自愈重建
+        });
+    } catch (e) {
+        logError('[remote] 审计日志流创建失败', e);
+        auditStream = null;
+    }
 }
+createAuditStream();
 
 async function audit(sessionId, actor, action, detail) {
+    // 自愈：上次 fd 失效（如 EBADF）后 auditStream 被置空，此处重建一次
+    if (!auditStream) createAuditStream();
     if (!auditStream) return;
     const line = JSON.stringify({
         sessionId,
@@ -224,7 +246,11 @@ async function audit(sessionId, actor, action, detail) {
         detail: detail || null,
         ts: nowMs(),
     }) + '\n';
-    auditStream.write(line);
+    try {
+        auditStream.write(line);
+    } catch (e) {
+        logError('[remote] 审计写失败', e.message);
+    }
 }
 
 // ---- 控制码（固定码：每台设备一个永久 6 位纯数字码，由 deviceId 派生）----
@@ -668,6 +694,8 @@ async function handleMessage(ws, m) {
             const code = (m.payload && m.payload.code || '').trim();
             // 传输模式由控制端决定（'webrtc' | 'cs'）。被控端无条件跟随，自己本机开关不参与决策。
             const mode = (m.payload && m.payload.mode === 'webrtc') ? 'webrtc' : 'cs';
+            // 内容源由控制端决定（'screen' | 'camera'）。相机实况走 Camera2，无需录屏授权、可后台静默。
+            const content = (m.payload && m.payload.content === 'camera') ? 'camera' : 'screen';
             if (!code) { ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'empty' } })); break; }
             const r = await consumeControlCode(code);
             if (!r.ok) {
@@ -686,12 +714,12 @@ async function handleMessage(ws, m) {
             }
             // 信任设备：免确认，直接匹配
             if (isTrusted(deviceId, hostId)) {
-                establishSession(deviceId, hostId, code, 'trust', mode);
+                establishSession(deviceId, hostId, code, 'trust', mode, content);
                 break;
             }
             // 非信任设备：向被控端推送"连接请求确认"弹窗，由被控端决定是否允许
-            // 记录控制端决定的传输模式，待被控端确认后建立会话时沿用（被控端必须跟随）
-            pendingConfirms.set(code + ':' + deviceId, { controller: deviceId, host: hostId, code, mode });
+            // 记录控制端决定的传输模式与内容源，待被控端确认后建立会话时沿用（被控端必须跟随）
+            pendingConfirms.set(code + ':' + deviceId, { controller: deviceId, host: hostId, code, mode, content });
             const ok = relayTo(hostId, {
                 op: 'incoming', sid: '', payload: {
                     controller: deviceId,
@@ -720,7 +748,7 @@ async function handleMessage(ws, m) {
                 break;
             }
             pendingConfirms.delete(key);
-            establishSession(controller, deviceId, code, 'confirm', pend.mode || 'cs');
+            establishSession(controller, deviceId, code, 'confirm', pend.mode || 'cs', pend.content || 'screen');
             break;
         }
 
@@ -832,6 +860,9 @@ async function handleMessage(ws, m) {
             const peerId = (m.payload && m.payload.peer) || '';
             // 传输模式由控制端决定（'webrtc' | 'cs'），被控端无条件跟随
             const mode = (m.payload && m.payload.mode === 'webrtc') ? 'webrtc' : 'cs';
+            // 内容源由控制端决定（'screen' | 'camera'）。相机实况走 Camera2，可后台静默。
+            const content = (m.payload && m.payload.content === 'camera') ? 'camera' : 'screen';
+            logInfo(`[DIAG] trust.request peer=${peerId} rcvContent=${(m.payload && m.payload.content)} => ${content}`);
             const code = genFixedCode(peerId);
             if (!isTrusted(deviceId, peerId)) {
                 ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'not_trusted' } }));
@@ -846,7 +877,7 @@ async function handleMessage(ws, m) {
                 ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: r.reason } }));
                 break;
             }
-            establishSession(deviceId, peerId, code, 'trust', mode);
+            establishSession(deviceId, peerId, code, 'trust', mode, content);
             break;
         }
 
@@ -881,7 +912,11 @@ async function handleMessage(ws, m) {
         // 控制端「声音」开关 -> 被控端据此启停音频采集编码（声音同步）
         case 'rtc.audio':
         // 控制端上报解码能力上限 -> 被控端据此钳制编码分辨率（原画质自适应）
-        case 'rtc.deccap': {
+        case 'rtc.deccap':
+        // 控制端切换编码方式（H264/H265/VP9 等）-> 被控端热更新 MediaMTX 推流编码参数
+        case 'rtc.mtxcfg':
+        // 相机实况：控制端切换前后置摄像头 -> 被控端切源
+        case 'live.camera': {
             const session = sessions.get(sid);
             if (!session || session.status === 'terminated') {
                 ws.send(JSON.stringify({ op: 'error', sid, payload: { msg: 'no_session' } }));

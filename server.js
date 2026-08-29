@@ -2,10 +2,23 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const multer = require('multer');
+const AdmZip = require('adm-zip');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const zlib = require('zlib');
 const remoteAssist = require('./remote-assist');
+
+// 全局兜底：任何未捕获异常/未处理的 Promise rejection 都不应直接杀死进程。
+// （历史崩溃：audit.log 的 WriteStream 在 fd 失效时抛出未捕获 'error' 事件导致 EBADF 进程退出）
+// 此处记录后不退出，配合 pm2/nodemon 等进程管理器自动重启策略。
+process.on('uncaughtException', (e) => {
+    console.error('[uncaughtException]', e.code, e.message, '\n', e.stack);
+});
+process.on('unhandledRejection', (r) => {
+    console.error('[unhandledRejection]', r);
+});
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -26,9 +39,12 @@ const DEVICES_DIR = path.join(DATA_DIR, 'devices');
 const USAGE_DIR = path.join(DATA_DIR, 'usage');
 const SNAPSHOT_DIR = path.join(DATA_DIR, 'snapshots');
 const CLIPBOARD_DIR = path.join(DATA_DIR, 'clipboards');
+// 已发布 APK 与版本元数据存放目录（APP 自动更新功能）
+const UPDATES_DIR = path.join(__dirname, 'updates');
+const LATEST_JSON = path.join(UPDATES_DIR, 'latest.json');
 
 function ensureDirectories() {
-    [DATA_DIR, DEVICES_DIR, USAGE_DIR, SNAPSHOT_DIR, CLIPBOARD_DIR].forEach(dir => {
+    [DATA_DIR, DEVICES_DIR, USAGE_DIR, SNAPSHOT_DIR, CLIPBOARD_DIR, UPDATES_DIR].forEach(dir => {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
@@ -71,6 +87,170 @@ function safeWriteJSON(filePath, data) {
         return false;
     }
 }
+/**
+ * 解析 APK 安装包内的二进制 AndroidManifest.xml，提取 versionName / versionCode。
+ * 纯 Node 实现，不依赖 Android SDK / aapt。
+ *
+ * APK 是 ZIP：AndroidManifest.xml 为 Android 二进制 XML 格式。
+ * - 文件由若干 chunk 组成，chunk 头：type(u16 LE) + headerSize(u16 LE) + size(u32 LE)。
+ * - 根元素 RES_XML_START_ELEMENT = 0x0102，其 name 以框架资源 ID 0x01010000 表示 <manifest>。
+ * - 元素属性区：每个属性 20 字节 = namespace(4)+nameResId(4)+rawValue(4)+typedValue(8)；
+ *   typedValue = size(2)+res0(1)+type(1)+data(4)。
+ * - android:versionCode 资源 ID = 0x0101021b（属性值类型 TYPE_INT（0x10）或 TYPE_FIRSTINT（0x08），data 即整数）。
+ * - android:versionName 资源 ID = 0x0101021c（TYPE_STRING（0x03），data 是字符串池索引）。
+ * - 字符串池 RES_STRING_POOL = 0x0001，含 UTF-8 / UTF-16 字符串数组；可能整体被 deflate 压缩（flag 位 1<<15）。
+ *
+ * 返回 { versionName, versionCode }；解析失败返回空串（由调用方回退手填值）。
+ */
+/**
+ * 解析 APK 安装包内的二进制 AndroidManifest.xml，提取 versionName / versionCode。
+ * 纯 Node 实现，不依赖 Android SDK / aapt。
+ *
+ * 布局要点（经验证）：
+ * - APK 是 ZIP。用 findZipEntry 在 EOCD 中定位 AndroidManifest.xml 本地数据。
+ * - 二进制 XML 由 chunk 组成：chunk 头 = type(u16)+headerSize(u16)+size(u32)。
+ * - StringPool(0x0001)：字符串用「偏移表 + UTF-16」布局。
+ *     - 偏移表紧跟 header 之后，u32[count]，每项 = 相对字符串数据区的字节偏移；
+ *     - 字符串数据区起点 = chunkOff + stringsStart；
+ *     - 每条字符串 = u16 字符数 + 字符数*2 的 UTF-16LE 字节。
+ * - StartElement(0x0102)：ns(4)@16 + name(4)@20 + attrStart(2)@24 + attrSize(2)@26 + attrCount(2)@28 … 属性区
+ *     - 属性记录 20 字节 = ns(4)+name(4)@4+rawValue(4)@12+typedValue(8)@16（size2+res0+type1@14+data4@16）
+ * - android:versionCode 框架 ID = 0x0101021b，android:versionName = 0x0101021c（标准 APK 走此路径）。
+ * - 部分 aapt2 产物属性名编码异常（非标准），故加启发式兜底：从根 <manifest> 属性值里挑
+ *   纯整数(→versionCode) / 带点版本串(→versionName)。
+ *
+ * 返回 { versionName, versionCode }；解析失败返回空串（由调用方回退手填值）。
+ */
+function parseApkVersion(apkBuffer) {
+    try {
+        // 用 adm-zip 解 APK（标准 ZIP 解析，处理 extra/comment/ZIP64 等边界），取出二进制 AndroidManifest.xml
+        const zip = new AdmZip(apkBuffer);
+        const entry = zip.getEntry('AndroidManifest.xml');
+        if (!entry) return { versionName: '', versionCode: '' };
+        const manifest = entry.getData();
+
+        const dv = new DataView(manifest.buffer, manifest.byteOffset, manifest.byteLength);
+        const u16 = (o) => dv.getUint16(o, true);
+        const u32 = (o) => dv.getUint32(o, true);
+        const u8 = (o) => dv.getUint8(o);
+
+        const stringPools = [];
+        let off = 8;
+        while (off + 8 <= manifest.length) {
+            const type = u16(off);
+            const size = u32(off + 4);
+            if (size < 8 || off + size > manifest.length) break;
+            if (type === 0x0001) stringPools.push(parseStringPool(manifest, off, size));
+            off += size;
+        }
+        const pool = stringPools[0] || [];
+        const getStr = (idx) => (idx >= 0 && idx < pool.length) ? pool[idx] : '';
+
+        off = 8;
+        while (off + 8 <= manifest.length) {
+            const type = u16(off);
+            const size = u32(off + 4);
+            if (size < 8 || off + size > manifest.length) break;
+            if (type === 0x0102) {
+                const name = u32(off + 20);
+                const elemName = (name < pool.length) ? pool[name] : '';
+                if (elemName === 'manifest') {
+                    const attrStart = u16(off + 24);
+                    const attrSize = u16(off + 26);
+                    const attrCount = u16(off + 28);
+                    // 属性数组起点：元素头 = ResChunk_header(8) + lineNumber/comment(8) = 16，再加 attributeStart
+                    const attrBase = off + 16 + attrStart;
+                    let versionCode = '', versionName = '';
+                    // aapt2 编译后 versionCode/versionName 的资源 ID 高 16 位会被置 0，裸 ID 不稳定
+                    // （debug 包里 versionCode=0x1b，release 包里却变成 0x1a；裸 0x1b 在两包中含义相反），
+                    // 因此不能单纯依赖低字节匹配。策略：完整 ID 直接命中；否则对裸 ID 用「值语义」消歧
+                    // —— versionName 必为点分版本串（如 1.0.2），versionCode 必为纯整数。
+                    const isDotVersion = (s) => typeof s === 'string' && /^\d+\.\d+/.test(s.trim());
+                    const isPlainInt = (s) => typeof s === 'string' && /^\d+$/.test(s.trim());
+                    let codeCand = null, nameCand = null;
+                    for (let i = 0; i < attrCount; i++) {
+                        const aOff = attrBase + i * attrSize;
+                        const aName = u32(aOff + 4);    // 完整属性 ID（32 位）
+                        const aType = u8(aOff + 15);    // typedValue.type（1 字节）
+                        const aData = u32(aOff + 16);    // typedValue.data
+                        // 取出属性值（TYPE_STRING=0x03 时去字符串池，否则当作整数）
+                        const val = (aType === 0x03) ? getStr(aData)
+                                    : String(aData >>> 0);
+                        if (aName === 0x0101021b) {        // 标准 android:versionCode
+                            codeCand = val;
+                        } else if (aName === 0x0101021c) { // 标准 android:versionName
+                            nameCand = val;
+                        } else if (aName === 0x0000001a || aName === 0x0000001b || aName === 0x0000001c) {
+                            // aapt2 裸 ID：用值语义消歧（裸 0x1b 在 debug=code、release=name，必须靠值判断）
+                            if (isDotVersion(val)) {
+                                nameCand = nameCand || val;
+                            } else if (isPlainInt(val)) {
+                                codeCand = codeCand || val;
+                            }
+                        }
+                    }
+                    versionCode = codeCand || '';
+                    versionName = nameCand || '';
+                    return { versionCode, versionName };
+                }
+            }
+            off += size;
+        }
+        return { versionName: '', versionCode: '' };
+    } catch (e) {
+        console.error('[parseApkVersion] 解析失败:', e.message);
+        return { versionName: '', versionCode: '' };
+    }
+}
+
+/**
+ * 解析 StringPool chunk（偏移表 + UTF-16 布局；支持 UTF-8 flag 与 deflate 压缩 flag）。
+ */
+function parseStringPool(buf, chunkOff, chunkSize) {
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const u16 = (o) => dv.getUint16(o, true);
+    const u32 = (o) => dv.getUint32(o, true);
+    const headerSize = u16(chunkOff + 2);
+    const stringCount = u32(chunkOff + 8);
+    const flags = u32(chunkOff + 16);
+    const stringsStart = u32(chunkOff + 20);
+    const isUtf8 = (flags & (1 << 8)) !== 0;
+    const ds = chunkOff + stringsStart;                 // 字符串数据区绝对起点
+    const offsetTableStart = chunkOff + headerSize;      // 偏移表（u32[count]）起点
+    const strings = [];
+    for (let i = 0; i < stringCount; i++) {
+        const strAbs = ds + u32(offsetTableStart + i * 4); // 字符串 i 绝对位置
+        if (isUtf8) {
+            // aapt2 UTF-8 字符串格式：[utf16Len(u16 或 uleb128)][utf8Len(uleb128)][utf8 字节]
+            let pos = strAbs;
+            let b0 = buf[pos];
+            let utf16Len;
+            if ((b0 & 0x80) === 0) { utf16Len = b0; pos += 1; }
+            else if ((b0 & 0xc0) === 0x80) { utf16Len = ((b0 & 0x3f) << 8) | buf[pos + 1]; pos += 2; }
+            else {
+                // 大长度：3 字节 uleb128（aapt2 编码：0x81,0x80,0x04 形式）
+                utf16Len = ((b0 & 0x0f) << 16) | (buf[pos + 1] << 8) | buf[pos + 2];
+                pos += 3;
+            }
+            // 读 utf8 字节长度（uleb128）
+            let utf8Len = 0, shift = 0;
+            while (true) {
+                const b = buf[pos++];
+                utf8Len |= (b & 0x7f) << shift;
+                if ((b & 0x80) === 0) break;
+                shift += 7;
+            }
+            const bytes = buf.subarray(pos, pos + utf8Len);
+            strings.push(Buffer.from(bytes).toString('utf8'));
+        } else {
+            const len = u16(strAbs);                          // u16 字符数
+            const strBytes = buf.subarray(strAbs + 2, strAbs + 2 + len * 2);
+            strings.push(Buffer.from(strBytes).toString('utf16le'));
+        }
+    }
+    return strings;
+}
+
 const fileLocks = new Map();
 async function withFileLock(filePath, operation) {
     while (fileLocks.has(filePath)) {
@@ -512,6 +692,21 @@ app.use('/clipboards', express.static(CLIPBOARD_DIR, {
     }
 }));
 
+// ---- APP 自动更新：发布页面与安装包下载 ----
+// 发布页面（publish.html 等静态资源）
+app.use('/public', express.static(path.join(__dirname, 'public'), {
+    setHeaders: (res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'no-cache');
+    }
+}));
+// 便捷路由：浏览器访问 /publish 直接打开发布页
+app.get('/publish', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'publish.html'));
+});
+// 最新安装包不再单独放在根目录 starclick.apk，统一由 /updates 目录承载，
+// 通过 /api/app/download/:versionCode 路由下载（见下方接口）。
+
 // 被控端上传剪切板文本（base64 JSON，零额外依赖）：{ deviceId, data }
 app.post('/api/remote/clipboard/upload', (req, res) => {
     try {
@@ -563,24 +758,6 @@ app.get('/api/ice-debug', (req, res) => {
     });
 });
 
-app.use((req, res) => {
-    res.status(404).json({
-        success: false,
-        error: '未找到该接口',
-        path: req.path,
-        method: req.method
-    });
-});
-
-app.use((err, req, res, next) => {
-    console.error('错误:', err);
-    res.status(500).json({
-        success: false,
-        error: '服务器内部错误',
-        message: err.message
-    });
-});
-
 function generateDeviceId() {
     const timestamp = Date.now().toString(36);
     const random = Math.random().toString(36).substring(2, 10);
@@ -601,6 +778,236 @@ function getChinaTime() {
     const iso = chinaTime.toISOString();
     return iso.replace('Z', '+08:00');
 }
+
+// ==================== APP 自动更新：版本发布 / 查询 ====================
+// multer 内存存储：APK 先放内存，解析 manifest 后再落盘（避免临时文件）
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+
+/**
+ * 发布新版本：上传 APK，服务端从二进制 AndroidManifest.xml 自动解析 versionName/versionCode，
+ * 解析成功以解析值为准（覆盖手填，防止手填错），失败则使用手填值。
+ * 落盘：覆盖根目录 starclick.apk（已被静态托管），并写 updates/latest.json。
+ */
+app.post('/api/app/publish', upload.single('apk'), (req, res) => {
+    try {
+        if (!req.file) {
+            return res.json({ success: false, message: '未收到 APK 文件' });
+        }
+        const apkBuf = req.file.buffer;
+        const parsed = parseApkVersion(apkBuf);
+
+        // 手填值优先用于兜底，但若解析成功则以解析为准
+        let versionName = (req.body.versionName || '').trim();
+        let versionCode = parseInt(req.body.versionCode || '', 10);
+        const autoName = parsed.versionName || '';
+        const autoCode = parsed.versionCode || '';
+
+        if (autoCode) {
+            versionCode = parseInt(autoCode, 10);
+        }
+        if (autoName) {
+            versionName = autoName;
+        }
+
+        if (!versionName || !versionCode || isNaN(versionCode)) {
+            return res.json({
+                success: false,
+                message: '无法识别版本号。APK 解析失败，请手动填写版本号与版本代码后重试。'
+            });
+        }
+
+        // 落盘 APK：统一存放到 updates/ 目录（不再在根目录保留 starclick.apk）
+        fs.writeFileSync(path.join(UPDATES_DIR, `starclick-${versionCode}.apk`), apkBuf);
+
+        const publishedAt = new Date().toISOString();
+
+        // 写 latest.json
+        const latest = {
+            versionName,
+            versionCode,
+            apkUrl: `/api/app/download/${versionCode}`,
+            size: apkBuf.length,
+            note: (req.body.note || '').toString().trim(),
+            parsedFromApk: !!(autoName || autoCode),
+            publishedAt
+        };
+        safeWriteJSON(LATEST_JSON, latest);
+
+        // 写每个版本独立的元数据文件（历史版本页 / 单版本下载使用）
+        safeWriteJSON(path.join(UPDATES_DIR, `starclick-${versionCode}.json`), latest);
+
+        console.log(`[app/publish] 发布成功 v${versionName} (code ${versionCode}), 自动解析=${latest.parsedFromApk}, 大小=${(apkBuf.length / 1024 / 1024).toFixed(1)}MB`);
+        res.json({ success: true, message: '发布成功', data: latest });
+    } catch (e) {
+        console.error('[app/publish] 失败:', e);
+        res.json({ success: false, message: '发布异常：' + e.message });
+    }
+});
+
+/**
+ * 仅解析 APK 版本号（不落盘、不发布），用于发布页面选文件后自动回填。
+ */
+app.post('/api/app/parse', upload.single('apk'), (req, res) => {
+    try {
+        if (!req.file) {
+            return res.json({ success: false, message: '未收到 APK 文件' });
+        }
+        const parsed = parseApkVersion(req.file.buffer);
+        const versionName = (req.body.versionName || '').trim() || parsed.versionName;
+        const versionCode = parsed.versionCode || (req.body.versionCode || '').trim();
+        res.json({
+            success: true,
+            data: {
+                versionName,
+                versionCode,
+                parsedFromApk: !!(parsed.versionName || parsed.versionCode),
+                fileName: req.file.originalname,
+                size: req.file.buffer.length
+            }
+        });
+    } catch (e) {
+        console.error('[app/parse] 失败:', e);
+        res.json({ success: false, message: '解析异常：' + e.message });
+    }
+});
+
+/**
+ * 查询最新版本信息（APP 检查更新调用）。
+ */
+app.get('/api/app/latest', (req, res) => {
+    const latest = safeReadJSON(LATEST_JSON, null);
+    if (latest) {
+        res.json({ success: true, data: latest });
+    } else {
+        res.json({ success: false, message: '暂无已发布版本', data: null });
+    }
+});
+
+/**
+ * 查询历史所有已发布版本（历史版本页调用）。
+ * 扫描 updates/ 下的 starclick-<code>.json 与对应 .apk，按 versionCode 倒序返回。
+ * 每个版本含独立下载地址 /api/app/download/<versionCode>。
+ */
+app.get('/api/app/history', (req, res) => {
+    try {
+        if (!fs.existsSync(UPDATES_DIR)) {
+            return res.json({ success: true, versions: [], total: 0 });
+        }
+        // 先收集每个 versionCode 的元数据（优先读 .json，缺失则由文件名兜底）
+        const metas = new Map();
+        const files = fs.readdirSync(UPDATES_DIR);
+        // 1) 读元数据 json
+        files.filter(f => /^starclick-(\d+)\.json$/.test(f)).forEach(f => {
+            const code = parseInt(f.match(/^starclick-(\d+)\.json$/)[1], 10);
+            const meta = safeReadJSON(path.join(UPDATES_DIR, f), null);
+            if (meta) metas.set(code, meta);
+        });
+        // 2) 补齐只有 .apk 没有 .json 的历史文件（兼容旧发布流程）
+        files.filter(f => /^starclick-(\d+)\.apk$/.test(f)).forEach(f => {
+            const code = parseInt(f.match(/^starclick-(\d+)\.apk$/)[1], 10);
+            const apkPath = path.join(UPDATES_DIR, f);
+            if (!metas.has(code)) {
+                metas.set(code, {
+                    versionName: String(code),
+                    versionCode: code,
+                    size: fs.statSync(apkPath).size,
+                    note: '',
+                    publishedAt: null
+                });
+            }
+        });
+        const versions = Array.from(metas.values())
+            .map(v => ({
+                versionName: v.versionName,
+                versionCode: v.versionCode,
+                size: v.size,
+                note: v.note || '',
+                parsedFromApk: !!v.parsedFromApk,
+                publishedAt: v.publishedAt || null,
+                apkUrl: `/api/app/download/${v.versionCode}`,
+                isLatest: (metas.size > 0 && v.versionCode === Math.max(...Array.from(metas.keys())))
+            }))
+            .sort((a, b) => Number(b.versionCode) - Number(a.versionCode));
+        res.json({ success: true, versions, total: versions.length });
+    } catch (e) {
+        console.error('[app/history] 失败:', e);
+        res.json({ success: false, message: '读取历史版本失败：' + e.message, versions: [], total: 0 });
+    }
+});
+
+/**
+ * 单版本 APK 下载（历史版本页「下载」按钮调用）。
+ * 文件不存在返回 404。
+ */
+app.get('/api/app/download/:versionCode', (req, res) => {
+    const code = parseInt(req.params.versionCode, 10);
+    if (!code || code <= 0) {
+        return res.status(400).json({ success: false, message: '非法的版本代码' });
+    }
+    const apkPath = path.join(UPDATES_DIR, `starclick-${code}.apk`);
+    if (!fs.existsSync(apkPath)) {
+        return res.status(404).json({ success: false, message: `版本 ${code} 的安装包不存在` });
+    }
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', `attachment; filename="starclick-v${code}.apk"`);
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(apkPath);
+});
+
+/**
+ * 删除单个历史版本（同时删除 .apk 与 .json 实际文件，并维护 latest.json）。
+ * 若删除的是当前线上最新版，则把 latest.json 指向剩余版本中 versionCode 最大者，没有则置空。
+ */
+app.delete('/api/app/version/:versionCode', (req, res) => {
+    const code = parseInt(req.params.versionCode, 10);
+    if (!code || code <= 0) {
+        return res.status(400).json({ success: false, message: '非法的版本代码' });
+    }
+    const apkPath = path.join(UPDATES_DIR, `starclick-${code}.apk`);
+    const jsonPath = path.join(UPDATES_DIR, `starclick-${code}.json`);
+    if (!fs.existsSync(apkPath) && !fs.existsSync(jsonPath)) {
+        return res.status(404).json({ success: false, message: `版本 ${code} 不存在` });
+    }
+    try {
+        if (fs.existsSync(apkPath)) fs.unlinkSync(apkPath);
+        if (fs.existsSync(jsonPath)) fs.unlinkSync(jsonPath);
+
+        // 维护 latest.json：若被删的是当前最新，则刷新为剩余最大版本
+        const latest = safeReadJSON(LATEST_JSON, null);
+        if (latest && Number(latest.versionCode) === code) {
+            // 重新扫描剩余版本，取 versionCode 最大者
+            let maxCode = -1;
+            if (fs.existsSync(UPDATES_DIR)) {
+                fs.readdirSync(UPDATES_DIR)
+                    .filter(f => /^starclick-(\d+)\.json$/.test(f))
+                    .forEach(f => {
+                        const c = parseInt(f.match(/^starclick-(\d+)\.json$/)[1], 10);
+                        if (c > maxCode) maxCode = c;
+                    });
+            }
+            if (maxCode > 0) {
+                const newLatest = safeReadJSON(path.join(UPDATES_DIR, `starclick-${maxCode}.json`), null);
+                safeWriteJSON(LATEST_JSON, newLatest || {
+                    versionName: String(maxCode), versionCode: maxCode,
+                    apkUrl: `/api/app/download/${maxCode}`, size: 0, note: '', publishedAt: null
+                });
+            } else {
+                // 没有剩余版本，清空 latest
+                if (fs.existsSync(LATEST_JSON)) fs.unlinkSync(LATEST_JSON);
+            }
+        }
+        res.json({ success: true, message: `版本 ${code} 已删除` });
+    } catch (e) {
+        console.error('[app/version delete] 失败:', e);
+        res.status(500).json({ success: false, message: '删除失败：' + e.message });
+    }
+});
+
+// 便捷路由：浏览器访问 /versions 直接打开历史版本页
+app.get('/versions', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'history.html'));
+});
 
 const server = app.listen(PORT, HOST, () => {
     console.log('=================================');
@@ -629,5 +1036,25 @@ const server = app.listen(PORT, HOST, () => {
 remoteAssist.attach(server);
 remoteAssist.startTimeoutWatchdog();
 console.log('[remote] 远程协助信令模块已挂载: /ws/remote');
+
+// 404 兜底与错误处理中间件必须放在所有路由之后，否则会拦截后续注册的路由
+app.use((req, res) => {
+    console.log('[404] 未匹配路由:', req.method, req.originalUrl || req.url, 'path=', req.path);
+    res.status(404).json({
+        success: false,
+        error: '未找到该接口',
+        path: req.path,
+        method: req.method
+    });
+});
+
+app.use((err, req, res, next) => {
+    console.error('错误:', err);
+    res.status(500).json({
+        success: false,
+        error: '服务器内部错误',
+        message: err.message
+    });
+});
 
 module.exports = app;

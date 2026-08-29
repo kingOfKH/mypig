@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StarClick · 历史版本</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg1: #1a1a2e; --bg2: #16213e;
+    --card: rgba(255,255,255,0.045); --border: rgba(255,255,255,0.09);
+    --text: #e6e6e6; --muted: #9aa0b4; --muted2: #c0c6dc;
+    --brand: #788cff; --brand2: #5a6cff; --brand-grad: linear-gradient(135deg, #788cff, #5a6cff);
+    --danger: #ff9a9a; --danger-bg: rgba(255,90,90,0.12); --danger-border: rgba(255,120,120,0.4);
+    --ok: #8fe093; --ok-bg: rgba(111,191,115,0.2);
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(120,140,255,0.12), transparent 60%),
+      radial-gradient(900px 500px at -10% 110%, rgba(111,191,115,0.08), transparent 55%),
+      linear-gradient(135deg, var(--bg1) 0%, var(--bg2) 100%);
+    color: var(--text); min-height: 100vh; padding: 32px 20px;
+  }
+  .wrap { width: 100%; max-width: 760px; margin: 0 auto; }
+  .head {
+    display: flex; align-items: flex-end; justify-content: space-between;
+    margin-bottom: 24px; flex-wrap: wrap; gap: 12px; padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  h1 {
+    font-size: 24px; font-weight: 700; letter-spacing: .3px;
+    background: linear-gradient(135deg, #fff, #b9c2ff);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .sub { font-size: 13px; color: var(--muted); margin-top: 4px; }
+  .link {
+    font-size: 13px; font-weight: 600; color: var(--brand); text-decoration: none;
+    padding: 8px 14px; border: 1px solid rgba(120,140,255,0.35); border-radius: 10px;
+    background: rgba(120,140,255,0.08); transition: all .18s ease;
+  }
+  .link:hover { background: rgba(120,140,255,0.18); border-color: var(--brand); transform: translateY(-1px); }
+  .list { display: flex; flex-direction: column; gap: 14px; }
+  .item {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 18px 20px; display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    transition: transform .18s ease, border-color .18s ease, background .18s ease;
+  }
+  .item:hover { transform: translateY(-2px); border-color: rgba(120,140,255,0.35); background: rgba(255,255,255,0.06); }
+  .item .info { min-width: 0; flex: 1; }
+  .ver { font-size: 16px; color: #fff; font-weight: 700; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .ver .code { font-size: 12px; color: var(--muted); font-weight: 500; }
+  .badge {
+    display: inline-block; font-size: 11px; padding: 2px 9px; border-radius: 20px;
+    background: var(--ok-bg); color: var(--ok); border: 1px solid rgba(111,191,115,0.35);
+    font-weight: 600;
+  }
+  .meta { font-size: 12px; color: var(--muted); margin-top: 8px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .meta span { display: inline-flex; align-items: center; gap: 4px; }
+  .note { font-size: 12.5px; color: var(--muted2); margin-top: 8px; word-break: break-all; line-height: 1.5; }
+  .ops { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .dl, .del {
+    padding: 10px 18px; border: none; border-radius: 10px; font-size: 13px; font-weight: 600;
+    cursor: pointer; text-decoration: none; white-space: nowrap; transition: all .18s ease;
+  }
+  .dl { background: var(--brand-grad); color: #fff; box-shadow: 0 6px 18px rgba(90,108,255,0.3); }
+  .dl:hover { transform: translateY(-1px); box-shadow: 0 8px 22px rgba(90,108,255,0.45); }
+  .del {
+    background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border);
+  }
+  .del:hover { background: rgba(255,90,90,0.22); }
+  .del:disabled { opacity: .5; cursor: default; transform: none; }
+  .empty, .err {
+    text-align: center; color: var(--muted); padding: 56px 0; font-size: 14px;
+  }
+  .empty .ic { font-size: 40px; display: block; margin-bottom: 12px; opacity: .6; }
+  .err { color: var(--danger); }
+  @media (max-width: 520px) {
+    .item { flex-direction: column; align-items: stretch; }
+    .ops { justify-content: flex-end; }
+    .ver { font-size: 15px; }
+  }
+
+  /* ===== 自定义确认弹窗 ===== */
+  .modal-mask {
+    position: fixed; inset: 0; background: rgba(8,10,22,0.6); backdrop-filter: blur(3px);
+    display: flex; align-items: center; justify-content: center; padding: 20px;
+    opacity: 0; visibility: hidden; transition: opacity .2s ease, visibility .2s ease; z-index: 50;
+  }
+  .modal-mask.show { opacity: 1; visibility: visible; }
+  .modal {
+    width: 100%; max-width: 380px; background: var(--card);
+    border: 1px solid var(--border); border-radius: 16px; padding: 24px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.55); transform: translateY(12px) scale(.97);
+    transition: transform .2s ease; backdrop-filter: blur(12px);
+  }
+  .modal-mask.show .modal { transform: translateY(0) scale(1); }
+  .modal .m-icon {
+    width: 46px; height: 46px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    font-size: 24px; margin-bottom: 14px;
+    background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border);
+  }
+  .modal .m-title { font-size: 16px; font-weight: 700; color: #fff; margin-bottom: 8px; }
+  .modal .m-text { font-size: 13.5px; color: var(--muted2); line-height: 1.6; }
+  .modal .m-text b { color: #fff; font-weight: 600; }
+  .modal .m-actions { display: flex; gap: 12px; margin-top: 22px; }
+  .modal .m-actions button {
+    flex: 1; padding: 11px; border-radius: 10px; font-size: 14px; font-weight: 600;
+    cursor: pointer; transition: all .18s ease; border: none;
+  }
+  .modal .m-cancel {
+    background: rgba(255,255,255,0.07); color: var(--muted2); border: 1px solid var(--border);
+  }
+  .modal .m-cancel:hover { background: rgba(255,255,255,0.12); }
+  .modal .m-ok {
+    background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border);
+  }
+  .modal .m-ok:hover { background: rgba(255,90,90,0.25); }
+  .modal .m-ok:disabled { opacity: .6; cursor: default; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <div>
+        <h1>StarClick 历史版本</h1>
+        <div class="sub">所有已发布版本，可单独下载或删除</div>
+      </div>
+      <a class="link" href="/publish">+ 发布新版本</a>
+    </div>
+    <div id="content"><div class="empty"><span class="ic">🕘</span>加载中…</div></div>
+  </div>
+
+  <!-- 自定义删除确认弹窗 -->
+  <div class="modal-mask" id="modal">
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="m-icon">⚠️</div>
+      <div class="m-title" id="mTitle">确认删除</div>
+      <div class="m-text" id="mText"></div>
+      <div class="m-actions">
+        <button class="m-cancel" id="mCancel">取消</button>
+        <button class="m-ok" id="mOk">删除</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const content = document.getElementById('content');
+
+  function fmtSize(n) {
+    if (!n && n !== 0) return '';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1024 / 1024).toFixed(1) + ' MB';
+  }
+  function fmtDate(s) {
+    if (!s) return '';
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    return d.toLocaleString('zh-CN', { hour12: false });
+  }
+
+  async function load() {
+    try {
+      const r = await fetch('/api/app/history');
+      const j = await r.json();
+      if (!j.success || !j.versions || j.versions.length === 0) {
+        content.innerHTML = '<div class="empty"><span class="ic">📭</span>暂无已发布版本</div>';
+        return;
+      }
+      const items = j.versions.map(v => `
+        <div class="item">
+          <div class="info">
+            <div class="ver">v${v.versionName}<span class="code">code ${v.versionCode}</span>${v.isLatest ? '<span class="badge">最新</span>' : ''}</div>
+            <div class="meta">
+              ${v.publishedAt ? '<span>🕒 ' + fmtDate(v.publishedAt) + '</span>' : ''}
+              ${fmtSize(v.size) ? '<span>📦 ' + fmtSize(v.size) + '</span>' : ''}
+            </div>
+            ${v.note ? '<div class="note">📝 ' + escapeHtml(v.note) + '</div>' : ''}
+          </div>
+          <div class="ops">
+            <a class="dl" href="${v.apkUrl}" download>下载</a>
+            <button class="del" data-code="${v.versionCode}" data-name="${escapeHtml(v.versionName)}">删除</button>
+          </div>
+        </div>
+      `).join('');
+      content.innerHTML = '<div class="list">' + items + '</div>';
+    } catch (e) {
+      content.innerHTML = '<div class="err">加载失败：' + escapeHtml(e.message) + '</div>';
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  // ===== 自定义确认弹窗：返回 Promise<boolean> =====
+  const modal = document.getElementById('modal');
+  const mTitle = document.getElementById('mTitle');
+  const mText = document.getElementById('mText');
+  const mCancel = document.getElementById('mCancel');
+  const mOk = document.getElementById('mOk');
+  let modalResolve = null;
+
+  function showConfirm(title, text) {
+    mTitle.textContent = title;
+    mText.innerHTML = text;
+    mOk.disabled = false;
+    mOk.textContent = '删除';
+    modal.classList.add('show');
+    return new Promise(resolve => { modalResolve = resolve; });
+  }
+  function closeModal(result) {
+    modal.classList.remove('show');
+    if (modalResolve) { modalResolve(result); modalResolve = null; }
+  }
+  mCancel.addEventListener('click', () => closeModal(false));
+  mOk.addEventListener('click', () => closeModal(true));
+  modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(false); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && modal.classList.contains('show')) closeModal(false); });
+
+  // 删除按钮（事件委托）：弹出自定义确认框 → 调用 DELETE 接口 → 刷新列表
+  content.addEventListener('click', async (e) => {
+    const btn = e.target.closest('.del');
+    if (!btn) return;
+    const code = btn.getAttribute('data-code');
+    const name = btn.getAttribute('data-name') || code;
+    const ok = await showConfirm(
+      '确认删除该版本？',
+      '确定要删除版本 <b>v' + escapeHtml(name) + '</b>（code ' + escapeHtml(code) + '）吗？<br>该版本的安装包与记录将被<b>永久删除，且无法恢复</b>。'
+    );
+    if (!ok) return;
+    // 锁定弹窗确认按钮，避免重复提交
+    mOk.disabled = true;
+    mOk.textContent = '删除中…';
+    btn.disabled = true;
+    btn.textContent = '删除中…';
+    try {
+      const r = await fetch(`/api/app/version/${code}`, { method: 'DELETE' });
+      const j = await r.json();
+      if (!j.success) throw new Error(j.message || '删除失败');
+      closeModal(true);
+      await load();
+    } catch (err) {
+      mOk.disabled = false;
+      mOk.textContent = '删除';
+      alert('删除失败：' + err.message);
+      btn.disabled = false;
+      btn.textContent = '删除';
+    }
+  });
+
+  load();
+</script>
+</body>
+</html>

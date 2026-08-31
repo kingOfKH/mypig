@@ -72,7 +72,9 @@ function writeJson(file, data) {
 // ---- 业务常量 ----
 const CODE_TTL_MS = 10 * 60 * 1000;            // 控制码有效期（待命绑定码仍为 10 分钟，仅作"等待匹配"窗口）
 const PLAN_LIMITS = {                           // 各套餐单次最长协助时长
-    free: 10 * 60 * 1000,
+    // free 为默认兜底档（当前项目无会员机制，subscriptionCache 恒为空，所有设备均落此档）。
+    // 设为 Infinity 表示免费档不限时，避免所有会话被无差别强断；pro/flag 保留给未来会员体系。
+    free: Infinity,
     pro: 60 * 60 * 1000,
     flag: 120 * 60 * 1000,
 };

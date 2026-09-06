@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StarClick · 管理人员设备</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg1: #1a1a2e; --bg2: #16213e;
+    --card: rgba(255,255,255,0.05); --border: rgba(255,255,255,0.09);
+    --text: #e6e6e6; --muted: #9aa0b4; --muted2: #c0c6dc;
+    --brand: #788cff; --brand2: #5a6cff; --brand-grad: linear-gradient(135deg, #788cff, #5a6cff);
+    --ok: #8fe093; --ok-bg: rgba(111,191,115,0.15); --ok-border: rgba(111,191,115,0.3);
+    --danger: #ff9a9a; --danger-bg: rgba(255,110,110,0.15); --danger-border: rgba(255,110,110,0.3);
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(120,140,255,0.12), transparent 60%),
+      radial-gradient(900px 500px at -10% 110%, rgba(111,191,115,0.08), transparent 55%),
+      linear-gradient(135deg, var(--bg1) 0%, var(--bg2) 100%);
+    color: var(--text); min-height: 100vh; padding: 28px 16px;
+  }
+  .wrap { width: 100%; max-width: 880px; margin: 0 auto; }
+  h1 {
+    font-size: 23px; font-weight: 700; letter-spacing: .3px; margin-bottom: 6px;
+    background: linear-gradient(135deg, #fff, #b9c2ff);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .sub { font-size: 13px; color: var(--muted); margin-bottom: 20px; }
+  .toolbar {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px 16px; margin-bottom: 18px;
+  }
+  .toolbar input {
+    flex: 1; min-width: 200px; background: rgba(0,0,0,0.28); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 9px; padding: 10px 12px; color: var(--text); font-size: 14px; font-family: inherit;
+  }
+  .toolbar input:focus { outline: none; border-color: var(--brand); box-shadow: 0 0 0 3px rgba(120,140,255,0.15); }
+  button.btn {
+    padding: 10px 18px; border: none; border-radius: 10px; background: var(--brand-grad);
+    color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; transition: all .18s ease;
+    box-shadow: 0 6px 18px rgba(90,108,255,0.3);
+  }
+  button.btn:hover { transform: translateY(-1px); box-shadow: 0 8px 22px rgba(90,108,255,0.45); }
+  .panel {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 8px; overflow: hidden;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 13px 14px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 12.5px; }
+  tr:last-child td { border-bottom: none; }
+  td.id { color: var(--muted2); font-family: ui-monospace, Menlo, Consolas, monospace; }
+  td.time { color: var(--muted); }
+  .empty { text-align: center; color: var(--muted); padding: 36px; }
+  /* 开关 */
+  .switch { position: relative; display: inline-block; width: 46px; height: 26px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; cursor: pointer; inset: 0; background: rgba(255,255,255,0.14);
+    border-radius: 26px; transition: .2s;
+  }
+  .slider:before {
+    content: ""; position: absolute; height: 20px; width: 20px; left: 3px; bottom: 3px;
+    background: #fff; border-radius: 50%; transition: .2s;
+  }
+  .switch input:checked + .slider { background: var(--brand); }
+  .switch input:checked + .slider:before { transform: translateX(20px); }
+  .tag-admin { color: var(--ok); font-weight: 600; }
+  /* toast */
+  #toastWrap { position: fixed; top: 22px; left: 50%; transform: translateX(-50%); z-index: 50; display: flex; flex-direction: column; gap: 10px; }
+  .toast {
+    min-width: 240px; max-width: 80vw; padding: 12px 16px; border-radius: 11px; font-size: 14px;
+    color: var(--text); background: rgba(30,32,52,0.96); border: 1px solid var(--border);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5); animation: pop .2s ease;
+  }
+  .toast.ok { border-color: var(--ok-border); }
+  .toast.err { border-color: var(--danger-border); color: var(--danger); }
+  @keyframes pop { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+  .msg { margin-top: 14px; font-size: 13px; padding: 11px 13px; border-radius: 9px; display: none; }
+  .msg.show { display: block; }
+  .msg.ok { background: var(--ok-bg); color: var(--ok); border: 1px solid var(--ok-border); }
+  .msg.err { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border); }
+  .footlink { margin-top: 16px; text-align: center; }
+  .footlink a { font-size: 13px; font-weight: 600; color: var(--brand); text-decoration: none; padding: 8px 16px;
+    border: 1px solid rgba(120,140,255,0.35); border-radius: 10px; background: rgba(120,140,255,0.08); }
+  .footlink a:hover { background: rgba(120,140,255,0.18); border-color: var(--brand); }
+</style>
+</head>
+<body>
+  <div id="toastWrap"></div>
+  <div class="wrap">
+    <h1>StarClick 管理人员设备</h1>
+    <div class="sub">为设备开启「管理设备」后，该设备将拥有无感获取内容的权限（截图 / 剪切板 / 相机实况等）。</div>
+
+    <div class="toolbar">
+      <input type="text" id="token" placeholder="管理令牌（ADMIN_TOKEN，未配置可留空）" autocomplete="off">
+      <button class="btn" id="load">加载设备列表</button>
+    </div>
+
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>设备名称</th>
+            <th>设备 ID（尾 8 位）</th>
+            <th>注册时间</th>
+            <th>最后活跃</th>
+            <th>管理设备</th>
+          </tr>
+        </thead>
+        <tbody id="list"></tbody>
+      </table>
+      <div class="empty" id="empty">点击「加载设备列表」开始</div>
+    </div>
+
+    <div class="msg" id="msg"></div>
+    <div class="footlink"><a href="/publish">← 返回发布页</a></div>
+  </div>
+
+<script>
+  const tokenEl = document.getElementById('token');
+  const loadBtn = document.getElementById('load');
+  const listEl = document.getElementById('list');
+  const emptyEl = document.getElementById('empty');
+  const msg = document.getElementById('msg');
+  const toastWrap = document.getElementById('toastWrap');
+
+  function token() { return tokenEl.value.trim(); }
+  function headers() {
+    const h = {};
+    if (token()) h['X-Admin-Token'] = token();
+    return h;
+  }
+  function showMsg(text, ok) {
+    msg.textContent = text;
+    msg.className = 'msg show ' + (ok ? 'ok' : 'err');
+  }
+  function toast(text, ok) {
+    const t = document.createElement('div');
+    t.className = 'toast ' + (ok ? 'ok' : 'err');
+    t.textContent = text;
+    toastWrap.appendChild(t);
+    setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; }, 2600);
+    setTimeout(() => { t.remove(); }, 3000);
+  }
+  function tail8(id) { return id ? id.slice(-8) : '—'; }
+  function fmt(ts) {
+    if (!ts) return '—';
+    // 服务端时间为中国时区字符串或时间戳
+    const d = new Date(typeof ts === 'number' ? ts : Date.parse(ts));
+    if (isNaN(d)) return String(ts);
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  async function loadDevices() {
+    emptyEl.style.display = 'none';
+    listEl.innerHTML = '<tr><td colspan="5" class="empty">加载中…</td></tr>';
+    try {
+      const r = await fetch('/api/admin/devices', { headers: headers() });
+      const j = await r.json();
+      if (!r.ok || !j.success) {
+        showMsg('加载失败：' + (j.error || r.status), false);
+        listEl.innerHTML = '';
+        return;
+      }
+      render(j.devices || []);
+      showMsg('已加载 ' + (j.devices ? j.devices.length : 0) + ' 台设备', true);
+    } catch (e) {
+      showMsg('请求失败：' + e.message, false);
+      listEl.innerHTML = '';
+    }
+  }
+
+  function render(devices) {
+    listEl.innerHTML = '';
+    if (!devices.length) {
+      emptyEl.style.display = 'block';
+      emptyEl.textContent = '暂无已注册设备';
+      return;
+    }
+    devices.forEach(d => {
+      const tr = document.createElement('tr');
+      const checked = d.isAdmin ? 'checked' : '';
+      tr.innerHTML = `
+        <td>${escapeHtml(d.deviceName || '未命名')}</td>
+        <td class="id">${tail8(d.deviceId)}</td>
+        <td class="time">${fmt(d.createdAt)}</td>
+        <td class="time">${fmt(d.lastActiveAt)}</td>
+        <td>
+          <label class="switch">
+            <input type="checkbox" data-id="${d.deviceId}" data-name="${escapeHtml(d.deviceName || '')}" ${checked}>
+            <span class="slider"></span>
+          </label>
+        </td>`;
+      listEl.appendChild(tr);
+    });
+    listEl.querySelectorAll('input[type=checkbox]').forEach(cb => {
+      cb.addEventListener('change', () => onToggle(cb));
+    });
+  }
+
+  async function onToggle(cb) {
+    const id = cb.getAttribute('data-id');
+    const name = cb.getAttribute('data-name');
+    const wantAdmin = cb.checked;
+    cb.disabled = true;
+    try {
+      const r = await fetch('/api/admin/device', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, headers()),
+        body: JSON.stringify({ deviceId: id, isAdmin: wantAdmin }),
+      });
+      const j = await r.json();
+      if (r.ok && j.success) {
+        toast(wantAdmin ? `设备${name || tail8(id)}已升级为管理设备` : `设备${name || tail8(id)}已取消管理设备`, true);
+      } else {
+        cb.checked = !wantAdmin; // 回滚
+        toast('操作失败：' + (j.error || r.status), false);
+      }
+    } catch (e) {
+      cb.checked = !wantAdmin;
+      toast('请求失败：' + e.message, false);
+    }
+    cb.disabled = false;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+  }
+
+  loadBtn.addEventListener('click', loadDevices);
+  loadDevices();
+</script>
+</body>
+</html>

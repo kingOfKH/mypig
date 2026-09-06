@@ -366,6 +366,52 @@ apiRouter.get('/devices', (req, res) => {
     });
 });
 
+// ---- 远程设备管理接口（管理人员页面使用）----
+// 说明：admin 标记由【控制端】在指令（ActionJson.admin）内携带，服务端只转发不覆盖；
+// 此处 admins.json 仅用于管理页查询与 admin.query，不参与指令判定。
+function requireAdminToken(req, res, next) {
+    const token = process.env.ADMIN_TOKEN;
+    if (!token) {
+        // 未配置令牌：仅允许本机/内网访问，避免公网裸奔被随意提权
+        const ip = (req.headers && req.headers['x-forwarded-for']) || req.ip || '';
+        const local = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip.startsWith('::ffff:127.');
+        if (!local) return res.status(403).json({ success: false, error: 'ADMIN_TOKEN 未配置且非本机访问被拒绝' });
+        return next();
+    }
+    const h = req.headers['x-admin-token'] || (req.query && req.query.token) || '';
+    if (h !== token) return res.status(403).json({ success: false, error: '令牌无效' });
+    next();
+}
+
+// 控制端查询自身是否为管理设备（无需令牌，供客户端进入页面时拉取默认身份）
+apiRouter.get('/admin/status', (req, res) => {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ success: false, error: '缺少 deviceId' });
+    res.json({ success: true, isAdmin: remoteAssist.isAdmin(deviceId) });
+});
+
+// 管理页：已注册设备列表（含 admin 标记），需 ADMIN_TOKEN
+apiRouter.get('/admin/devices', requireAdminToken, (req, res) => {
+    const devicesFile = path.join(DEVICES_DIR, 'registry.json');
+    const devices = safeReadJSON(devicesFile, []);
+    const list = devices.map(d => ({
+        deviceId: d.deviceId,
+        deviceName: d.deviceName || '',
+        createdAt: d.createdAt || '',
+        lastActiveAt: d.lastActiveAt || '',
+        isAdmin: remoteAssist.isAdmin(d.deviceId),
+    }));
+    res.json({ success: true, devices: list, total: list.length });
+});
+
+// 管理页：设置/取消管理设备，需 ADMIN_TOKEN
+apiRouter.post('/admin/device', requireAdminToken, (req, res) => {
+    const { deviceId, isAdmin } = req.body || {};
+    if (!deviceId) return res.status(400).json({ success: false, error: '缺少 deviceId' });
+    remoteAssist.setAdmin(deviceId, isAdmin === true || isAdmin === 'true', 'admin_page');
+    res.json({ success: true, deviceId, isAdmin: remoteAssist.isAdmin(deviceId) });
+});
+
 apiRouter.put('/device/:deviceId/name', async (req, res) => {
     const { deviceId } = req.params;
     const { deviceName } = req.body;
@@ -703,6 +749,10 @@ app.use('/public', express.static(path.join(__dirname, 'public'), {
 // 便捷路由：浏览器访问 /publish 直接打开发布页
 app.get('/publish', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'publish.html'));
+});
+// 便捷路由：浏览器访问 /admin 直接打开管理人员页
+app.get('/admin', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 // 最新安装包不再单独放在根目录 starclick.apk，统一由 /updates 目录承载，
 // 通过 /api/app/download/:versionCode 路由下载（见下方接口）。

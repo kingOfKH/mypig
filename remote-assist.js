@@ -82,6 +82,102 @@ const HEARTBEAT_TIMEOUT_MS = 70 * 1000;         // 心跳 30s，超时 ~2 次判
 const RECONNECT_GRACE_MS = 45 * 1000;          // 断线宽限期：45s 内重连则保持会话不终止
 const TRUST_FILE = path.join(DATA_DIR, 'trust.json');
 
+// ---- 积分（points）系统 ----
+// 设计：服务端权威记账，余额以 JSON 文件持久化；客户端仅持有镜像用于即时展示与预检。
+// 计费触发点（均在既有「成功事件」上自动执行，客户端零额外请求）：
+//   ① 建立远程会话（establishSession / code.matched）→ 控制端扣 CONNECT 费；
+//   ② 信任设备指令成功回执（trust.cmd_ack ok=true）→ 控制端按指令类型扣费；
+//   ③ 每日签到（points.signin）→ 奖励积分。
+const POINTS_FILE = path.join(DATA_DIR, 'points.json');
+const INITIAL_BALANCE = 20;   // 新设备初始赠送，保证可立即体验（须与客户端 RemoteAssistManager.POINTS_INITIAL_BALANCE 一致）
+// 每日签到奖励：早起（06:00–09:00）奖励 8 积分，其余时间奖励 5 积分
+function signinRewardNow() {
+    const h = new Date().getHours();
+    return (h >= 6 && h < 9) ? 8 : 5;
+}
+const COST_CONNECT = 1;       // 建立一次远程会话（控制端付费）
+// 信任指令统一计费（控制端付费）；所有指令默认 -1
+const TRUST_CMD_PRICE = {
+    location: 1,
+    snapshot: 1,
+    capture: 1,
+    clipboard: 1,
+    lockScreen: 1,
+    battery: 0,
+    telemetry: 0,
+};
+const DEFAULT_TRUST_CMD_COST = 1;
+let pointsCache = readJson(POINTS_FILE, {});
+function savePointsCache() { writeJson(POINTS_FILE, pointsCache); }
+function todayStr() {
+    const d = new Date();
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function getPoints(deviceId) {
+    if (!pointsCache[deviceId]) {
+        pointsCache[deviceId] = { balance: INITIAL_BALANCE, signinDate: '', totalEarned: 0, totalSpent: 0, createdAt: nowMs(), history: [] };
+        savePointsCache();
+    }
+    return pointsCache[deviceId];
+}
+// 向设备推送最新积分状态（服务端 → 客户端，增量更新镜像）
+function pushPoints(deviceId) {
+    const p = getPoints(deviceId);
+    const canSignin = p.signinDate !== todayStr();
+    relayTo(deviceId, { op: 'points.update', payload: { balance: p.balance, signinDate: p.signinDate, canSignin, signinReward: signinRewardNow(), history: (p.history || []).slice(-20) } });
+}
+// 记录一条积分变动（签到/扣费），仅保留最近 50 条，用于客户端明细展示
+function addHistory(deviceId, type, delta, balanceAfter) {
+    const p = getPoints(deviceId);
+    if (!Array.isArray(p.history)) p.history = [];
+    p.history.push({ ts: nowMs(), type, delta, balance: balanceAfter });
+    if (p.history.length > 50) p.history = p.history.slice(-50);
+    savePointsCache();
+}
+// 积分变动即时通知（扣费/签到成功时推送控制端，用于 Toast 提示）
+function pushNotice(deviceId, type, delta) {
+    relayTo(deviceId, { op: 'points.notice', payload: { type, delta } });
+}
+// 扣费（控制端付费），余额下限 0；扣完主动推送最新状态
+function deduct(deviceId, amount, reason) {
+    if (!amount || amount <= 0) return;
+    const p = getPoints(deviceId);
+    const before = p.balance;
+    p.balance = Math.max(0, p.balance - amount);
+    p.totalSpent = (p.totalSpent || 0) + (before - p.balance);
+    savePointsCache();
+    logInfo(`[POINTS] 扣费 device=${deviceId.slice(-8)} ${reason} -${amount} 余额=${p.balance}`);
+    addHistory(deviceId, reason, -amount, p.balance);
+    pushPoints(deviceId);
+    pushNotice(deviceId, reason, -amount);
+}
+
+// ---- 管理设备（仅用于管理页查询 / admin.query；不参与指令判定）----
+// 设计：admin 标记由【控制端】在指令（ActionJson.admin）内携带，服务端只转发不覆盖。
+// 这里的 admins.json 仅回答"这台设备是不是管理设备"，供管理页开关与 admin.query 使用。
+const ADMIN_FILE = path.join(DATA_DIR, 'admins.json');
+let adminCache = readJson(ADMIN_FILE, {});
+function saveAdminCache() { writeJson(ADMIN_FILE, adminCache); }
+function isAdmin(deviceId) { return !!(adminCache[deviceId] && adminCache[deviceId].isAdmin); }
+function setAdmin(deviceId, on, by) {
+    if (!deviceId) return false;
+    if (!adminCache[deviceId]) adminCache[deviceId] = {};
+    adminCache[deviceId].isAdmin = !!on;
+    adminCache[deviceId].setAt = nowMs();
+    if (by) adminCache[deviceId].setBy = by;
+    saveAdminCache();
+    // 权限变更即时推送：若目标设备当前在线，立即经信令通知其刷新「管理设备」身份，
+    // 无需重启 APP / 重连即可在下次进入远程设备页展示管理权限可见内容（升权/降权同路径）。
+    try {
+        const pushed = relayTo(deviceId, { op: 'admin.updated', payload: { isAdmin: !!on } });
+        logInfo(`[ADMIN] 设备 ${deviceId.slice(-8)} 管理权限已变更为 ${!!on}，推送 admin.updated=${pushed}`);
+    } catch (e) {
+        logError('[ADMIN] 推送 admin.updated 失败', e);
+    }
+    return true;
+}
+function getAllAdmins() { return JSON.parse(JSON.stringify(adminCache)); }
+
 // 内存态：deviceId -> 该设备的所有活动 ws 连接集合（同一设备可能同时有
 //   ①前台 UI 远控页连接 ②RemoteSignalingService 常驻信令连接，二者都应计为"在线"）。
 // 采用 Set 而非单值，close 时只移除自身 ws，避免常驻连接被另一条连接的关闭误删导致误判离线。
@@ -101,24 +197,34 @@ function saveTrustCache() {
 }
 
 // 待确认的连接请求 / 待确认的信任绑定：key = code + ':' + 发起方deviceId
-const pendingConfirms = new Map();
 const pendingTrust = new Map();
+// 待扣费的信任指令费用：key = controllerId + ':' + hostId，被控端成功回执时按此扣费
+const pendingTrustCost = new Map();
 
 // 建立会话（信任直连 / 确认后直连共用）
 // mode：控制端发起连接时携带的传输模式（'webrtc' | 'cs'），由控制端最终决定，被控端跟随。
 // content：控制端发起连接时携带的内容源（'screen' | 'camera'），标识被控端推流内容类型。
-async function establishSession(controller, host, code, tag, mode, content) {
-    logInfo(`[DIAG] establishSession controller=${controller} host=${host} mode=${mode} content=${content}`);
+async function establishSession(controller, host, code, tag, mode, content, admin, rmode) {
+    logInfo(`[DIAG] establishSession controller=${controller} host=${host} mode=${mode} content=${content} admin=${admin} rmode=${rmode}`);
     const sidNew = genSessionId();
     const plan = getPlan(controller);
     const session = makeSession(sidNew, controller, host, code, plan, mode, content);
+    // admin 由控制端在连接请求内携带（client-claimed），服务端仅透传，不覆盖。
+    session.controllerAdmin = admin === true;
+    // 控制语义模式（操作/观看）：控制端在连接请求内携带（'control' | 'watch'），服务端仅透传，
+    // 供被控端「连接确认弹窗」在 code.matched 当下即按真实模式提示，无需等待 MODE cmd（零延迟）。
+    session.rmode = (rmode === 'watch') ? 'watch' : 'control';
     sessions.set(sidNew, session);
     await persistSession(session, 'connecting');
-    await audit(sidNew, controller, 'connect', `code=${code} via=${tag} mode=${session.mode} content=${session.content}`);
+    await audit(sidNew, controller, 'connect', `code=${code} via=${tag} mode=${session.mode} content=${session.content} admin=${session.controllerAdmin} rmode=${session.rmode}`);
     // 把选定的传输模式权威下发给两端（被控端必须跟随，控制端也以服务端下发为准消除本地竞态）
     const modeInfo = { mode: session.mode };
     // 内容源：屏幕录屏或相机实况，客户端据此决定被控端采集源与控制端 UI。
     const contentInfo = { content: session.content };
+    // admin 标记：随 code.matched 透传给两端，供被控端决定自动脚本/长活投影等会话级行为（控制端下发，可信项目直接采用）。
+    const adminInfo = { admin: session.controllerAdmin };
+    // 控制语义模式（操作/观看）：随 code.matched 透传给被控端，供连接确认弹窗按真实模式提示（零延迟）。
+    const rmodeInfo = { rmode: session.rmode };
     // MediaMTX WHIP/WHEP 端点：被控端推流用 /whip，控制端拉流用 /whep，path 同为 sid。
     // 用被控端连接到的服务端 IP 构建 base，避免 localhost 在手机上指向手机自身。
     const mtxBase = getMediamtxBaseForDevice(host);
@@ -126,8 +232,11 @@ async function establishSession(controller, host, code, tag, mode, content) {
         mediamtxWhip: `${mtxBase}/${sidNew}/whip`,
         mediamtxWhep: `${mtxBase}/${sidNew}/whep`
     };
-    relayTo(host, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: controller, plan, ...modeInfo, ...contentInfo, ...mtxInfo } });
-    relayTo(controller, { op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: host, plan, ...modeInfo, ...contentInfo, ...mtxInfo } });
+    relayTo(host, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: controller, plan, ...modeInfo, ...contentInfo, ...adminInfo, ...rmodeInfo, ...mtxInfo } });
+    relayTo(controller, { op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: host, plan, ...modeInfo, ...contentInfo, ...adminInfo, ...rmodeInfo, ...mtxInfo } });
+    // 计费：控制端建立会话即扣 CONNECT 费（余额下限 0，扣完主动推送 points.update）
+    // 管理设备不消耗积分：携带 admin 标记的连接豁免 CONNECT 费
+    if (!session.controllerAdmin) deduct(controller, COST_CONNECT, 'connect');
     logInfo(`会话建立(${tag}) sid=${sidNew} 传输模式=${session.mode} 内容源=${session.content} plan=${plan} mtx=${mtxInfo.mediamtxWhip}`);
 }
 
@@ -682,16 +791,6 @@ async function handleMessage(ws, m) {
     const sid = m.sid;
 
     switch (m.op) {
-        case 'code.create': {
-            logInfo(`>>> code.create 来自 device=${deviceId.slice(-8)}，开始生成控制码`);
-            const rec = await createControlCode(deviceId);
-            await audit(rec.code, deviceId, 'open', 'create_code');
-            const resp = JSON.stringify({ op: 'code.created', payload: { code: rec.code, expiresAt: rec.expiresAt } });
-            logInfo(`<<< 回包 code.created code=${rec.code}`);
-            ws.send(resp);
-            break;
-        }
-
         case 'code.connect': {
             const code = (m.payload && m.payload.code || '').trim();
             // 传输模式由控制端决定（'webrtc' | 'cs'）。被控端无条件跟随，自己本机开关不参与决策。
@@ -716,56 +815,11 @@ async function handleMessage(ws, m) {
             }
             // 信任设备：免确认，直接匹配
             if (isTrusted(deviceId, hostId)) {
-                establishSession(deviceId, hostId, code, 'trust', mode, content);
+                establishSession(deviceId, hostId, code, 'trust', mode, content, m.payload && m.payload.admin, m.payload && m.payload.rmode);
                 break;
             }
-            // 非信任设备：向被控端推送"连接请求确认"弹窗，由被控端决定是否允许
-            // 记录控制端决定的传输模式与内容源，待被控端确认后建立会话时沿用（被控端必须跟随）
-            pendingConfirms.set(code + ':' + deviceId, { controller: deviceId, host: hostId, code, mode, content });
-            const ok = relayTo(hostId, {
-                op: 'incoming', sid: '', payload: {
-                    controller: deviceId,
-                    code,
-                    controllerName: (m.payload && m.payload.name) || '',
-                }
-            });
-            if (!ok) {
-                ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'host_offline' } }));
-                break;
-            }
-            // 控制端先收到"等待确认"提示
-            ws.send(JSON.stringify({ op: 'code.waiting', payload: { code, host: hostId } }));
-            logInfo(`连接请求待确认 controller=${deviceId.slice(-8)} -> host=${hostId.slice(-8)} code=${code}`);
-            break;
-        }
-
-        // 被控端在待命页面对"连接请求确认"弹窗的回应
-        case 'incoming.confirm': {
-            const code = (m.payload && m.payload.code || '').trim();
-            const controller = m.payload && m.payload.controller;
-            const key = code + ':' + controller;
-            const pend = pendingConfirms.get(key);
-            if (!pend || pend.host !== deviceId) {
-                ws.send(JSON.stringify({ op: 'error', payload: { msg: 'no_pending' } }));
-                break;
-            }
-            pendingConfirms.delete(key);
-            establishSession(controller, deviceId, code, 'confirm', pend.mode || 'cs', pend.content || 'screen');
-            break;
-        }
-
-        case 'incoming.reject': {
-            const code = (m.payload && m.payload.code || '').trim();
-            const controller = m.payload && m.payload.controller;
-            const key = code + ':' + controller;
-            const pend = pendingConfirms.get(key);
-            if (!pend || pend.host !== deviceId) {
-                ws.send(JSON.stringify({ op: 'error', payload: { msg: 'no_pending' } }));
-                break;
-            }
-            pendingConfirms.delete(key);
-            relayTo(controller, { op: 'code.reject', payload: { reason: 'rejected' } });
-            logInfo(`连接请求被拒绝 host=${deviceId.slice(-8)} -> controller=${controller && controller.slice(-8)}`);
+            // 临时远控（陌生人凭码直连）已移除：仅信任设备可连接
+            ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: 'not_trusted' } }));
             break;
         }
 
@@ -805,7 +859,7 @@ async function handleMessage(ws, m) {
                 ws.send(JSON.stringify({ op: 'trust.bind.fail', payload: { reason: 'peer_offline' } }));
                 break;
             }
-            pendingTrust.set(code + ':' + deviceId, { from: deviceId, fromName: peerName, to: peerId, code });
+            pendingTrust.set(code + ':' + deviceId, { from: deviceId, fromName: peerName, to: peerId, code, admin: m.payload && m.payload.admin });
             relayTo(peerId, {
                 op: 'trust.incoming', payload: {
                     from: deviceId,
@@ -815,6 +869,25 @@ async function handleMessage(ws, m) {
             });
             ws.send(JSON.stringify({ op: 'trust.bind.waiting', payload: { code } }));
             logInfo(`信任绑定请求 from=${deviceId.slice(-8)} -> to=${peerId.slice(-8)} code=${code}`);
+            break;
+        }
+
+        // 控制端：拉取当前所有在线设备（排除自己），用于"添加信任设备"弹窗内快速选择。
+        // 设备名取连接时上报的系统设备名称；控制码由 deviceId 稳定派生（与客户端本地计算一致）。
+        case 'device.list': {
+            const list = [];
+            for (const otherId of online.keys()) {
+                if (otherId === deviceId) continue; // 排除请求方自身
+                const info = deviceInfo.get(otherId) || {};
+                list.push({
+                    deviceId: otherId,
+                    name: info.deviceName || '',
+                    code: genFixedCode(otherId),
+                    standby: !!(standbyMap.get(otherId) && standbyMap.get(otherId).standby),
+                });
+            }
+            ws.send(JSON.stringify({ op: 'device.list', payload: { list } }));
+            logInfo(`>>> device.list 来自 device=${deviceId.slice(-8)} 返回在线设备数=${list.length}`);
             break;
         }
 
@@ -879,7 +952,7 @@ async function handleMessage(ws, m) {
                 ws.send(JSON.stringify({ op: 'code.reject', payload: { reason: r.reason } }));
                 break;
             }
-            establishSession(deviceId, peerId, code, 'trust', mode, content);
+            establishSession(deviceId, peerId, code, 'trust', mode, content, m.payload && m.payload.admin, m.payload && m.payload.rmode);
             break;
         }
 
@@ -996,6 +1069,17 @@ async function handleMessage(ws, m) {
             // 透传给受控端（relayTo 按 deviceId 遍历其所有在线连接发送），
             // 携来源 deviceId（控制端，写入 payload.peer）以便其回执；action 为编码后的 ActionJson 字符串
             console.log(`[trust.cmd] 转发 -> 被控端 ${peerId} action=${(payload.action || '').slice(0, 80)}`);
+            // 计费：解析指令类型登记待扣费（控制端付费），待被控端成功回执 trust.cmd_ack 时扣减
+            // 同时记录 admin 标记：管理设备不消耗积分，回执成功时豁免扣费。
+            let cmdCost = DEFAULT_TRUST_CMD_COST;
+            let cmdAdmin = false;
+            try {
+                const actObj = JSON.parse(payload.action || '{}');
+                const t = actObj && actObj.type;
+                if (t && TRUST_CMD_PRICE[t] != null) cmdCost = TRUST_CMD_PRICE[t];
+                cmdAdmin = !!(actObj && actObj.admin);
+            } catch (e) { cmdCost = DEFAULT_TRUST_CMD_COST; }
+            pendingTrustCost.set(deviceId + ':' + peerId, { cost: cmdCost, admin: cmdAdmin });
             relayTo(peerId, { op: 'trust.cmd', payload: { peer: deviceId, action: payload.action } });
             break;
         }
@@ -1005,6 +1089,17 @@ async function handleMessage(ws, m) {
             const payload = m.payload || {};
             const controllerId = payload.peer;
             console.log(`[trust.cmd_ack] === 入口: from=${deviceId} controllerId=${controllerId} ok=${payload.ok} reason=${payload.reason || ''} url=${(payload.url || '').slice(0, 80)} isReal=${payload.isReal}`);
+            // 计费：被控端成功回执后，按登记的费用从控制端扣减（失败不计费）
+            const okFlag = (payload.ok === 'true' || payload.ok === true);
+            const costKey = controllerId + ':' + deviceId;
+            const pendingCost = pendingTrustCost.get(costKey);
+            if (pendingCost != null) {
+                pendingTrustCost.delete(costKey);
+                // 管理设备不消耗积分：携带 admin 标记的指令，回执成功也豁免扣费
+                if (okFlag && pendingCost.cost > 0 && !pendingCost.admin) {
+                    deduct(controllerId, pendingCost.cost, 'trust.cmd:' + (payload.type || ''));
+                }
+            }
             const targetSet = online.get(controllerId);
             if (targetSet && targetSet.size > 0) {
                 // 透传完整 payload（含 ok/reason/url 等快照字段），仅覆盖 peer 为回执来源设备（被控端）
@@ -1013,6 +1108,39 @@ async function handleMessage(ws, m) {
             } else {
                 console.log(`[trust.cmd_ack] 控制端 ${controllerId} 不在线，丢弃回执`);
             }
+            break;
+        }
+
+        // 积分：查询余额 / 每日签到
+        case 'points.query': {
+            pushPoints(deviceId);
+            break;
+        }
+        case 'points.signin': {
+            const p = getPoints(deviceId);
+            if (p.signinDate === todayStr()) {
+                // 今日已签：仅回推当前状态（canSignin=false）
+                pushPoints(deviceId);
+                break;
+            }
+            const h = new Date().getHours();
+            const early = (h >= 6 && h < 9);
+            const reward = early ? 8 : 5;
+            const signinType = early ? 'signin_early' : 'signin';
+            p.signinDate = todayStr();
+            p.balance += reward;
+            p.totalEarned = (p.totalEarned || 0) + reward;
+            savePointsCache();
+            logInfo(`[POINTS] 签到 device=${deviceId.slice(-8)} type=${signinType} +${reward} 余额=${p.balance}`);
+            addHistory(deviceId, signinType, reward, p.balance);
+            pushPoints(deviceId);
+            pushNotice(deviceId, signinType, reward);
+            break;
+        }
+
+        // 控制端查询自身是否为管理设备（仅查询，admin 标记实际由控制端在指令内携带）
+        case 'admin.query': {
+            ws.send(JSON.stringify({ op: 'admin.status', payload: { isAdmin: isAdmin(deviceId) } }));
             break;
         }
 
@@ -1127,5 +1255,8 @@ module.exports = {
     getPlan,
     getIceConfig,
     startTimeoutWatchdog,
+    isAdmin,
+    setAdmin,
+    getAllAdmins,
     _internal: { online, sessions, consumeControlCode, lookupControlCode, createControlCode },
 };

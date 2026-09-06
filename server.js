@@ -370,16 +370,7 @@ apiRouter.get('/devices', (req, res) => {
 // 说明：admin 标记由【控制端】在指令（ActionJson.admin）内携带，服务端只转发不覆盖；
 // 此处 admins.json 仅用于管理页查询与 admin.query，不参与指令判定。
 function requireAdminToken(req, res, next) {
-    const token = process.env.ADMIN_TOKEN;
-    if (!token) {
-        // 未配置令牌：仅允许本机/内网访问，避免公网裸奔被随意提权
-        const ip = (req.headers && req.headers['x-forwarded-for']) || req.ip || '';
-        const local = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip.startsWith('::ffff:127.');
-        if (!local) return res.status(403).json({ success: false, error: 'ADMIN_TOKEN 未配置且非本机访问被拒绝' });
-        return next();
-    }
-    const h = req.headers['x-admin-token'] || (req.query && req.query.token) || '';
-    if (h !== token) return res.status(403).json({ success: false, error: '令牌无效' });
+    // 个人自用：取消令牌与来源限制，管理页直接可访问。
     next();
 }
 

@@ -29,6 +29,138 @@ app.use(express.json({ limit: '50mb' }));
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 
+// ===================== 后台页面登录保护 =====================
+// 目标：/admin、/publish、/versions 三个后台 HTML 页面以及 /public/* 静态资源必须登录后访问。
+// 边界（重要）：APP 使用的 /api/*（除管理接口）、/ws/remote、/snapshots/*、/clipboards/*
+// 必须保持开放，否则 Android 客户端无法工作。
+// 实现：不引入 session 依赖，使用「签名 Cookie（无状态）」。
+//   Cookie 内直接携带 {u:用户名, exp:过期时间戳} 并用 HMAC-SHA256 签名，服务端不保存会话。
+//   因此【重启服务后已登录用户无需重新登录】（只要未超过有效期）。
+//   签名密钥持久化在 data/.session-secret（首次运行自动生成、重启不变）；也可用环境变量
+//   SESSION_SECRET 覆盖。注意：若更换签名密钥，所有已登录 Cookie 会立即失效（需重新登录）。
+const crypto = require('crypto');
+const PAGE_AUTH_USER = process.env.PAGE_AUTH_USER || 'admin';
+const PAGE_AUTH_PASS = process.env.PAGE_AUTH_PASS || '111111';
+const PAGE_AUTH_COOKIE = 'sc_sid';
+const PAGE_AUTH_TTL_MS = 12 * 60 * 60 * 1000; // 登录有效期 12 小时
+
+// 稳定的签名密钥：优先环境变量 SESSION_SECRET；否则使用 data/.session-secret 文件（首次运行自动生成并持久化）。
+const SESSION_SECRET_FILE = path.join(__dirname, 'data', '.session-secret');
+function loadSessionSecret() {
+  if (process.env.SESSION_SECRET) return String(process.env.SESSION_SECRET);
+  try {
+    if (fs.existsSync(SESSION_SECRET_FILE)) {
+      const s = fs.readFileSync(SESSION_SECRET_FILE, 'utf8').trim();
+      if (s) return s;
+    }
+  } catch (e) { /* 忽略，走下方生成 */ }
+  const generated = crypto.randomBytes(32).toString('hex');
+  try {
+    if (!fs.existsSync(path.dirname(SESSION_SECRET_FILE))) {
+      fs.mkdirSync(path.dirname(SESSION_SECRET_FILE), { recursive: true });
+    }
+    fs.writeFileSync(SESSION_SECRET_FILE, generated, { mode: 0o600 });
+  } catch (e) {
+    console.error('[session] 无法持久化签名密钥，重启后已登录用户需重新登录：', e.message);
+  }
+  return generated;
+}
+const SESSION_SECRET = loadSessionSecret();
+
+function base64urlEncode(buf) {
+  return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function base64urlDecode(str) {
+  str = String(str).replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  return Buffer.from(str, 'base64');
+}
+
+// 签发登录 Cookie 值：payload.signature（均为 base64url）
+function signSession(payloadObj) {
+  const payload = base64urlEncode(Buffer.from(JSON.stringify(payloadObj), 'utf8'));
+  const sig = base64urlEncode(crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest());
+  return `${payload}.${sig}`;
+}
+// 校验签名并返回 {u, exp}，失败（篡改/过期/格式错）返回 null
+function verifySession(cookieValue) {
+  if (!cookieValue || typeof cookieValue !== 'string') return null;
+  const dot = cookieValue.lastIndexOf('.');
+  if (dot <= 0) return null;
+  const payload = cookieValue.slice(0, dot);
+  const sig = cookieValue.slice(dot + 1);
+  const expected = base64urlEncode(crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest());
+  // 定长比较，防时序侧信道
+  if (sig.length !== expected.length) return null;
+  let diff = 0;
+  for (let i = 0; i < sig.length; i++) diff |= sig.charCodeAt(i) ^ expected.charCodeAt(i);
+  if (diff !== 0) return null;
+  try {
+    const obj = JSON.parse(base64urlDecode(payload).toString('utf8'));
+    if (!obj || typeof obj.u !== 'string' || typeof obj.exp !== 'number') return null;
+    if (Date.now() > obj.exp) return null; // 已过期
+    return obj;
+  } catch (e) { return null; }
+}
+
+function parseCookieHeader(header) {
+    const out = {};
+    if (!header) return out;
+    header.split(';').forEach((part) => {
+        const idx = part.indexOf('=');
+        if (idx < 0) return;
+        const k = part.slice(0, idx).trim();
+        const v = part.slice(idx + 1).trim();
+        if (k) { try { out[k] = decodeURIComponent(v); } catch (e) { out[k] = v; } }
+    });
+    return out;
+}
+
+// 返回已登录用户名，未登录返回 null
+function pageAuthUser(req) {
+    const cookie = parseCookieHeader(req.headers.cookie)[PAGE_AUTH_COOKIE];
+    const s = verifySession(cookie);
+    return s ? s.u : null;
+}
+function isPageAuthed(req) { return !!pageAuthUser(req); }
+
+/** 页面用：未登录跳转登录页（携带回跳地址） */
+function requirePageAuth(req, res, next) {
+    if (isPageAuthed(req)) return next();
+    const redirect = encodeURIComponent(req.originalUrl || '/admin');
+    return res.redirect(`/login?redirect=${redirect}`);
+}
+
+/** 接口用：未登录返回 401 JSON（避免页面 fetch 被重定向成 HTML 导致解析失败） */
+function requirePageAuthJson(req, res, next) {
+    if (isPageAuthed(req)) return next();
+    return res.status(401).json({ success: false, error: '未登录或登录已过期' });
+}
+
+// 登录页
+app.get('/login', (req, res) => {
+    if (isPageAuthed(req)) return res.redirect('/admin');
+    res.sendFile(path.join(__dirname, 'public', 'login.html'));
+});
+
+// 登录提交
+app.post('/api/page-login', (req, res) => {
+    const { username, password } = req.body || {};
+    if (username !== PAGE_AUTH_USER || String(password) !== String(PAGE_AUTH_PASS)) {
+        return res.json({ success: false, message: '用户名或密码错误' });
+    }
+    const token = signSession({ u: username, exp: Date.now() + PAGE_AUTH_TTL_MS });
+    res.setHeader('Set-Cookie',
+        `${PAGE_AUTH_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(PAGE_AUTH_TTL_MS / 1000)}`);
+    res.json({ success: true });
+});
+
+// 退出登录
+app.get('/logout', (req, res) => {
+    res.setHeader('Set-Cookie', `${PAGE_AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+    return res.redirect('/login');
+});
+
 // 健康检查端点（供 App "测试连接" 功能使用）
 app.get('/api/health', (req, res) => {
     res.json({ ok: true, ts: Date.now() });
@@ -381,8 +513,8 @@ apiRouter.get('/admin/status', (req, res) => {
     res.json({ success: true, isAdmin: remoteAssist.isAdmin(deviceId) });
 });
 
-// 管理页：已注册设备列表（含 admin 标记），需 ADMIN_TOKEN
-apiRouter.get('/admin/devices', requireAdminToken, (req, res) => {
+// 管理页：已注册设备列表（含 admin 标记），需后台页面登录
+apiRouter.get('/admin/devices', requireAdminToken, requirePageAuthJson, (req, res) => {
     const devicesFile = path.join(DEVICES_DIR, 'registry.json');
     const devices = safeReadJSON(devicesFile, []);
     const list = devices.map(d => ({
@@ -391,16 +523,38 @@ apiRouter.get('/admin/devices', requireAdminToken, (req, res) => {
         createdAt: d.createdAt || '',
         lastActiveAt: d.lastActiveAt || '',
         isAdmin: remoteAssist.isAdmin(d.deviceId),
+        points: remoteAssist.getPoints(d.deviceId).balance,
     }));
     res.json({ success: true, devices: list, total: list.length });
 });
 
-// 管理页：设置/取消管理设备，需 ADMIN_TOKEN
-apiRouter.post('/admin/device', requireAdminToken, (req, res) => {
+// 管理页：设置/取消管理设备，需后台页面登录
+apiRouter.post('/admin/device', requireAdminToken, requirePageAuthJson, (req, res) => {
     const { deviceId, isAdmin } = req.body || {};
     if (!deviceId) return res.status(400).json({ success: false, error: '缺少 deviceId' });
     remoteAssist.setAdmin(deviceId, isAdmin === true || isAdmin === 'true', 'admin_page');
     res.json({ success: true, deviceId, isAdmin: remoteAssist.isAdmin(deviceId) });
+});
+
+// 管理页：查询指定设备的积分余额与变动明细（含后台调整备注），需后台页面登录
+apiRouter.get('/admin/points', requireAdminToken, requirePageAuthJson, (req, res) => {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ success: false, error: '缺少 deviceId' });
+    const p = remoteAssist.getPoints(deviceId);
+    res.json({ success: true, deviceId, balance: p.balance, history: p.history || [] });
+});
+
+// 管理页：手动为设备增减积分（正=奖励 / 负=扣除），支持备注，需后台页面登录
+apiRouter.post('/admin/points/adjust', requireAdminToken, requirePageAuthJson, (req, res) => {
+    const { deviceId, delta, note } = req.body || {};
+    if (!deviceId) return res.status(400).json({ success: false, error: '缺少 deviceId' });
+    const d = Number(delta);
+    if (!Number.isFinite(d) || d === 0) {
+        return res.status(400).json({ success: false, error: '积分数量必须为非零数字' });
+    }
+    const p = remoteAssist.adjustPoints(deviceId, d, note);
+    if (!p) return res.status(400).json({ success: false, error: '设备不存在' });
+    res.json({ success: true, deviceId, balance: p.balance });
 });
 
 apiRouter.put('/device/:deviceId/name', async (req, res) => {
@@ -731,18 +885,18 @@ app.use('/clipboards', express.static(CLIPBOARD_DIR, {
 
 // ---- APP 自动更新：发布页面与安装包下载 ----
 // 发布页面（publish.html 等静态资源）
-app.use('/public', express.static(path.join(__dirname, 'public'), {
+app.use('/public', requirePageAuth, express.static(path.join(__dirname, 'public'), {
     setHeaders: (res) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Cache-Control', 'no-cache');
     }
 }));
 // 便捷路由：浏览器访问 /publish 直接打开发布页
-app.get('/publish', (req, res) => {
+app.get('/publish', requirePageAuth, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'publish.html'));
 });
 // 便捷路由：浏览器访问 /admin 直接打开管理人员页
-app.get('/admin', (req, res) => {
+app.get('/admin', requirePageAuth, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 // 最新安装包不再单独放在根目录 starclick.apk，统一由 /updates 目录承载，
@@ -1046,7 +1200,7 @@ app.delete('/api/app/version/:versionCode', (req, res) => {
 });
 
 // 便捷路由：浏览器访问 /versions 直接打开历史版本页
-app.get('/versions', (req, res) => {
+app.get('/versions', requirePageAuth, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'history.html'));
 });
 

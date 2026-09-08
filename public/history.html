@@ -2,131 +2,169 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#f6f7f9">
 <title>StarClick · 历史版本</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
-    --bg1: #1a1a2e; --bg2: #16213e;
-    --card: rgba(255,255,255,0.045); --border: rgba(255,255,255,0.09);
-    --text: #e6e6e6; --muted: #9aa0b4; --muted2: #c0c6dc;
-    --brand: #788cff; --brand2: #5a6cff; --brand-grad: linear-gradient(135deg, #788cff, #5a6cff);
-    --danger: #ff9a9a; --danger-bg: rgba(255,90,90,0.12); --danger-border: rgba(255,120,120,0.4);
-    --ok: #8fe093; --ok-bg: rgba(111,191,115,0.2);
-  }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    background:
-      radial-gradient(1200px 600px at 80% -10%, rgba(120,140,255,0.12), transparent 60%),
-      radial-gradient(900px 500px at -10% 110%, rgba(111,191,115,0.08), transparent 55%),
-      linear-gradient(135deg, var(--bg1) 0%, var(--bg2) 100%);
-    color: var(--text); min-height: 100vh; padding: 32px 20px;
-  }
-  .wrap { width: 100%; max-width: 760px; margin: 0 auto; }
-  .head {
-    display: flex; align-items: flex-end; justify-content: space-between;
-    margin-bottom: 24px; flex-wrap: wrap; gap: 12px; padding-bottom: 16px;
-    border-bottom: 1px solid var(--border);
-  }
-  h1 {
-    font-size: 24px; font-weight: 700; letter-spacing: .3px;
-    background: linear-gradient(135deg, #fff, #b9c2ff);
-    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
-  }
-  .sub { font-size: 13px; color: var(--muted); margin-top: 4px; }
-  .link {
-    font-size: 13px; font-weight: 600; color: var(--brand); text-decoration: none;
-    padding: 8px 14px; border: 1px solid rgba(120,140,255,0.35); border-radius: 10px;
-    background: rgba(120,140,255,0.08); transition: all .18s ease;
-  }
-  .link:hover { background: rgba(120,140,255,0.18); border-color: var(--brand); transform: translateY(-1px); }
-  .list { display: flex; flex-direction: column; gap: 14px; }
-  .item {
-    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
-    padding: 18px 20px; display: flex; align-items: center; justify-content: space-between; gap: 14px;
-    transition: transform .18s ease, border-color .18s ease, background .18s ease;
-  }
-  .item:hover { transform: translateY(-2px); border-color: rgba(120,140,255,0.35); background: rgba(255,255,255,0.06); }
-  .item .info { min-width: 0; flex: 1; }
-  .ver { font-size: 16px; color: #fff; font-weight: 700; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-  .ver .code { font-size: 12px; color: var(--muted); font-weight: 500; }
-  .badge {
-    display: inline-block; font-size: 11px; padding: 2px 9px; border-radius: 20px;
-    background: var(--ok-bg); color: var(--ok); border: 1px solid rgba(111,191,115,0.35);
-    font-weight: 600;
-  }
-  .meta { font-size: 12px; color: var(--muted); margin-top: 8px; display: flex; gap: 16px; flex-wrap: wrap; }
-  .meta span { display: inline-flex; align-items: center; gap: 4px; }
-  .note { font-size: 12.5px; color: var(--muted2); margin-top: 8px; word-break: break-all; line-height: 1.5; }
-  .ops { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-  .dl, .del {
-    padding: 10px 18px; border: none; border-radius: 10px; font-size: 13px; font-weight: 600;
-    cursor: pointer; text-decoration: none; white-space: nowrap; transition: all .18s ease;
-  }
-  .dl { background: var(--brand-grad); color: #fff; box-shadow: 0 6px 18px rgba(90,108,255,0.3); }
-  .dl:hover { transform: translateY(-1px); box-shadow: 0 8px 22px rgba(90,108,255,0.45); }
-  .del {
-    background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border);
-  }
-  .del:hover { background: rgba(255,90,90,0.22); }
-  .del:disabled { opacity: .5; cursor: default; transform: none; }
-  .empty, .err {
-    text-align: center; color: var(--muted); padding: 56px 0; font-size: 14px;
-  }
-  .empty .ic { font-size: 40px; display: block; margin-bottom: 12px; opacity: .6; }
-  .err { color: var(--danger); }
-  @media (max-width: 520px) {
-    .item { flex-direction: column; align-items: stretch; }
-    .ops { justify-content: flex-end; }
-    .ver { font-size: 15px; }
+    /* 与「管理设备」完全一致的冷调石板灰系统 */
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-hover: #f8f9fb;
+    --border: rgba(0,0,0,0.06);
+    --border-strong: rgba(0,0,0,0.1);
+
+    --text: #0f1115;
+    --text-secondary: #525866;
+    --text-muted: #8b909a;
+
+    --accent: #5b5bf6;
+    --accent-hover: #4848e0;
+    --accent-soft: #eef0ff;
+
+    --success: #22c55e;
+    --danger: #ef4444;
+    --danger-soft: #fef2f2;
+    --danger-border: #fecaca;
+    --danger-hover: rgba(239,68,68,0.08);
+
+    --radius-xl: 20px;
+    --radius-lg: 16px;
+    --radius-md: 12px;
+    --radius-sm: 8px;
+
+    --shadow-card: 0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.03);
+    --shadow-card-hover: 0 4px 16px rgba(0,0,0,0.06), 0 8px 24px rgba(0,0,0,0.04);
+
+    --font: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   }
 
-  /* ===== 自定义确认弹窗 ===== */
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+  body {
+    font-family: var(--font); min-height: 100vh; color: var(--text);
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+    line-height: 1.5; padding: calc(24px + env(safe-area-inset-top)) 24px calc(48px + env(safe-area-inset-bottom));
+    background: var(--bg);
+  }
+
+  .wrap { width: 100%; max-width: 760px; margin: 0 auto; }
+
+  /* ---------- 页头 ---------- */
+  .head {
+    display: flex; align-items: flex-end; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap; margin-bottom: 32px;
+  }
+  h1 {
+    font: 800 28px/1.2 var(--font); letter-spacing: -0.03em; color: var(--text);
+  }
+  .sub { font-size: 14px; color: var(--text-secondary); margin-top: 8px; }
+
+  .navs { display: flex; gap: 8px; flex-wrap: wrap; }
+  .link {
+    font: 600 13px/1 var(--font); color: var(--text-secondary); text-decoration: none;
+    padding: 10px 16px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--surface); transition: all 0.15s ease; box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+  }
+  .link:hover { background: var(--surface-hover); border-color: var(--border-strong); transform: translateY(-1px); }
+  .link.primary { background: var(--text); color: #fff; border-color: var(--text); }
+  .link.primary:hover { background: #000; }
+
+  /* ---------- 列表 ---------- */
+  .list { display: flex; flex-direction: column; gap: 10px; }
+  .item {
+    position: relative; background: var(--surface); border-radius: var(--radius-lg);
+    padding: 20px 22px; display: flex; align-items: center; justify-content: space-between; gap: 18px;
+    transition: all 0.2s ease; box-shadow: var(--shadow-card); overflow: hidden;
+  }
+  .item:hover { box-shadow: var(--shadow-card-hover); }
+  .item.latest::before {
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: var(--accent); border-radius: 0 3px 3px 0;
+  }
+
+  .item .info { min-width: 0; flex: 1; }
+  .ver {
+    font: 700 16px/1.4 var(--font); color: var(--text);
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  }
+  .ver .code { font-size: 12px; color: var(--text-muted); font-weight: 500; }
+  .badge {
+    display: inline-flex; align-items: center; font-size: 11px; padding: 4px 10px; border-radius: 20px;
+    background: var(--accent-soft); color: var(--accent); font-weight: 600;
+  }
+  .meta { font-size: 12px; color: var(--text-muted); margin-top: 8px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .meta span { display: inline-flex; align-items: center; gap: 5px; }
+  .note { font-size: 13px; color: var(--text-secondary); margin-top: 10px; word-break: break-word; line-height: 1.5; }
+
+  .ops { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .dl, .del {
+    padding: 10px 18px; border: none; border-radius: var(--radius-sm); font: 600 13px/1 var(--font);
+    cursor: pointer; text-decoration: none; white-space: nowrap; transition: all 0.15s ease;
+  }
+  .dl { background: var(--text); color: #fff; }
+  .dl:hover { background: #000; transform: translateY(-1px); }
+  .del { background: var(--surface); color: var(--danger); border: 1px solid var(--danger-border); }
+  .del:hover:not(:disabled) { background: var(--danger-soft); }
+  .del:disabled { opacity: .5; cursor: default; }
+
+  .empty, .err { text-align: center; color: var(--text-muted); padding: 72px 0; font-size: 14px; }
+  .empty .ic { font-size: 44px; display: block; margin-bottom: 14px; opacity: 0.4; }
+  .err { color: var(--danger); }
+
+  /* ---------- 确认弹窗 ---------- */
   .modal-mask {
-    position: fixed; inset: 0; background: rgba(8,10,22,0.6); backdrop-filter: blur(3px);
+    position: fixed; inset: 0; background: rgba(15,17,21,0.4); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
     display: flex; align-items: center; justify-content: center; padding: 20px;
-    opacity: 0; visibility: hidden; transition: opacity .2s ease, visibility .2s ease; z-index: 50;
+    opacity: 0; visibility: hidden; transition: opacity 0.2s ease, visibility 0.2s ease; z-index: 50;
   }
   .modal-mask.show { opacity: 1; visibility: visible; }
   .modal {
-    width: 100%; max-width: 380px; background: var(--card);
-    border: 1px solid var(--border); border-radius: 16px; padding: 24px;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.55); transform: translateY(12px) scale(.97);
-    transition: transform .2s ease; backdrop-filter: blur(12px);
+    position: relative; width: 100%; max-width: 380px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 24px;
+    box-shadow: 0 16px 48px rgba(0,0,0,0.16), 0 4px 12px rgba(0,0,0,0.06);
+    transform: translateY(12px) scale(0.97); transition: transform 0.2s ease;
   }
   .modal-mask.show .modal { transform: translateY(0) scale(1); }
   .modal .m-icon {
-    width: 46px; height: 46px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
-    font-size: 24px; margin-bottom: 14px;
-    background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border);
+    width: 44px; height: 44px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    font-size: 22px; margin-bottom: 14px;
+    background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger-border);
   }
-  .modal .m-title { font-size: 16px; font-weight: 700; color: #fff; margin-bottom: 8px; }
-  .modal .m-text { font-size: 13.5px; color: var(--muted2); line-height: 1.6; }
-  .modal .m-text b { color: #fff; font-weight: 600; }
+  .modal .m-title { font: 700 16px/1.4 var(--font); color: var(--text); margin-bottom: 8px; }
+  .modal .m-text { font-size: 13.5px; color: var(--text-secondary); line-height: 1.6; }
+  .modal .m-text b { color: var(--text); font-weight: 600; }
   .modal .m-actions { display: flex; gap: 12px; margin-top: 22px; }
   .modal .m-actions button {
-    flex: 1; padding: 11px; border-radius: 10px; font-size: 14px; font-weight: 600;
-    cursor: pointer; transition: all .18s ease; border: none;
+    flex: 1; padding: 12px; border-radius: var(--radius-sm); font: 600 14px/1 var(--font);
+    cursor: pointer; transition: all 0.15s ease; border: none;
   }
-  .modal .m-cancel {
-    background: rgba(255,255,255,0.07); color: var(--muted2); border: 1px solid var(--border);
-  }
-  .modal .m-cancel:hover { background: rgba(255,255,255,0.12); }
-  .modal .m-ok {
-    background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border);
-  }
-  .modal .m-ok:hover { background: rgba(255,90,90,0.25); }
+  .modal .m-cancel { background: var(--bg); color: var(--text-secondary); border: 1px solid var(--border); }
+  .modal .m-cancel:hover { background: var(--surface-hover); }
+  .modal .m-ok { background: var(--danger); color: #fff; }
+  .modal .m-ok:hover:not(:disabled) { background: #dc2626; }
   .modal .m-ok:disabled { opacity: .6; cursor: default; }
+
+  @media (max-width: 640px) {
+    body { padding: 16px 16px calc(32px + env(safe-area-inset-bottom)); }
+    h1 { font-size: 24px; }
+    .item { padding: 16px; gap: 14px; flex-wrap: wrap; }
+    .ops { width: 100%; justify-content: flex-end; padding-top: 4px; }
+    .dl, .del { flex: 1; text-align: center; }
+  }
 </style>
 </head>
 <body>
   <div class="wrap">
     <div class="head">
       <div>
-        <h1>StarClick 历史版本</h1>
+        <h1>历史版本</h1>
         <div class="sub">所有已发布版本，可单独下载或删除</div>
       </div>
-      <a class="link" href="/publish">+ 发布新版本</a>
+      <div class="navs">
+        <a class="link" href="/admin">← 管理页</a>
+        <a class="link primary" href="/publish">+ 发布新版本</a>
+      </div>
     </div>
     <div id="content"><div class="empty"><span class="ic">🕘</span>加载中…</div></div>
   </div>
@@ -168,7 +206,7 @@
         return;
       }
       const items = j.versions.map(v => `
-        <div class="item">
+        <div class="item${v.isLatest ? ' latest' : ''}">
           <div class="info">
             <div class="ver">v${v.versionName}<span class="code">code ${v.versionCode}</span>${v.isLatest ? '<span class="badge">最新</span>' : ''}</div>
             <div class="meta">

@@ -85,7 +85,7 @@ const TRUST_FILE = path.join(DATA_DIR, 'trust.json');
 // ---- 积分（points）系统 ----
 // 设计：服务端权威记账，余额以 JSON 文件持久化；客户端仅持有镜像用于即时展示与预检。
 // 计费触发点（均在既有「成功事件」上自动执行，客户端零额外请求）：
-//   ① 建立远程会话（establishSession / code.matched）→ 控制端扣 CONNECT 费；
+//   ① 远程会话真正就绪（被控端推流成功 rtc.connected）→ 控制端扣 CONNECT 费（非建立会话当下）；
 //   ② 信任设备指令成功回执（trust.cmd_ack ok=true）→ 控制端按指令类型扣费；
 //   ③ 每日签到（points.signin）→ 奖励积分。
 const POINTS_FILE = path.join(DATA_DIR, 'points.json');
@@ -126,11 +126,11 @@ function pushPoints(deviceId) {
     const canSignin = p.signinDate !== todayStr();
     relayTo(deviceId, { op: 'points.update', payload: { balance: p.balance, signinDate: p.signinDate, canSignin, signinReward: signinRewardNow(), history: (p.history || []).slice(-20) } });
 }
-// 记录一条积分变动（签到/扣费），仅保留最近 50 条，用于客户端明细展示
-function addHistory(deviceId, type, delta, balanceAfter) {
+// 记录一条积分变动（签到/扣费/后台调整），仅保留最近 50 条，用于客户端明细展示
+function addHistory(deviceId, type, delta, balanceAfter, note) {
     const p = getPoints(deviceId);
     if (!Array.isArray(p.history)) p.history = [];
-    p.history.push({ ts: nowMs(), type, delta, balance: balanceAfter });
+    p.history.push({ ts: nowMs(), type, delta, balance: balanceAfter, note: note || '' });
     if (p.history.length > 50) p.history = p.history.slice(-50);
     savePointsCache();
 }
@@ -150,6 +150,37 @@ function deduct(deviceId, amount, reason) {
     addHistory(deviceId, reason, -amount, p.balance);
     pushPoints(deviceId);
     pushNotice(deviceId, reason, -amount);
+}
+
+// 后台手动调整积分（管理页使用）：delta 可正（奖励）可负（扣除）；余额下限 0。
+// 返回更新后的积分对象（含 balance / history），调用方据此刷新界面与明细。
+function adjustPoints(deviceId, delta, note) {
+    if (!deviceId) return null;
+    const d = Number(delta);
+    if (!Number.isFinite(d) || d === 0) return null;
+    const p = getPoints(deviceId);
+    const before = p.balance;
+    const after = Math.max(0, before + d);
+    const applied = after - before; // 实际变动（扣除时可能被 0 下限夹断）
+    if (applied > 0) p.totalEarned = (p.totalEarned || 0) + applied;
+    else if (applied < 0) p.totalSpent = (p.totalSpent || 0) + (-applied);
+    p.balance = after;
+    savePointsCache();
+    addHistory(deviceId, 'admin', applied, after, note ? String(note) : '');
+    logInfo(`[POINTS] 后台调整 device=${deviceId.slice(-8)} ${applied >= 0 ? '+' : ''}${applied} 备注=${note || '-'} 余额=${after}`);
+    pushPoints(deviceId);
+    return p;
+}
+
+// 连接费：在「会话真正就绪（被控端推流成功 rtc.connected）」时扣，而非 code.matched 当下。
+// 原因：非管理设备连接在 code.matched 之后还有一道被控端「同意/拒绝」当面确认，且录屏授权/
+// 起流仍可能失败；若在匹配当下即扣，被拒绝或起流失败都会白扣 1 分（服务端无退款逻辑）。
+// 幂等：rtc.connected 可能因重连/重发多次到达，每个会话只扣一次。
+function billConnectIfReady(session) {
+    if (!session || session.connectBilled) return;
+    if (session.controllerAdmin) return;   // 管理设备发起的连接豁免连接费
+    session.connectBilled = true;
+    deduct(session.controller, COST_CONNECT, 'connect');
 }
 
 // ---- 管理设备（仅用于管理页查询 / admin.query；不参与指令判定）----
@@ -234,9 +265,11 @@ async function establishSession(controller, host, code, tag, mode, content, admi
     };
     relayTo(host, { op: 'code.matched', sid: sidNew, payload: { role: 'host', peer: controller, plan, ...modeInfo, ...contentInfo, ...adminInfo, ...rmodeInfo, ...mtxInfo } });
     relayTo(controller, { op: 'code.matched', sid: sidNew, payload: { role: 'controller', peer: host, plan, ...modeInfo, ...contentInfo, ...adminInfo, ...rmodeInfo, ...mtxInfo } });
-    // 计费：控制端建立会话即扣 CONNECT 费（余额下限 0，扣完主动推送 points.update）
-    // 管理设备不消耗积分：携带 admin 标记的连接豁免 CONNECT 费
-    if (!session.controllerAdmin) deduct(controller, COST_CONNECT, 'connect');
+    // 计费：连接费【不再】于此「配对成功」当下扣除，改由 billConnectIfReady() 在会话真正
+    // 就绪（被控端推流成功 rtc.connected）时扣除。
+    // 原因：非管理设备连接在 code.matched 之后还有一道被控端「同意/拒绝」当面确认，且录屏
+    // 授权 / 起流仍可能失败；此处即扣会导致被拒绝或起流失败也白扣 1 分。管理设备依旧豁免。
+    logInfo(`连接费待扣（等推流就绪）sid=${sidNew} 控制端管理设备=${session.controllerAdmin ? '是(豁免)' : '否'}`);
     logInfo(`会话建立(${tag}) sid=${sidNew} 传输模式=${session.mode} 内容源=${session.content} plan=${plan} mtx=${mtxInfo.mediamtxWhip}`);
 }
 
@@ -316,6 +349,8 @@ function makeSession(sid, controller, host, code, plan, mode, content) {
         endedAt: null,
         lastActivity: nowMs(),
         limitMs: PLAN_LIMITS[plan] || PLAN_LIMITS.free,
+        // 连接费是否已扣：改在「会话真正就绪（被控端推流成功）」时扣，见 billConnectIfReady
+        connectBilled: false,
     };
 }
 
@@ -982,7 +1017,6 @@ async function handleMessage(ws, m) {
         case 'rtc.ice':
         case 'rtc.meta':
         case 'rtc.quality':
-        case 'rtc.connected':
         case 'rtc.encres':
         // 控制端「声音」开关 -> 被控端据此启停音频采集编码（声音同步）
         case 'rtc.audio':
@@ -1005,10 +1039,26 @@ async function handleMessage(ws, m) {
 
         case 'rtc.connected': {
             const session = sessions.get(sid);
-            if (!session) break;
-            session.status = 'streaming';
+            if (!session || session.status === 'terminated') {
+                ws.send(JSON.stringify({ op: 'error', sid, payload: { msg: 'no_session' } }));
+                break;
+            }
             session.lastActivity = nowMs();
-            await persistSession(session, 'streaming');
+            // 必须转发给对端：控制端依赖该信号判定「被控端推流就绪」后才启动 WHEP 拉流，
+            // 否则会对尚不存在的流反复 404 盲轮询（首帧 6-15s 黑屏的主因）。
+            // 注：此前本 op 被上面 rtc.* 通用 case 组抢先 break，造成本分支实为死代码，
+            // session.status 从未被置为 streaming；现已移出该组，本分支正式生效。
+            const rtcPeer = peerOf(session, deviceId);
+            relayTo(rtcPeer, { op: m.op, sid, payload: m.payload });
+            // 仅被控端（推流方）上报的推流就绪才算数，防止控制端伪造信号提前触发扣费/置状态
+            if (deviceId === session.host) {
+                if (session.status !== 'streaming') {
+                    session.status = 'streaming';
+                    await persistSession(session, 'streaming');
+                }
+                // 连接费：会话真正就绪（被控端推流成功）才扣，幂等
+                billConnectIfReady(session);
+            }
             break;
         }
 
@@ -1258,5 +1308,7 @@ module.exports = {
     isAdmin,
     setAdmin,
     getAllAdmins,
+    getPoints,
+    adjustPoints,
     _internal: { online, sessions, consumeControlCode, lookupControlCode, createControlCode },
 };

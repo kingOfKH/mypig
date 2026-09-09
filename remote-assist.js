@@ -305,7 +305,7 @@ function logThrottled(key, intervalMs, fn) {
 }
 // 高频信令 op（心跳、cmd、rtc.quality 等）白名单：超过一次/秒的不重复打印，
 // 避免这些每秒 1-2 次的信令覆盖真正关键的二进制丢帧/IDR风暴日志。
-const NOISY_OP_RE = /^(heartbeat|rtc\.quality|rtc\.deccap|rtc\.codec|cmd\.ack)$/;
+const NOISY_OP_RE = /^(heartbeat|rtc\.quality|rtc\.deccap|rtc\.codec|cmd\.ack|notify\.ping)$/;
 
 // ---- 订阅缓存（避免每次 code.connect 都同步读文件阻塞事件循环）----
 let subscriptionCache = null;
@@ -1157,6 +1157,48 @@ async function handleMessage(ws, m) {
                 relayTo(controllerId, { op: 'trust.cmd_ack', payload: { ...payload, peer: deviceId } });
             } else {
                 console.log(`[trust.cmd_ack] 控制端 ${controllerId} 不在线，丢弃回执`);
+            }
+            break;
+        }
+
+        // ══════════════ 远程「实时通知」══════════════
+        // 控制端进入「实时通知」页 → notify.start（被控端回 notify.snapshot 全量快照）；
+        // 其后被控端每收到一条新通知即以 notify.post 实时推送；
+        // 控制端停留页面期间每 8s 发 notify.ping 心跳（被控端据此判断控制端是否还在）；
+        // 控制端退出页面发 notify.stop 立即停止。
+        // 安全：与 trust.cmd 一致，校验在线 + 信任关系；不计费、不依赖会话(sid)。
+        case 'notify.start':
+        case 'notify.stop':
+        case 'notify.ping': {
+            const payload = m.payload || {};
+            const peerId = payload.peer;
+            if (!peerId) break;
+            const peerSet = online.get(peerId);
+            // 心跳/停止属于尽力而为，失败无需回执；仅 start 需要回执以免控制端一直转圈
+            const needAck = (m.op === 'notify.start');
+            if (!peerSet || peerSet.size === 0) {
+                if (needAck) relayTo(deviceId, { op: 'notify.snapshot', payload: { peer: peerId, ok: false, reason: '对方不在线' } });
+                break;
+            }
+            if (!isTrusted(deviceId, peerId)) {
+                if (needAck) relayTo(deviceId, { op: 'notify.snapshot', payload: { peer: peerId, ok: false, reason: '非信任设备' } });
+                break;
+            }
+            relayTo(peerId, { op: m.op, payload: { peer: deviceId } });
+            break;
+        }
+
+        // 被控端 → 控制端：通知栏快照 / 单条新通知实时推送
+        case 'notify.snapshot':
+        case 'notify.post': {
+            const payload = m.payload || {};
+            const controllerId = payload.peer;
+            if (!controllerId) break;
+            // 校验控制端确实信任本被控端，防止伪造推送
+            if (!isTrusted(controllerId, deviceId)) break;
+            const targetSet = online.get(controllerId);
+            if (targetSet && targetSet.size > 0) {
+                relayTo(controllerId, { op: m.op, payload: { ...payload, peer: deviceId } });
             }
             break;
         }

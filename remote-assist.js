@@ -61,7 +61,12 @@ function readJson(file, def) {
 }
 function writeJson(file, data) {
     try {
-        fs.writeFileSync(file, JSON.stringify(data, null, 2));
+        // P0 原子写：先写临时文件再 rename 覆盖（同分区 rename 原子），
+        // 避免写入过程中进程崩溃/断电导致目标文件被截断、JSON 解析失败而整库归零。
+        // P1 紧凑存储：去掉 2 空格缩进，体积约为原来的 1/3（对所有 JSON 文件生效，readJson 格式无关）。
+        const tmp = file + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(data));
+        fs.renameSync(tmp, file);
         return true;
     } catch (e) {
         logError('[remote] 写入失败', file, e);
@@ -88,7 +93,24 @@ const TRUST_FILE = path.join(DATA_DIR, 'trust.json');
 //   ① 远程会话真正就绪（被控端推流成功 rtc.connected）→ 控制端扣 CONNECT 费（非建立会话当下）；
 //   ② 信任设备指令成功回执（trust.cmd_ack ok=true）→ 控制端按指令类型扣费；
 //   ③ 每日签到（points.signin）→ 奖励积分。
-const POINTS_FILE = path.join(DATA_DIR, 'points.json');
+const POINTS_DIR = path.join(DATA_DIR, 'points');
+// 确保分片目录存在（DATA_DIR 已 ensureDir，子目录需自建）
+try { fs.mkdirSync(POINTS_DIR, { recursive: true }); } catch (_) {}
+// 2026-09-10：取消「旧 points.json → 分片」迁移。若远程服务器已存在旧单文件 points.json，
+// 在此安全归档（改名 + 时间戳后缀，不删除、可回滚），避免旧数据被新分片逻辑误读或静默残留；
+// 新逻辑按设备分片重新记账，视为「旧数据丢弃、新设备重新开始」。
+// 关键：用全局 console 而非模块底部的 logError/logInfo，避免模块加载期 TDZ 导致的崩溃。
+(function discardLegacyPointsFile() {
+  const legacy = path.join(DATA_DIR, 'points.json');
+  if (!fs.existsSync(legacy)) return;
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    fs.renameSync(legacy, legacy + '.discarded-' + stamp);
+    console.warn('[POINTS] 检测到旧单文件 points.json，已安全归档为 points.json.discarded-*；按新设备重新记账，旧余额不再生效。');
+  } catch (e) {
+    console.warn('[POINTS] 旧 points.json 归档失败（将忽略该文件，不影响启动）：', (e && e.message) || e);
+  }
+})();
 const INITIAL_BALANCE = 20;   // 新设备初始赠送，保证可立即体验（须与客户端 RemoteAssistManager.POINTS_INITIAL_BALANCE 一致）
 // 每日签到奖励：早起（06:00–09:00）奖励 8 积分，其余时间奖励 5 积分
 function signinRewardNow() {
@@ -107,24 +129,80 @@ const TRUST_CMD_PRICE = {
     telemetry: 0,
 };
 const DEFAULT_TRUST_CMD_COST = 1;
-let pointsCache = readJson(POINTS_FILE, {});
-function savePointsCache() { writeJson(POINTS_FILE, pointsCache); }
+
+// ────────── 积分存储：按设备分片（P3） ──────────
+// 旧实现为单文件 points.json，设备数增长时文件线性膨胀且每次变动全量重写（写放大）。
+// 改为 data/remote/points/<deviceId-hash>.json 分片：每次只写单个设备文件，写复杂度 O(设备数)→O(1)。
+// deviceId 可能含 :/@ 等文件系统非法字符，用 sha1 哈希作文件名（单向，故文件名与缓存键必须同源）。
+let pointsCache = {};   // hashKeyOf(deviceId) -> 设备积分对象（懒加载：首次访问某设备才读盘/创建）
+function hashKeyOf(deviceId) {
+    return crypto.createHash('sha1').update(String(deviceId)).digest('hex');
+}
+function pointsFilePath(deviceId) {
+    return path.join(POINTS_DIR, hashKeyOf(deviceId) + '.json');
+}
+// 2026-09-10：取消「旧 points.json → 分片」迁移；旧数据直接丢弃，按新设备重新开始（分片目录下无对应文件即视为新设备，自动给初始余额）。
+// 单设备落盘（原子写由 writeJson 保证）
+function savePoints(deviceId) {
+    const key = hashKeyOf(deviceId);
+    const p = pointsCache[key];
+    if (p) writeJson(pointsFilePath(deviceId), p);
+}
 function todayStr() {
     const d = new Date();
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 function getPoints(deviceId) {
-    if (!pointsCache[deviceId]) {
-        pointsCache[deviceId] = { balance: INITIAL_BALANCE, signinDate: '', totalEarned: 0, totalSpent: 0, createdAt: nowMs(), history: [] };
-        savePointsCache();
+    const key = hashKeyOf(deviceId);
+    if (!pointsCache[key]) {
+        const loaded = readJson(pointsFilePath(deviceId), null);
+        if (loaded && typeof loaded === 'object') {
+            if (!loaded.history) loaded.history = [];
+            pointsCache[key] = loaded;
+        } else {
+            pointsCache[key] = { balance: INITIAL_BALANCE, signinDate: '', totalEarned: 0, totalSpent: 0, createdAt: nowMs(), history: [] };
+        }
+        // 首次访问即落盘（保证分片文件存在；默认值也写，迁就旧逻辑）
+        savePoints(deviceId);
     }
-    return pointsCache[deviceId];
+    return pointsCache[key];
 }
-// 向设备推送最新积分状态（服务端 → 客户端，增量更新镜像）
-function pushPoints(deviceId) {
+// 向设备推送最新积分状态（服务端 → 客户端，增量更新镜像）。
+// 明细分页：保留最近 50 条；第 1 页发最近 20 条，第 2 页发较早的 30 条（合计 50）；
+// 客户端点「查看更多」时带 page=1 拉取；50 条拉完 hasMore=false，客户端提示「只支持查看最近 50 条」。
+const POINTS_PAGE_SIZE = 20;
+const POINTS_PAGE2_SIZE = 30;
+const POINTS_HISTORY_MAX = 50;
+function pushPoints(deviceId, page) {
     const p = getPoints(deviceId);
     const canSignin = p.signinDate !== todayStr();
-    relayTo(deviceId, { op: 'points.update', payload: { balance: p.balance, signinDate: p.signinDate, canSignin, signinReward: signinRewardNow(), history: (p.history || []).slice(-20) } });
+    const history = Array.isArray(p.history) ? p.history : [];
+    const pg = (typeof page === 'number' && page > 0) ? page : 0;
+    let slice, hasMore;
+    if (pg <= 0) {
+        slice = history.slice(-POINTS_PAGE_SIZE);
+        hasMore = history.length > POINTS_PAGE_SIZE;
+    } else if (pg === 1) {
+        // 保留 50 条中除去最近 20 的较早部分
+        slice = history.slice(-POINTS_HISTORY_MAX, -POINTS_PAGE_SIZE);
+        hasMore = false;
+    } else {
+        slice = [];
+        hasMore = false;
+    }
+    relayTo(deviceId, {
+        op: 'points.update',
+        payload: {
+            balance: p.balance,
+            signinDate: p.signinDate,
+            canSignin,
+            signinReward: signinRewardNow(),
+            history: slice,
+            pointsPage: pg,
+            pointsHasMore: hasMore,
+            pointsMax: POINTS_HISTORY_MAX
+        }
+    });
 }
 // 记录一条积分变动（签到/扣费/后台调整），仅保留最近 50 条，用于客户端明细展示
 function addHistory(deviceId, type, delta, balanceAfter, note) {
@@ -132,7 +210,7 @@ function addHistory(deviceId, type, delta, balanceAfter, note) {
     if (!Array.isArray(p.history)) p.history = [];
     p.history.push({ ts: nowMs(), type, delta, balance: balanceAfter, note: note || '' });
     if (p.history.length > 50) p.history = p.history.slice(-50);
-    savePointsCache();
+    savePoints(deviceId);
 }
 // 积分变动即时通知（扣费/签到成功时推送控制端，用于 Toast 提示）
 function pushNotice(deviceId, type, delta) {
@@ -145,7 +223,7 @@ function deduct(deviceId, amount, reason) {
     const before = p.balance;
     p.balance = Math.max(0, p.balance - amount);
     p.totalSpent = (p.totalSpent || 0) + (before - p.balance);
-    savePointsCache();
+    savePoints(deviceId);
     logInfo(`[POINTS] 扣费 device=${deviceId.slice(-8)} ${reason} -${amount} 余额=${p.balance}`);
     addHistory(deviceId, reason, -amount, p.balance);
     pushPoints(deviceId);
@@ -165,7 +243,7 @@ function adjustPoints(deviceId, delta, note) {
     if (applied > 0) p.totalEarned = (p.totalEarned || 0) + applied;
     else if (applied < 0) p.totalSpent = (p.totalSpent || 0) + (-applied);
     p.balance = after;
-    savePointsCache();
+    savePoints(deviceId);
     addHistory(deviceId, 'admin', applied, after, note ? String(note) : '');
     logInfo(`[POINTS] 后台调整 device=${deviceId.slice(-8)} ${applied >= 0 ? '+' : ''}${applied} 备注=${note || '-'} 余额=${after}`);
     pushPoints(deviceId);
@@ -1205,7 +1283,10 @@ async function handleMessage(ws, m) {
 
         // 积分：查询余额 / 每日签到
         case 'points.query': {
-            pushPoints(deviceId);
+            // page 可选：客户端「查看更多」时带 page=1 拉取较早的 30 条（合计 50）
+            const pq = m.payload || {};
+            const page = pq.page ? parseInt(pq.page, 10) : 0;
+            pushPoints(deviceId, page);
             break;
         }
         case 'points.signin': {
@@ -1222,7 +1303,7 @@ async function handleMessage(ws, m) {
             p.signinDate = todayStr();
             p.balance += reward;
             p.totalEarned = (p.totalEarned || 0) + reward;
-            savePointsCache();
+            savePoints(deviceId);
             logInfo(`[POINTS] 签到 device=${deviceId.slice(-8)} type=${signinType} +${reward} 余额=${p.balance}`);
             addHistory(deviceId, signinType, reward, p.balance);
             pushPoints(deviceId);

@@ -112,10 +112,29 @@ try { fs.mkdirSync(POINTS_DIR, { recursive: true }); } catch (_) {}
   }
 })();
 const INITIAL_BALANCE = 20;   // 新设备初始赠送，保证可立即体验（须与客户端 RemoteAssistManager.POINTS_INITIAL_BALANCE 一致）
-// 每日签到奖励：早起（06:00–09:00）奖励 8 积分，其余时间奖励 5 积分
-function signinRewardNow() {
-    const h = new Date().getHours();
-    return (h >= 6 && h < 9) ? 8 : 5;
+// 连续签到奖励：6 天为一周期，第 1~6 天分别奖励 5/7/10/12/15/20 积分；第 7 天回到周期第 1 天（5 积分）。
+const SIGNIN_CYCLE_DAYS = 6;
+const SIGNIN_REWARDS = [5, 7, 10, 12, 15, 20];   // 索引 0..5 对应周期第 1..6 天
+// 连续天数（streak，含今日）→ 周期内的第几天（1..6），最少为 1
+function signinCycleDayOf(streak) { const s = Math.max(1, streak | 0); return ((s - 1) % SIGNIN_CYCLE_DAYS) + 1; }
+// 连续天数 → 本次签到可得积分
+function signinRewardOf(streak) { return SIGNIN_REWARDS[signinCycleDayOf(streak) - 1]; }
+// 昨天日期字符串（与 todayStr 同格式 YYYY-MM-DD），用于判断连续签到是否中断
+function yesterdayStr() {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+// 给定设备当前积分数据，推算「今日若签到」的预览（用于 points.update 推送客户端渲染进度）
+function signinPreview(p) {
+    const achieved = p.signinStreak || 0;
+    if (p.signinDate === todayStr()) {
+        // 今日已签：返回当前周期位置与已得奖励（canSignin=false）
+        return { canSignin: false, cycleDay: signinCycleDayOf(achieved), reward: signinRewardOf(achieved) };
+    }
+    // 今日未签：依据上次签到日期判断是否断签，断签则重新从第 1 天计起
+    const next = (p.signinDate && p.signinDate === yesterdayStr()) ? achieved + 1 : 1;
+    return { canSignin: true, cycleDay: signinCycleDayOf(next), reward: signinRewardOf(next) };
 }
 const COST_CONNECT = 1;       // 建立一次远程会话（控制端付费）
 // 信任指令统一计费（控制端付费）；所有指令默认 -1
@@ -160,7 +179,7 @@ function getPoints(deviceId) {
             if (!loaded.history) loaded.history = [];
             pointsCache[key] = loaded;
         } else {
-            pointsCache[key] = { balance: INITIAL_BALANCE, signinDate: '', totalEarned: 0, totalSpent: 0, createdAt: nowMs(), history: [] };
+            pointsCache[key] = { balance: INITIAL_BALANCE, signinDate: '', signinStreak: 0, totalEarned: 0, totalSpent: 0, createdAt: nowMs(), history: [] };
         }
         // 首次访问即落盘（保证分片文件存在；默认值也写，迁就旧逻辑）
         savePoints(deviceId);
@@ -175,7 +194,8 @@ const POINTS_PAGE2_SIZE = 30;
 const POINTS_HISTORY_MAX = 50;
 function pushPoints(deviceId, page) {
     const p = getPoints(deviceId);
-    const canSignin = p.signinDate !== todayStr();
+    const prev = signinPreview(p);
+    const canSignin = prev.canSignin;
     const history = Array.isArray(p.history) ? p.history : [];
     const pg = (typeof page === 'number' && page > 0) ? page : 0;
     let slice, hasMore;
@@ -196,7 +216,9 @@ function pushPoints(deviceId, page) {
             balance: p.balance,
             signinDate: p.signinDate,
             canSignin,
-            signinReward: signinRewardNow(),
+            signinReward: prev.reward,
+            signinStreak: p.signinStreak || 0,
+            signinCycleDay: prev.cycleDay,
             history: slice,
             pointsPage: pg,
             pointsHasMore: hasMore,
@@ -1296,18 +1318,20 @@ async function handleMessage(ws, m) {
                 pushPoints(deviceId);
                 break;
             }
-            const h = new Date().getHours();
-            const early = (h >= 6 && h < 9);
-            const reward = early ? 8 : 5;
-            const signinType = early ? 'signin_early' : 'signin';
+            // 连续签到：依据上次签到日期判断是否断签，断签则重新从第 1 天计起
+            const prev = p.signinStreak || 0;
+            const streak = (p.signinDate && p.signinDate === yesterdayStr()) ? prev + 1 : 1;
+            const cycleDay = signinCycleDayOf(streak);
+            const reward = signinRewardOf(streak);
+            p.signinStreak = streak;
             p.signinDate = todayStr();
             p.balance += reward;
             p.totalEarned = (p.totalEarned || 0) + reward;
             savePoints(deviceId);
-            logInfo(`[POINTS] 签到 device=${deviceId.slice(-8)} type=${signinType} +${reward} 余额=${p.balance}`);
-            addHistory(deviceId, signinType, reward, p.balance);
+            logInfo(`[POINTS] 签到 device=${deviceId.slice(-8)} 连续${streak}天 第${cycleDay}天 +${reward} 余额=${p.balance}`);
+            addHistory(deviceId, 'signin', reward, p.balance, `连续第${streak}天·第${cycleDay}天`);
             pushPoints(deviceId);
-            pushNotice(deviceId, signinType, reward);
+            pushNotice(deviceId, 'signin', reward);
             break;
         }
 

@@ -146,11 +146,9 @@ const TRUST_CMD_PRICE = {
     lockScreen: 1,
     battery: 0,
     telemetry: 0,
-    // 跨设备互动功能（每次消耗 0.1 积分）
+    // �6 个 interact type（每次消耗 0.1 积分）
     'interact.emoji': 0.1,
     'interact.msg': 0.1,
-    'interact.shake': 0.1,
-    'interact.danmaku': 0.1,
     'interact.draw': 0.1,
     'interact.prank': 0.1,
 };

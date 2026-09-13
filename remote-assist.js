@@ -150,7 +150,7 @@ const TRUST_CMD_PRICE = {
     'interact.emoji': 0.1,
     'interact.msg': 0.1,
     'interact.draw': 0.1,
-    'interact.prank': 0.1,
+
 };
 const DEFAULT_TRUST_CMD_COST = 1;
 

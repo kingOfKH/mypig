@@ -146,6 +146,11 @@ const TRUST_CMD_PRICE = {
     lockScreen: 1,
     battery: 0,
     telemetry: 0,
+    // �6 个 interact type（每次消耗 0.1 积分）
+    'interact.emoji': 0.1,
+    'interact.msg': 0.1,
+    'interact.draw': 0.1,
+
 };
 const DEFAULT_TRUST_CMD_COST = 1;
 
@@ -243,7 +248,7 @@ function deduct(deviceId, amount, reason) {
     if (!amount || amount <= 0) return;
     const p = getPoints(deviceId);
     const before = p.balance;
-    p.balance = Math.max(0, p.balance - amount);
+    p.balance = Math.max(0, Math.round((p.balance - amount) * 10) / 10);
     p.totalSpent = (p.totalSpent || 0) + (before - p.balance);
     savePoints(deviceId);
     logInfo(`[POINTS] 扣费 device=${deviceId.slice(-8)} ${reason} -${amount} 余额=${p.balance}`);
@@ -260,7 +265,7 @@ function adjustPoints(deviceId, delta, note) {
     if (!Number.isFinite(d) || d === 0) return null;
     const p = getPoints(deviceId);
     const before = p.balance;
-    const after = Math.max(0, before + d);
+    const after = Math.max(0, Math.round((before + d) * 10) / 10);
     const applied = after - before; // 实际变动（扣除时可能被 0 下限夹断）
     if (applied > 0) p.totalEarned = (p.totalEarned || 0) + applied;
     else if (applied < 0) p.totalSpent = (p.totalSpent || 0) + (-applied);
@@ -1325,7 +1330,7 @@ async function handleMessage(ws, m) {
             const reward = signinRewardOf(streak);
             p.signinStreak = streak;
             p.signinDate = todayStr();
-            p.balance += reward;
+            p.balance = Math.round((p.balance + reward) * 10) / 10;
             p.totalEarned = (p.totalEarned || 0) + reward;
             savePoints(deviceId);
             logInfo(`[POINTS] 签到 device=${deviceId.slice(-8)} 连续${streak}天 第${cycleDay}天 +${reward} 余额=${p.balance}`);

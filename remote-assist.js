@@ -91,7 +91,7 @@ const TRUST_FILE = path.join(DATA_DIR, 'trust.json');
 // 设计：服务端权威记账，余额以 JSON 文件持久化；客户端仅持有镜像用于即时展示与预检。
 // 计费触发点（均在既有「成功事件」上自动执行，客户端零额外请求）：
 //   ① 远程会话真正就绪（被控端推流成功 rtc.connected）→ 控制端扣 CONNECT 费（非建立会话当下）；
-//   ② 信任设备指令成功回执（trust.cmd_ack ok=true）→ 控制端按指令类型扣费；
+//   ② 信任设备指令【转发送达】即扣费（trust.cmd 转发成功当下，控制端付费），不再等回执；
 //   ③ 每日签到（points.signin）→ 奖励积分。
 const POINTS_DIR = path.join(DATA_DIR, 'points');
 // 确保分片目录存在（DATA_DIR 已 ensureDir，子目录需自建）
@@ -623,7 +623,10 @@ function getTrustList(deviceId) {
     return Object.keys(m).map(peerId => ({
         deviceId: peerId,
         name: m[peerId].name,
-        deviceName: m[peerId].deviceName || (deviceInfo.get(peerId) && deviceInfo.get(peerId).deviceName) || '',
+        // 优先取「对端自己上报的名字」(deviceInfo)，缓存值仅作兜底：
+        // 设备自己上报的才是其当前真实名称；缓存可能是上次连接时的旧值或被污染值（历史 bug 落盘），
+        // 若让缓存优先，脏数据会永久掩盖真名。
+        deviceName: (deviceInfo.get(peerId) && deviceInfo.get(peerId).deviceName) || m[peerId].deviceName || '',
         // 在线且处于待命状态才视为"可一键连接"
         online: online.has(peerId) && online.get(peerId).size > 0,
         standby: !!(standbyMap.get(peerId) && standbyMap.get(peerId).standby),
@@ -776,7 +779,25 @@ function attach(httpServer) {
         }
         // 记录系统设备名称（设置→关于手机→设备名称，如「荣耀60SE」「妈妈的手机」），
         // 供信任列表默认展示（无需备注即可区分不同设备）
-        if (dname) deviceInfo.set(deviceId, { deviceName: dname });
+        if (dname) {
+            deviceInfo.set(deviceId, { deviceName: dname });
+            // 连接时用该设备刚上报的权威名称，回填「别人列表里·它」的所有条目并落盘，
+            // 以此修复历史 bug 写入的持久脏数据（曾把某设备的名字套到它所有对端条目上）。
+            // 只写 trustCache[owner][deviceId]（描述本设备的条目），绝不碰 trustCache[deviceId][owner]。
+            let repaired = 0;
+            for (const ownerId of Object.keys(trustCache)) {
+                if (ownerId === deviceId) continue;
+                const entry = trustCache[ownerId] && trustCache[ownerId][deviceId];
+                if (entry && entry.deviceName !== dname) {
+                    entry.deviceName = dname;
+                    repaired++;
+                }
+            }
+            if (repaired > 0) {
+                saveTrustCache();
+                logInfo(`[名称校正] 已回填 device=${deviceId.slice(-8)} 影响条目=${repaired}`);
+            }
+        }
         logInfo(`新 WebSocket 连接建立 device=${deviceId.slice(-8)}${dname ? ' dname=' + dname : ''} 在线=${online.size}`);
 
         ws.deviceId = deviceId;
@@ -1070,6 +1091,34 @@ async function handleMessage(ws, m) {
             break;
         }
 
+        // 设备名称在线更新：改名后客户端经 WS 推送最新名，立即刷新内存 deviceInfo，
+        // 并同步已建立信任的对端信任缓存 deviceName，再向「信任了本设备」的在线对端
+        // 广播最新信任列表，使对端无需重连即可看到新名。
+        case 'device.name': {
+            const dname = (m.payload && m.payload.dname || '').toString().trim();
+            if (!dname) break;
+            // 最新名称落到 deviceInfo（本设备的权威名称）
+            deviceInfo.set(deviceId, { deviceName: dname });
+            // 关键：要更新的是「别人的列表里·我」→ trustCache[peerId][deviceId]。
+            // 语义依据 addTrust()：trustCache[a][b].deviceName 存的是 **b 自己的名字**。
+            // 历史 bug 写成了 trustCache[deviceId][peerId]（「我的列表里·别人」），
+            // 结果把本机新名字套到所有对端头上，并落盘形成持久脏数据。此处已修正方向。
+            let changed = false;
+            if (trustCache[deviceId]) {
+                for (const peerId of Object.keys(trustCache[deviceId])) {
+                    if (peerId === deviceId) continue;
+                    if (trustCache[peerId] && trustCache[peerId][deviceId]) {
+                        trustCache[peerId][deviceId].deviceName = dname;
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) saveTrustCache();
+            notifyTrustPeers(deviceId);
+            logInfo(`设备名称在线更新 device=${deviceId.slice(-8)} dname=${dname}`);
+            break;
+        }
+
         // 信任设备一键连接：免确认直接匹配（前提对方在线且待命）
         case 'trust.request': {
             const peerId = (m.payload && m.payload.peer) || '';
@@ -1224,18 +1273,25 @@ async function handleMessage(ws, m) {
             // 透传给受控端（relayTo 按 deviceId 遍历其所有在线连接发送），
             // 携来源 deviceId（控制端，写入 payload.peer）以便其回执；action 为编码后的 ActionJson 字符串
             console.log(`[trust.cmd] 转发 -> 被控端 ${peerId} action=${(payload.action || '').slice(0, 80)}`);
-            // 计费：解析指令类型登记待扣费（控制端付费），待被控端成功回执 trust.cmd_ack 时扣减
-            // 同时记录 admin 标记：管理设备不消耗积分，回执成功时豁免扣费。
+            // 计费：解析指令类型，于【转发送达】当下即扣费（控制端付费），而非等被控端回执。
+            // 语义对齐产品：只要消息成功发到对方设备（转发成功）就算发送成功，立即扣积分，
+            // 不再等对方已读/解锁才扣。被控端离线/非信任已在上面拦截（不转发=不计费）。
+            // 管理设备（admin=true）不消耗积分，豁免扣费。
             let cmdCost = DEFAULT_TRUST_CMD_COST;
             let cmdAdmin = false;
+            let cmdType = '';
             try {
                 const actObj = JSON.parse(payload.action || '{}');
                 const t = actObj && actObj.type;
                 if (t && TRUST_CMD_PRICE[t] != null) cmdCost = TRUST_CMD_PRICE[t];
                 cmdAdmin = !!(actObj && actObj.admin);
+                cmdType = t || '';
             } catch (e) { cmdCost = DEFAULT_TRUST_CMD_COST; }
-            pendingTrustCost.set(deviceId + ':' + peerId, { cost: cmdCost, admin: cmdAdmin });
             relayTo(peerId, { op: 'trust.cmd', payload: { peer: deviceId, action: payload.action } });
+            // 转发即送达：立即扣费（回执分支不再扣，避免重复计费）
+            if (cmdCost > 0 && !cmdAdmin) {
+                deduct(deviceId, cmdCost, 'trust.cmd:' + cmdType);
+            }
             break;
         }
 
@@ -1244,17 +1300,10 @@ async function handleMessage(ws, m) {
             const payload = m.payload || {};
             const controllerId = payload.peer;
             console.log(`[trust.cmd_ack] === 入口: from=${deviceId} controllerId=${controllerId} ok=${payload.ok} reason=${payload.reason || ''} url=${(payload.url || '').slice(0, 80)} isReal=${payload.isReal}`);
-            // 计费：被控端成功回执后，按登记的费用从控制端扣减（失败不计费）
-            const okFlag = (payload.ok === 'true' || payload.ok === true);
+            // 计费已在「转发送达」时完成（见 trust.cmd 分支），此处不再扣费，
+            // 仅清理待扣费登记，避免内存泄漏。
             const costKey = controllerId + ':' + deviceId;
-            const pendingCost = pendingTrustCost.get(costKey);
-            if (pendingCost != null) {
-                pendingTrustCost.delete(costKey);
-                // 管理设备不消耗积分：携带 admin 标记的指令，回执成功也豁免扣费
-                if (okFlag && pendingCost.cost > 0 && !pendingCost.admin) {
-                    deduct(controllerId, pendingCost.cost, 'trust.cmd:' + (payload.type || ''));
-                }
-            }
+            pendingTrustCost.delete(costKey);
             const targetSet = online.get(controllerId);
             if (targetSet && targetSet.size > 0) {
                 // 透传完整 payload（含 ok/reason/url 等快照字段），仅覆盖 peer 为回执来源设备（被控端）

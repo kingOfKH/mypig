@@ -4,11 +4,15 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const multer = require('multer');
 const AdmZip = require('adm-zip');
+// 头像压缩：纯 JS 实现，零原生编译，跨平台必装得上（已锁定 0.22.x 稳定 API）
+const Jimp = require('jimp');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const zlib = require('zlib');
 const remoteAssist = require('./remote-assist');
+// 统一设备档案：全服务唯一的设备名权威存储（HTTP 体系与 WS 体系共用）
+const deviceRegistry = require('./device-registry');
 
 // 全局兜底：任何未捕获异常/未处理的 Promise rejection 都不应直接杀死进程。
 // （历史崩溃：audit.log 的 WriteStream 在 fd 失效时抛出未捕获 'error' 事件导致 EBADF 进程退出）
@@ -173,6 +177,8 @@ const SNAPSHOT_DIR = path.join(DATA_DIR, 'snapshots');
 const CLIPBOARD_DIR = path.join(DATA_DIR, 'clipboards');
 // 已发布 APK 与版本元数据存放目录（APP 自动更新功能）
 const UPDATES_DIR = path.join(__dirname, 'updates');
+const AVATAR_DIR = path.join(DATA_DIR, 'avatars');
+fs.mkdirSync(AVATAR_DIR, { recursive: true });
 const LATEST_JSON = path.join(UPDATES_DIR, 'latest.json');
 
 function ensureDirectories() {
@@ -435,65 +441,37 @@ apiRouter.get('/health', (req, res) => {
 
 apiRouter.post('/device/register', async (req, res) => {
     const { deviceId, deviceName } = req.body;
-    
+
     console.log(`设备注册请求: deviceId=${deviceId}, deviceName=${deviceName}`);
-    
-    const devicesFile = path.join(DEVICES_DIR, 'registry.json');
-    
-    await withFileLock(devicesFile, async () => {
-        let devices = safeReadJSON(devicesFile, []);
-        
-        console.log(`当前已注册设备数: ${devices.length}, 设备列表: ${devices.map(d => d.deviceId).join(', ')}`);
-        
-        let existingDevice = devices.find(d => d.deviceId === deviceId);
-        
-        if (existingDevice) {
-            console.log(`设备已存在: ${deviceId}`);
-            res.json({
-                success: true,
-                message: '设备已存在',
-                device: existingDevice,
-                isNew: false
-            });
-        } else {
-            const newDevice = {
-                deviceId: deviceId || generateDeviceId(),
-                deviceName: deviceName || `设备${devices.length + 1}`,
-                createdAt: getChinaTime(),
-                lastActiveAt: getChinaTime()
-            };
-            
-            devices.push(newDevice);
-            console.log(`新设备注册: ${newDevice.deviceId}, 总设备数: ${devices.length}`);
-            safeWriteJSON(devicesFile, devices);
-            
-            const deviceUsageDir = path.join(USAGE_DIR, newDevice.deviceId);
-            if (!fs.existsSync(deviceUsageDir)) {
-                fs.mkdirSync(deviceUsageDir, { recursive: true });
-            }
-            
-            res.json({
-                success: true,
-                message: '设备注册成功',
-                device: newDevice,
-                isNew: true
-            });
+
+    // 统一设备档案（唯一权威）：内部已加锁，不再直接读写 registry.json
+    const id = deviceId || generateDeviceId();
+    const { device, isNew } = await deviceRegistry.upsertDevice(id, deviceName);
+    const newDevice = device || { deviceId: id, deviceName: deviceName || deviceRegistry.fallbackName(id) };
+
+    console.log(`${isNew ? '新设备注册' : '设备已存在'}: ${newDevice.deviceId}`);
+
+    if (isNew) {
+        const deviceUsageDir = path.join(USAGE_DIR, newDevice.deviceId);
+        if (!fs.existsSync(deviceUsageDir)) {
+            fs.mkdirSync(deviceUsageDir, { recursive: true });
         }
+    }
+
+    res.json({
+        success: true,
+        message: isNew ? '设备注册成功' : '设备已存在',
+        device: newDevice,
+        isNew
     });
 });
 
 apiRouter.get('/devices', (req, res) => {
-    const devicesFile = path.join(DEVICES_DIR, 'registry.json');
-    const devices = safeReadJSON(devicesFile, []);
-    
+    const devices = deviceRegistry.listAll();
+
     res.json({
         success: true,
-        devices: devices.map(d => ({
-            deviceId: d.deviceId,
-            deviceName: d.deviceName,
-            createdAt: d.createdAt,
-            lastActiveAt: d.lastActiveAt
-        })),
+        devices,
         total: devices.length
     });
 });
@@ -515,8 +493,7 @@ apiRouter.get('/admin/status', (req, res) => {
 
 // 管理页：已注册设备列表（含 admin 标记），需后台页面登录
 apiRouter.get('/admin/devices', requireAdminToken, requirePageAuthJson, (req, res) => {
-    const devicesFile = path.join(DEVICES_DIR, 'registry.json');
-    const devices = safeReadJSON(devicesFile, []);
+    const devices = deviceRegistry.listAll();
     const list = devices.map(d => ({
         deviceId: d.deviceId,
         deviceName: d.deviceName || '',
@@ -569,39 +546,23 @@ apiRouter.put('/device/:deviceId/name', async (req, res) => {
         return;
     }
     
-    const devicesFile = path.join(DEVICES_DIR, 'registry.json');
-    
-    await withFileLock(devicesFile, async () => {
-        let devices = safeReadJSON(devicesFile, []);
-        
-        if (!devices || devices.length === 0) {
-            res.status(404).json({
-                success: false,
-                error: '设备不存在'
-            });
-            return;
+    // 统一设备档案：这是「设备名」的唯一权威写入口（改名）
+    await deviceRegistry.setName(deviceId, deviceName.trim());
+
+    // 改名后主动通知在线对端刷新信任列表。
+    // 旧实现只写文件不推送，对端只能等对方重连 WS 上报 dname 才看到新名（表现为"改名对方不生效"）。
+    try {
+        if (typeof remoteAssist.notifyDeviceNameChanged === 'function') {
+            remoteAssist.notifyDeviceNameChanged(deviceId);
         }
-        
-        const deviceIndex = devices.findIndex(d => d.deviceId === deviceId);
-        
-        if (deviceIndex === -1) {
-            res.status(404).json({
-                success: false,
-                error: '设备不存在'
-            });
-            return;
-        }
-        
-        devices[deviceIndex].deviceName = deviceName.trim();
-        devices[deviceIndex].lastActiveAt = getChinaTime();
-        
-        safeWriteJSON(devicesFile, devices);
-        
-        res.json({
-            success: true,
-            message: '设备名称更新成功',
-            device: devices[deviceIndex]
-        });
+    } catch (e) {
+        console.error('[改名] 通知对端失败:', e && e.message);
+    }
+
+    res.json({
+        success: true,
+        message: '设备名称更新成功',
+        device: { deviceId, deviceName: deviceName.trim() }
     });
 });
 
@@ -616,29 +577,15 @@ apiRouter.post('/usage/sync', async (req, res) => {
         return;
     }
     
-    const devicesFile = path.join(DEVICES_DIR, 'registry.json');
-    
-    await withFileLock(devicesFile, async () => {
-        let devices = safeReadJSON(devicesFile, []);
-        
-        let existingDevice = devices.find(d => d.deviceId === deviceId);
-        if (!existingDevice) {
-            console.log(`同步时发现新设备，自动注册: ${deviceId}`);
-            const newDevice = {
-                deviceId: deviceId,
-                deviceName: deviceName || `设备${devices.length + 1}`,
-                createdAt: getChinaTime(),
-                lastActiveAt: getChinaTime()
-            };
-            devices.push(newDevice);
-            safeWriteJSON(devicesFile, devices);
-            
-            const deviceUsageDir = path.join(USAGE_DIR, deviceId);
-            if (!fs.existsSync(deviceUsageDir)) {
-                fs.mkdirSync(deviceUsageDir, { recursive: true });
-            }
+    // 统一设备档案：同步使用记录时若发现未建档设备则自动建档（幂等，不覆盖已有名称）
+    const { isNew } = await deviceRegistry.upsertDevice(deviceId, deviceName);
+    if (isNew) {
+        console.log(`同步时发现新设备，自动注册: ${deviceId}`);
+        const deviceUsageDir = path.join(USAGE_DIR, deviceId);
+        if (!fs.existsSync(deviceUsageDir)) {
+            fs.mkdirSync(deviceUsageDir, { recursive: true });
         }
-    });
+    }
     
     if (!records || !Array.isArray(records) || records.length === 0) {
         res.json({
@@ -710,16 +657,8 @@ apiRouter.post('/usage/sync', async (req, res) => {
         });
     }
     
-    await withFileLock(devicesFile, async () => {
-        let devices = safeReadJSON(devicesFile, []);
-        if (devices && devices.length > 0) {
-            const deviceIndex = devices.findIndex(d => d.deviceId === deviceId);
-            if (deviceIndex !== -1) {
-                devices[deviceIndex].lastActiveAt = getChinaTime();
-                safeWriteJSON(devicesFile, devices);
-            }
-        }
-    });
+    // 统一设备档案：仅刷新活跃时间
+    await deviceRegistry.touch(deviceId);
     
     res.json({
         success: true,
@@ -883,6 +822,14 @@ app.use('/clipboards', express.static(CLIPBOARD_DIR, {
     }
 }));
 
+// 静态托管：/avatars/<deviceId>.jpg 可直接访问（远程协助-设备头像）
+app.use('/avatars', express.static(AVATAR_DIR, {
+    setHeaders: (res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'no-cache');
+    }
+}));
+
 // ---- APP 自动更新：发布页面与安装包下载 ----
 // 发布页面（publish.html 等静态资源）
 app.use('/public', requirePageAuth, express.static(path.join(__dirname, 'public'), {
@@ -977,6 +924,29 @@ function getChinaTime() {
 // ==================== APP 自动更新：版本发布 / 查询 ====================
 // multer 内存存储：APK 先放内存，解析 manifest 后再落盘（避免临时文件）
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+
+// ==================== 设备头像：上传（服务端压缩优化后存储） ====================
+// 上传：multer 收内存 → jimp 压缩为 256×256 JPEG（quality 82，体积降 95%+）→ 落盘 data/avatars/<id>.jpg
+// 成功后 deviceRegistry.bumpAvatar 版本号 +1，并通知信任对端重新拉取（未变更则对端用本地缓存，不重复下载）。
+app.put('/api/device/:deviceId/avatar', upload.single('avatar'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ success: false, error: '未收到图片' });
+        const deviceId = String(req.params.deviceId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+        if (!deviceId) return res.status(400).json({ success: false, error: '非法 deviceId' });
+        const img = await Jimp.read(req.file.buffer);
+        img.cover(256, 256).quality(82);
+        fs.mkdirSync(AVATAR_DIR, { recursive: true });
+        await img.writeAsync(path.join(AVATAR_DIR, `${deviceId}.jpg`));
+        const avatarVersion = await deviceRegistry.bumpAvatar(deviceId);
+        try {
+            if (typeof remoteAssist.notifyAvatarChanged === 'function') remoteAssist.notifyAvatarChanged(deviceId, avatarVersion);
+        } catch (e) { console.warn('[avatar] notifyAvatarChanged 失败:', e && e.message); }
+        res.json({ success: true, avatarVersion, url: `/avatars/${deviceId}.jpg` });
+    } catch (e) {
+        console.error('[avatar] 上传失败:', e);
+        res.status(500).json({ success: false, error: '服务端处理失败: ' + e.message });
+    }
+});
 
 /**
  * 发布新版本：上传 APK，服务端从二进制 AndroidManifest.xml 自动解析 versionName/versionCode，

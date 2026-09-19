@@ -21,6 +21,9 @@ const crypto = require('crypto');
 
 const { WebSocketServer } = require('ws');
 const { xorBase64 } = require('./crypto-util');
+// 统一设备档案：设备名的唯一权威来源（与 server.js 的 HTTP 体系共用同一份数据）
+// 本模块不再自持 deviceInfo 内存表——它随进程重启丢失，是"设备名莫名回退/串号"的根源。
+const deviceRegistry = require('./device-registry');
 
 // ---- 路径与存储 ----
 const DATA_DIR = path.join(__dirname, 'data', 'remote');
@@ -91,7 +94,7 @@ const TRUST_FILE = path.join(DATA_DIR, 'trust.json');
 // 设计：服务端权威记账，余额以 JSON 文件持久化；客户端仅持有镜像用于即时展示与预检。
 // 计费触发点（均在既有「成功事件」上自动执行，客户端零额外请求）：
 //   ① 远程会话真正就绪（被控端推流成功 rtc.connected）→ 控制端扣 CONNECT 费（非建立会话当下）；
-//   ② 信任设备指令成功回执（trust.cmd_ack ok=true）→ 控制端按指令类型扣费；
+//   ② 信任设备指令【转发送达】即扣费（trust.cmd 转发成功当下，控制端付费），不再等回执；
 //   ③ 每日签到（points.signin）→ 奖励积分。
 const POINTS_DIR = path.join(DATA_DIR, 'points');
 // 确保分片目录存在（DATA_DIR 已 ensureDir，子目录需自建）
@@ -323,9 +326,9 @@ const sessions = new Map();
 const pendingDisconnects = new Map();
 // deviceId -> { standby:Boolean, code:String }  被控端待命状态（授权录屏后常驻在线等待）
 const standbyMap = new Map();
-// deviceId -> { deviceName:String }  系统设备名称（连接时上报），供信任列表默认展示
-const deviceInfo = new Map();
-// deviceId -> 信任对象集合  { "对方deviceId": { name, addedAt } }  持久化于 TRUST_FILE
+// 设备名统一由 device-registry 提供（持久化、跨体系唯一）；此处不再维护内存副本。
+// deviceId -> 信任对象集合  { "对方deviceId": { addedAt } }  持久化于 TRUST_FILE
+// 注意：信任边只存「关系」，不再冗余存对方名称——冗余副本正是历史"改名串号"bug 的温床。
 let trustCache = readJson(TRUST_FILE, {});
 
 function saveTrustCache() {
@@ -604,30 +607,42 @@ async function expireCode(code) {
 }
 
 // ---- 信任关系 ----
-// 双向持久化：trustCache[deviceId][peerId] = { name, deviceName, addedAt }
+// 双向持久化：trustCache[deviceId][peerId] = { addedAt }
+// 只存关系，不再存名称——名称一律在 getTrustList() 里从统一设备档案解析。
 function isTrusted(a, b) {
     return !!(trustCache[a] && trustCache[a][b]);
 }
 function addTrust(a, b, nameA, nameB) {
     if (!trustCache[a]) trustCache[a] = {};
     if (!trustCache[b]) trustCache[b] = {};
-    // 优先用对方上报的系统设备名（deviceInfo），回退到已存设备名，最后空串
-    const dnA = (deviceInfo.get(a) && deviceInfo.get(a).deviceName) || (trustCache[a][b] && trustCache[a][b].deviceName) || '';
-    const dnB = (deviceInfo.get(b) && deviceInfo.get(b).deviceName) || (trustCache[b][a] && trustCache[b][a].deviceName) || '';
-    trustCache[a][b] = { name: nameB || b, deviceName: dnB, addedAt: nowMs() };
-    trustCache[b][a] = { name: nameA || a, deviceName: dnA, addedAt: nowMs() };
+    // 若双方此前从未建档（从未注册/上报过名称），用绑定时携带的名称补一个初始档案，
+    // 保证"刚配对还没上报过名称"的设备也有名字可显示（统一档案仍可被后续上报覆盖）。
+    if (!deviceRegistry.getName(a) && nameA) deviceRegistry.setName(a, nameA);
+    if (!deviceRegistry.getName(b) && nameB) deviceRegistry.setName(b, nameB);
+    trustCache[a][b] = { addedAt: nowMs() };
+    trustCache[b][a] = { addedAt: nowMs() };
     saveTrustCache();
 }
 function getTrustList(deviceId) {
     const m = trustCache[deviceId] || {};
-    return Object.keys(m).map(peerId => ({
-        deviceId: peerId,
-        name: m[peerId].name,
-        deviceName: m[peerId].deviceName || (deviceInfo.get(peerId) && deviceInfo.get(peerId).deviceName) || '',
-        // 在线且处于待命状态才视为"可一键连接"
-        online: online.has(peerId) && online.get(peerId).size > 0,
-        standby: !!(standbyMap.get(peerId) && standbyMap.get(peerId).standby),
-    }));
+    return Object.keys(m).map(peerId => {
+        // 名称唯一来源 = 统一设备档案（对端自己上报、持久化、跨体系一致）
+        const canonical = deviceRegistry.getName(peerId);
+        const fallback = deviceRegistry.fallbackName(peerId);
+        return {
+            deviceId: peerId,
+            // displayName：新字段，客户端直接用它，无需再自行 deviceName.ifBlank{name} 兜底
+            displayName: canonical || fallback,
+            // —— 以下两个为兼容旧客户端的字段，保留下发，待老版本占比极低后再移除 ——
+            name: canonical || fallback,
+            deviceName: canonical || '',
+            // 头像版本：客户端据此判断是否需重新拉取（命中本地缓存则零联网）
+            avatarVersion: deviceRegistry.getAvatarVersion(peerId),
+            // 在线且处于待命状态才视为"可一键连接"
+            online: online.has(peerId) && online.get(peerId).size > 0,
+            standby: !!(standbyMap.get(peerId) && standbyMap.get(peerId).standby),
+        };
+    });
 }
 
 /**
@@ -645,6 +660,24 @@ function notifyTrustPeers(deviceId) {
         }
     } catch (e) {
         logWarn('notifyTrustPeers 失败:', e && e.message);
+    }
+}
+
+/**
+ * 头像变更专用推送：仅给"信任了该设备"的在线对端发 avatar.updated（携带上传者 deviceId + 新版本号）。
+ * 比整份 trust.list 更轻；客户端据版本号变化失效旧缓存并重拉，未变更则继续用本地缓存（不重复下载）。
+ */
+function notifyAvatarPeers(deviceId, version) {
+    try {
+        for (const peerId of Object.keys(trustCache)) {
+            if (peerId === deviceId) continue;
+            // 只推给确实信任了该设备、且当前在线的对端
+            if (!trustCache[peerId] || !trustCache[peerId][deviceId]) continue;
+            if (!online.has(peerId) || online.get(peerId).size === 0) continue;
+            relayTo(peerId, { op: 'avatar.updated', payload: { deviceId, avatarVersion: version } });
+        }
+    } catch (e) {
+        logWarn('notifyAvatarPeers 失败:', e && e.message);
     }
 }
 
@@ -762,7 +795,7 @@ function attach(httpServer) {
         logError('[WSS-ERROR] WebSocketServer 错误:', e.message, e.stack);
     });
 
-    wss.on('connection', (ws, req) => {
+    wss.on('connection', async (ws, req) => {
         logInfo(`[WS-CONN] 连接事件触发 remote=${req.socket.remoteAddress}:${req.socket.remotePort} url=${req.url}`);
         const url = new URL(req.url, 'http://localhost');
         const deviceId = url.searchParams.get('deviceId');
@@ -776,7 +809,15 @@ function attach(httpServer) {
         }
         // 记录系统设备名称（设置→关于手机→设备名称，如「荣耀60SE」「妈妈的手机」），
         // 供信任列表默认展示（无需备注即可区分不同设备）
-        if (dname) deviceInfo.set(deviceId, { deviceName: dname });
+        // 上报的本机名称写入统一设备档案（持久化，进程重启不丢）。
+        // 不再回填 trustCache——信任边已不存名称，读取时统一从档案解析，天然无脏数据问题。
+        if (dname) {
+            try {
+                await deviceRegistry.setName(deviceId, dname);
+            } catch (e) {
+                logWarn(`[名称上报] 写入档案失败 device=${deviceId && deviceId.slice(-8)}: ${e && e.message}`);
+            }
+        }
         logInfo(`新 WebSocket 连接建立 device=${deviceId.slice(-8)}${dname ? ' dname=' + dname : ''} 在线=${online.size}`);
 
         ws.deviceId = deviceId;
@@ -983,7 +1024,8 @@ async function handleMessage(ws, m) {
         // 信任绑定：控制端输入对方控制码发起绑定请求，对方弹窗确认
         case 'trust.bind': {
             const code = (m.payload && m.payload.code || '').trim();
-            const peerName = (m.payload && m.payload.name) || '';
+            // 未携带名称时用统一档案里的名字（旧客户端不传 name 也能显示正确名字）
+            const peerName = (m.payload && m.payload.name) || deviceRegistry.getName(deviceId) || '';
             // 绑定只需解析出对方 deviceId，不占用控制码（否则该码会被置为 connected）
             const r = await lookupControlCode(code);
             if (!r.ok) {
@@ -1018,10 +1060,9 @@ async function handleMessage(ws, m) {
             const list = [];
             for (const otherId of online.keys()) {
                 if (otherId === deviceId) continue; // 排除请求方自身
-                const info = deviceInfo.get(otherId) || {};
                 list.push({
                     deviceId: otherId,
-                    name: info.deviceName || '',
+                    name: deviceRegistry.getDisplayName(otherId),
                     code: genFixedCode(otherId),
                     standby: !!(standbyMap.get(otherId) && standbyMap.get(otherId).standby),
                 });
@@ -1067,6 +1108,21 @@ async function handleMessage(ws, m) {
         case 'trust.list': {
             const list = getTrustList(deviceId);
             ws.send(JSON.stringify({ op: 'trust.list', payload: { list } }));
+            break;
+        }
+
+        // 设备名称在线更新：改名后客户端经 WS 推送最新名，写入统一设备档案（持久化），
+        // 再向「信任了本设备」的在线对端广播最新信任列表，使对端无需重连即可看到新名。
+        case 'device.name': {
+            const dname = (m.payload && m.payload.dname || '').toString().trim();
+            if (!dname) break;
+            // 唯一权威写入：统一设备档案（同时被 HTTP 改名使用），持久化、跨体系一致。
+            // 不再写 trustCache —— 信任边只存关系，名称统一在 getTrustList() 解析，
+            // 从结构上杜绝"把我的名字写到别人条目上"这类串号问题。
+            await deviceRegistry.setName(deviceId, dname);
+            // 把最新列表推给信任了本设备的在线对端，使其立即看到新名
+            notifyTrustPeers(deviceId);
+            logInfo(`设备名称在线更新 device=${deviceId.slice(-8)} dname=${dname}`);
             break;
         }
 
@@ -1224,18 +1280,25 @@ async function handleMessage(ws, m) {
             // 透传给受控端（relayTo 按 deviceId 遍历其所有在线连接发送），
             // 携来源 deviceId（控制端，写入 payload.peer）以便其回执；action 为编码后的 ActionJson 字符串
             console.log(`[trust.cmd] 转发 -> 被控端 ${peerId} action=${(payload.action || '').slice(0, 80)}`);
-            // 计费：解析指令类型登记待扣费（控制端付费），待被控端成功回执 trust.cmd_ack 时扣减
-            // 同时记录 admin 标记：管理设备不消耗积分，回执成功时豁免扣费。
+            // 计费：解析指令类型，于【转发送达】当下即扣费（控制端付费），而非等被控端回执。
+            // 语义对齐产品：只要消息成功发到对方设备（转发成功）就算发送成功，立即扣积分，
+            // 不再等对方已读/解锁才扣。被控端离线/非信任已在上面拦截（不转发=不计费）。
+            // 管理设备（admin=true）不消耗积分，豁免扣费。
             let cmdCost = DEFAULT_TRUST_CMD_COST;
             let cmdAdmin = false;
+            let cmdType = '';
             try {
                 const actObj = JSON.parse(payload.action || '{}');
                 const t = actObj && actObj.type;
                 if (t && TRUST_CMD_PRICE[t] != null) cmdCost = TRUST_CMD_PRICE[t];
                 cmdAdmin = !!(actObj && actObj.admin);
+                cmdType = t || '';
             } catch (e) { cmdCost = DEFAULT_TRUST_CMD_COST; }
-            pendingTrustCost.set(deviceId + ':' + peerId, { cost: cmdCost, admin: cmdAdmin });
             relayTo(peerId, { op: 'trust.cmd', payload: { peer: deviceId, action: payload.action } });
+            // 转发即送达：立即扣费（回执分支不再扣，避免重复计费）
+            if (cmdCost > 0 && !cmdAdmin) {
+                deduct(deviceId, cmdCost, 'trust.cmd:' + cmdType);
+            }
             break;
         }
 
@@ -1244,17 +1307,10 @@ async function handleMessage(ws, m) {
             const payload = m.payload || {};
             const controllerId = payload.peer;
             console.log(`[trust.cmd_ack] === 入口: from=${deviceId} controllerId=${controllerId} ok=${payload.ok} reason=${payload.reason || ''} url=${(payload.url || '').slice(0, 80)} isReal=${payload.isReal}`);
-            // 计费：被控端成功回执后，按登记的费用从控制端扣减（失败不计费）
-            const okFlag = (payload.ok === 'true' || payload.ok === true);
+            // 计费已在「转发送达」时完成（见 trust.cmd 分支），此处不再扣费，
+            // 仅清理待扣费登记，避免内存泄漏。
             const costKey = controllerId + ':' + deviceId;
-            const pendingCost = pendingTrustCost.get(costKey);
-            if (pendingCost != null) {
-                pendingTrustCost.delete(costKey);
-                // 管理设备不消耗积分：携带 admin 标记的指令，回执成功也豁免扣费
-                if (okFlag && pendingCost.cost > 0 && !pendingCost.admin) {
-                    deduct(controllerId, pendingCost.cost, 'trust.cmd:' + (payload.type || ''));
-                }
-            }
+            pendingTrustCost.delete(costKey);
             const targetSet = online.get(controllerId);
             if (targetSet && targetSet.size > 0) {
                 // 透传完整 payload（含 ok/reason/url 等快照字段），仅覆盖 peer 为回执来源设备（被控端）
@@ -1453,6 +1509,12 @@ function getIceConfig() {
 module.exports = {
     attach,
     registerVerify,
+    // 设备名变更后由外部（HTTP 改名接口）调用：把最新信任列表推给在线对端。
+    // 解决旧实现"HTTP 改名只落盘、对端要等对方重连才看得到"的问题。
+    notifyDeviceNameChanged: (deviceId) => notifyTrustPeers(deviceId),
+    // 头像变更后由外部（HTTP 上传接口）调用：直接给"信任了该设备"的在线对端推送 avatar.updated，
+    // 携带上传者 deviceId + 新版本号；客户端据此失效旧缓存并重拉（未变更则对端用本地缓存，不重复下载）。
+    notifyAvatarChanged: (deviceId, version) => notifyAvatarPeers(deviceId, version),
     setSubscription,
     getPlan,
     getIceConfig,

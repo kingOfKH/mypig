@@ -830,6 +830,19 @@ app.use('/avatars', express.static(AVATAR_DIR, {
     }
 }));
 
+// ---- 表情 Lottie 矢量动画：静态托管（APP 首次渲染时按需下载到沙盒，不打包进 APK）----
+// 资源位于 public/qqface-lottie/，由 scripts/build-lottie.js 从 QFace 仓库生成：
+//   /lottie/manifest.json  列出所有可用表情 id（数字串数组）
+//   /lottie/{id}.json      对应表情的 Lottie 矢量动画
+// 免鉴权（与 /snapshots、/avatars 一致），并对客户端开放。
+const LOTTIE_DIR = path.join(__dirname, 'public', 'qqface-lottie');
+app.use('/lottie', express.static(LOTTIE_DIR, {
+    setHeaders: (res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+    }
+}));
+
 // ---- APP 自动更新：发布页面与安装包下载 ----
 // 发布页面（publish.html 等静态资源）
 app.use('/public', requirePageAuth, express.static(path.join(__dirname, 'public'), {
@@ -925,6 +938,261 @@ function getChinaTime() {
 // multer 内存存储：APK 先放内存，解析 manifest 后再落盘（避免临时文件）
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
 
+// ==================== 表情包（统一服务端托管）：普通(png) / 超级(lottie) / 自定义(上传) ====================
+// 普通表情：public/emoji/regular/*.png（低分辨率 png，由客户端从 assets 迁移而来，不再打包进 APK）
+// 超级表情：复用 public/qqface-lottie/*.json（Lottie 矢量动画）
+// 自定义表情：public/emoji/custom/*.png（用户上传，所有用户共享，元数据持久化到 data/emoji/custom.json）
+// 客户端启动静默拉取 /emoji/catalog，按 hash 增量下载到本地沙盒，进入聊天前加载完成。
+const EMOJI_DIR = path.join(__dirname, 'public', 'emoji');
+const EMOJI_REGULAR_DIR = path.join(EMOJI_DIR, 'regular');
+const EMOJI_CUSTOM_DIR = path.join(EMOJI_DIR, 'custom');
+const EMOJI_CUSTOM_JSON = path.join(__dirname, 'data', 'emoji', 'custom.json');
+fs.mkdirSync(EMOJI_REGULAR_DIR, { recursive: true });
+fs.mkdirSync(EMOJI_CUSTOM_DIR, { recursive: true });
+
+// 自定义表情上传**独立的 multer 实例**：不能复用 APK 上传那个 200MB 限制的 upload，
+// 否则一张超大图就能把内存（memoryStorage）打爆。这里单独限 10MB。
+const EMOJI_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+const emojiUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: EMOJI_UPLOAD_MAX_BYTES, files: 1 }
+});
+
+// 自定义表情总条数上限（全员共享，防止无限增长撑爆磁盘并拖慢 catalog）
+const EMOJI_CUSTOM_MAX = 200;
+
+// 轻量滥用防护：同 IP 上传频率限制（不引入 token 鉴权，避免打断 APP 正常上传）
+const EMOJI_UPLOAD_RATE_WINDOW = 60 * 1000;
+const EMOJI_UPLOAD_RATE_MAX = 20;
+const emojiUploadHits = new Map();
+function emojiUploadAllowed(ip) {
+    const now = Date.now();
+    const arr = (emojiUploadHits.get(ip) || []).filter(t => now - t < EMOJI_UPLOAD_RATE_WINDOW);
+    arr.push(now);
+    emojiUploadHits.set(ip, arr);
+    if (emojiUploadHits.size > 5000) emojiUploadHits.clear(); // 防止 Map 自身无限增长
+    return arr.length <= EMOJI_UPLOAD_RATE_MAX;
+}
+
+app.use('/emoji/regular', express.static(EMOJI_REGULAR_DIR, {
+    setHeaders: (res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+    }
+}));
+app.use('/emoji/custom', express.static(EMOJI_CUSTOM_DIR, {
+    setHeaders: (res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+    }
+}));
+
+function emojiFileHash(buf) {
+    return crypto.createHash('md5').update(buf).digest('hex');
+}
+
+// 内存缓存 catalog（自定义上传后失效），避免每次请求都扫盘
+let emojiCatalogCache = null;
+let emojiCatalogCacheAt = 0;
+const EMOJI_CATALOG_TTL = 30 * 1000;
+
+/**
+ * 单文件 hash 缓存：仅在 mtime/size 变化时才真正读文件算 md5。
+ *
+ * 旧实现每 30s 重建 catalog 就对 ~300 个文件做 **同步** readFileSync + md5，
+ * 直接阻塞事件循环（所有客户端请求一起卡）。现在常规重建只剩 stat 开销；
+ * 且 hash 语义完全不变（仍是内容 md5），客户端按 hash 增量下载不会误触发全量重下。
+ */
+const emojiFileMetaCache = new Map(); // filePath -> { mtimeMs, size, hash }
+
+async function buildFileEntry(dirPath, publicPrefix, id, fileName) {
+    const p = path.join(dirPath, fileName);
+    const st = await fs.promises.stat(p);
+    const cached = emojiFileMetaCache.get(p);
+    let hash = (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) ? cached.hash : null;
+    if (!hash) {
+        const buf = await fs.promises.readFile(p);
+        hash = emojiFileHash(buf);
+        emojiFileMetaCache.set(p, { mtimeMs: st.mtimeMs, size: st.size, hash });
+    }
+    return { id, file: `${publicPrefix}/${fileName}`, hash, size: st.size };
+}
+
+async function buildEmojiCatalog() {
+    const now = Date.now();
+    if (emojiCatalogCache && (now - emojiCatalogCacheAt) < EMOJI_CATALOG_TTL) {
+        return emojiCatalogCache;
+    }
+    const regular = [];
+    try {
+        const files = (await fs.promises.readdir(EMOJI_REGULAR_DIR)).filter(f => f.toLowerCase().endsWith('.png'));
+        for (const f of files) {
+            regular.push(await buildFileEntry(EMOJI_REGULAR_DIR, '/emoji/regular', f.replace(/\.png$/i, ''), f));
+        }
+    } catch (e) { console.warn('[emoji] 扫描 regular 失败:', e.message); }
+
+    const superList = [];
+    try {
+        const manifestPath = path.join(LOTTIE_DIR, 'manifest.json');
+        const manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8'));
+        for (const rawId of manifest) {
+            // 白名单：manifest 若被污染（含 ../ 等）会导致路径穿越，这里先规范化
+            const id = String(rawId).replace(/[^0-9a-zA-Z_-]/g, '');
+            if (!id) continue;
+            superList.push(await buildFileEntry(LOTTIE_DIR, '/lottie', `s${id}`, `${id}.json`));
+        }
+    } catch (e) { console.warn('[emoji] 扫描 super 失败:', e.message); }
+
+    let custom = [];
+    try {
+        custom = JSON.parse(await fs.promises.readFile(EMOJI_CUSTOM_JSON, 'utf8') || '[]');
+    } catch (e) { custom = []; }
+
+    const catalog = { regular, super: superList, custom };
+    emojiCatalogCache = catalog;
+    emojiCatalogCacheAt = now;
+    return catalog;
+}
+
+app.get('/emoji/catalog', async (req, res) => {
+    try {
+        const catalog = await buildEmojiCatalog();
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.json(catalog);
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 自定义表情上传：multer 内存 → jimp 归一化(cover 240×240) → 落盘 + 追加到 data/emoji/custom.json（所有用户共享）
+app.post('/api/emoji/custom/upload', emojiUpload.single('emoji'), async (req, res) => {
+    try {
+        if (!emojiUploadAllowed(req.ip || req.connection?.remoteAddress || 'unknown')) {
+            return res.status(429).json({ success: false, error: '上传过于频繁，请稍后再试' });
+        }
+        if (!req.file) return res.status(400).json({ success: false, error: '未收到图片' });
+        // 仅允许图片类型
+        const mime = req.file.mimetype || '';
+        if (!mime.startsWith('image/')) return res.status(400).json({ success: false, error: '仅支持图片文件' });
+
+        const raw = sanitizeImageBuffer(req.file.buffer);
+        // ⚠️ 只有 **APNG（PNG + acTL）** 才能原样保留动画：
+        // 客户端解码器（ApngDecoder）仅支持 PNG/APNG，且本地文件固定按 `${id}.png` 命名。
+        // 若把 GIF 原样存成 .gif，客户端根本解不出来——**比"压成静态"更糟（直接显示不出来）**。
+        // 因此 GIF 仍走原有 Jimp 归一化（与本次改动前行为完全一致，无回归）；
+        // 待客户端支持 GIF 帧解码后再放开 GIF 动画。
+        const isGif = raw.length >= 3 && raw[0] === 0x47 && raw[1] === 0x49 && raw[2] === 0x46;
+        const animated = !isGif && isAnimatedImageBuffer(raw);
+        const id = 'c_' + crypto.randomBytes(6).toString('hex');
+        const fileName = `${id}.png`;
+        const destPath = path.join(EMOJI_CUSTOM_DIR, fileName);
+        fs.mkdirSync(EMOJI_CUSTOM_DIR, { recursive: true });
+
+        if (animated) {
+            // 动图（APNG）：绝不能走 Jimp——Jimp 只保留首帧，会把动画压成静态图。
+            // 原样落盘保留全部帧，客户端据此逐帧播放。体积已由 10MB 上限约束。
+            fs.writeFileSync(destPath, raw);
+        } else {
+            // 静态图 + GIF：按原逻辑归一化到 240×240（体积与显示一致，行为与改动前相同）
+            const img = await Jimp.read(raw);
+            img.cover(240, 240);
+            await img.writeAsync(destPath);
+        }
+
+        const fileBuf = fs.readFileSync(destPath);
+        // 内容去重：同一张图重复上传直接复用已有条目，避免表情面板出现重复项
+        const contentHash = emojiFileHash(fileBuf);
+        const uploader = String(req.body?.deviceId || req.query?.deviceId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+
+        let entry = null;
+        let deduped = false;
+        await withFileLock(EMOJI_CUSTOM_JSON, async () => {
+            let list = [];
+            try { list = JSON.parse(fs.readFileSync(EMOJI_CUSTOM_JSON, 'utf8') || '[]'); } catch (e) { list = []; }
+            const exist = list.find(x => x && x.hash === contentHash && x.size === fileBuf.length);
+            if (exist) {
+                // 已存在完全相同的内容：删除刚写入的重复文件，复用原条目
+                try { fs.unlinkSync(destPath); } catch (e) { /* 忽略清理失败 */ }
+                entry = exist;
+                deduped = true;
+                return;
+            }
+            // 条数上限：防止无限增长撑爆磁盘/拖慢 catalog（超出则拒绝并清理本次文件）
+            if (list.length >= EMOJI_CUSTOM_MAX) {
+                try { fs.unlinkSync(destPath); } catch (e) { /* 忽略清理失败 */ }
+                entry = null;
+                return;
+            }
+            entry = {
+                id,
+                file: `/emoji/custom/${fileName}`,
+                hash: contentHash,
+                size: fileBuf.length,
+                animated: animated || undefined,
+                uploader: uploader || undefined,
+                ts: Date.now()
+            };
+            list.push(entry);
+            safeWriteJSON(EMOJI_CUSTOM_JSON, list);
+        });
+
+        if (!entry) {
+            return res.status(400).json({ success: false, error: `自定义表情已达上限（${EMOJI_CUSTOM_MAX} 个）` });
+        }
+        emojiCatalogCache = null; // 失效缓存
+        res.json({ success: true, entry, deduped });
+    } catch (e) {
+        console.error('[emoji] 自定义上传失败:', e);
+        res.status(500).json({ success: false, error: '服务端处理失败: ' + e.message });
+    }
+});
+
+/**
+ * 判定图片是否为动态图：
+ * - GIF：按动图处理（自定义表情里的 GIF 基本都是动图）；
+ * - PNG/APNG：扫描 chunk，出现 `acTL`（动画控制块，必在 IDAT 之前）即为动图。
+ * 只读文件头与前几个 chunk，不解码整图，开销极小。
+ * 必须放在服务端：客户端据此决定「全屏弹幕（动图）还是横幅（静态）」的展示策略。
+ */
+function isAnimatedImageBuffer(buf) {
+    if (!Buffer.isBuffer(buf) || buf.length < 8) return false;
+    // GIF: "GIF87a" / "GIF89a"
+    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return true;
+    // PNG 签名: 89 50 4E 47 0D 0A 1A 0A
+    if (buf[0] !== 0x89 || buf[1] !== 0x50 || buf[2] !== 0x4E || buf[3] !== 0x47) return false;
+    let pos = 8;
+    while (pos + 8 <= buf.length) {
+        const len = buf.readUInt32BE(pos);
+        const type = buf.toString('ascii', pos + 4, pos + 8);
+        const chunkEnd = pos + 8 + len + 4;
+        if (chunkEnd > buf.length) break;
+        if (type === 'acTL') return true;                      // 动画控制块 → 动图
+        if (type === 'IDAT' || type === 'IEND') return false;  // 已到图像数据/结尾 → 静态
+        pos = chunkEnd;
+    }
+    return false;
+}
+
+// 部分客户端/图库产出的 PNG 在 IEND 之后携带多余字节（缩略图、元数据等），
+// 会让 Jimp 内置的旧版 pngjs 解析报 "unrecognised content at end of stream"。
+// 这里按 PNG 规范扫描到 IEND 块（含 4 字节 CRC）即截断，丢弃尾部垃圾字节（对合法 PNG 无损）。
+function sanitizeImageBuffer(buf) {
+    if (!Buffer.isBuffer(buf) || buf.length < 8) return buf;
+    // PNG 签名: 89 50 4E 47 0D 0A 1A 0A
+    if (buf[0] !== 0x89 || buf[1] !== 0x50 || buf[2] !== 0x4E || buf[3] !== 0x47) return buf;
+    let pos = 8;
+    while (pos + 8 <= buf.length) {
+        const len = buf.readUInt32BE(pos);
+        const type = buf.toString('ascii', pos + 4, pos + 8);
+        const chunkEnd = pos + 8 + len + 4; // 4(长度)+4(类型)+len(数据)+4(CRC)
+        if (chunkEnd > buf.length) break;
+        if (type === 'IEND') return buf.subarray(0, chunkEnd);
+        pos = chunkEnd;
+    }
+    return buf;
+}
+
 // ==================== 设备头像：上传（服务端压缩优化后存储） ====================
 // 上传：multer 收内存 → jimp 压缩为 256×256 JPEG（quality 82，体积降 95%+）→ 落盘 data/avatars/<id>.jpg
 // 成功后 deviceRegistry.bumpAvatar 版本号 +1，并通知信任对端重新拉取（未变更则对端用本地缓存，不重复下载）。
@@ -933,7 +1201,7 @@ app.put('/api/device/:deviceId/avatar', upload.single('avatar'), async (req, res
         if (!req.file) return res.status(400).json({ success: false, error: '未收到图片' });
         const deviceId = String(req.params.deviceId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
         if (!deviceId) return res.status(400).json({ success: false, error: '非法 deviceId' });
-        const img = await Jimp.read(req.file.buffer);
+        const img = await Jimp.read(sanitizeImageBuffer(req.file.buffer));
         img.cover(256, 256).quality(82);
         fs.mkdirSync(AVATAR_DIR, { recursive: true });
         await img.writeAsync(path.join(AVATAR_DIR, `${deviceId}.jpg`));

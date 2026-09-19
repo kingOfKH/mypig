@@ -1515,6 +1515,18 @@ module.exports = {
     // 头像变更后由外部（HTTP 上传接口）调用：直接给"信任了该设备"的在线对端推送 avatar.updated，
     // 携带上传者 deviceId + 新版本号；客户端据此失效旧缓存并重拉（未变更则对端用本地缓存，不重复下载）。
     notifyAvatarChanged: (deviceId, version) => notifyAvatarPeers(deviceId, version),
+    // 表情 catalog 变更后由外部（管理页保存）调用：向所有在线设备广播 emoji.catalog.update，
+    // 客户端收到后调用 EmojiCatalog.preload() 做 hash 增量同步（仅下载变更文件，非全量）。
+    broadcastEmojiCatalogUpdate: () => {
+        const msg = JSON.stringify({ op: 'emoji.catalog.update', payload: { ts: Date.now() } });
+        for (const [deviceId, set] of online) {
+            for (const ws of set) {
+                if (ws && ws.readyState === ws.OPEN) {
+                    try { ws.send(msg); } catch (e) { /* ignore */ }
+                }
+            }
+        }
+    },
     setSubscription,
     getPlan,
     getIceConfig,

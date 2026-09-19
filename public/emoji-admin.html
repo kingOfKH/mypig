@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#f6f7f9">
+<title>StarClick · 表情包管理</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --surface: #ffffff; --surface-hover: #f8f9fb;
+    --border: rgba(0,0,0,0.06); --border-strong: rgba(0,0,0,0.1);
+    --text: #0f1115; --text-secondary: #525866; --text-muted: #8b909a;
+    --accent: #5b5bf6; --accent-hover: #4848e0; --accent-soft: #eef0ff;
+    --success: #22c55e; --danger: #ef4444; --danger-soft: #fef2f2;
+    --warning: #f59e0b; --warning-soft: #fef3c7;
+    --radius-xl: 20px; --radius-lg: 16px; --radius-md: 12px; --radius-sm: 8px;
+    --shadow-card: 0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.03);
+    --shadow-card-hover: 0 4px 16px rgba(0,0,0,0.06), 0 8px 24px rgba(0,0,0,0.04);
+    --shadow-btn: 0 2px 8px rgba(91,91,246,0.25);
+    --font: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body { font-family: var(--font); min-height: 100vh; color: var(--text); -webkit-font-smoothing: antialiased; line-height: 1.5; padding: 0 24px calc(48px + env(safe-area-inset-bottom)); background: var(--bg); }
+
+  .topbar { position: sticky; top: 0; z-index: 40; margin: 0 -24px 32px; padding: calc(14px + env(safe-area-inset-top)) 24px 14px; background: rgba(246,247,249,0.92); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border-bottom: 1px solid var(--border); }
+  .topbar-inner { max-width: 1100px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo { width: 36px; height: 36px; border-radius: 10px; background: var(--accent); color: #fff; font-weight: 700; font-size: 15px; display: flex; align-items: center; justify-content: center; }
+  .brand-text .t { font-size: 16px; font-weight: 600; }
+  .brand-text .s { font-size: 12px; color: var(--text-muted); }
+  .nav-btns { display: flex; gap: 8px; }
+  .nav-btn { padding: 8px 16px; border-radius: var(--radius-sm); text-decoration: none; font-size: 14px; font-weight: 500; color: var(--text-secondary); background: var(--surface); border: 1px solid var(--border); transition: all .15s; }
+  .nav-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 24px; font-weight: 700; margin-bottom: 24px; }
+
+  .tabs { display: flex; gap: 4px; margin-bottom: 20px; background: var(--surface); border-radius: var(--radius-md); padding: 4px; box-shadow: var(--shadow-card); }
+  .tab { flex: 1; padding: 10px 16px; border: none; background: none; border-radius: var(--radius-sm); font-size: 14px; font-weight: 500; color: var(--text-secondary); cursor: pointer; transition: all .15s; font-family: var(--font); }
+  .tab.active { background: var(--accent); color: #fff; }
+  .tab:not(.active):hover { background: var(--surface-hover); }
+
+  .action-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+  .btn { padding: 8px 18px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 14px; font-weight: 500; cursor: pointer; transition: all .15s; font-family: var(--font); display: inline-flex; align-items: center; gap: 6px; }
+  .btn:hover { background: var(--surface-hover); border-color: var(--border-strong); }
+  .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); box-shadow: var(--shadow-btn); }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-danger { color: var(--danger); }
+  .btn-danger:hover { background: var(--danger-soft); border-color: var(--danger); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .action-spacer { flex: 1; }
+  .count-badge { font-size: 13px; color: var(--text-muted); }
+
+  .emoji-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); gap: 8px; margin-bottom: 24px; }
+  .emoji-item { position: relative; aspect-ratio: 1; background: var(--surface); border: 2px solid transparent; border-radius: var(--radius-md); display: flex; align-items: center; justify-content: center; cursor: grab; transition: all .15s; overflow: hidden; }
+  .emoji-item:hover { border-color: var(--accent); box-shadow: var(--shadow-card-hover); }
+  .emoji-item.dragging { opacity: .4; }
+  .emoji-item.drag-over { border-color: var(--accent); border-style: dashed; }
+  .emoji-item.selected { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 2px var(--accent); }
+  .emoji-item .checkmark { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 11px; display: none; align-items: center; justify-content: center; z-index: 2; }
+  .emoji-item.selected .checkmark { display: flex; }
+  .emoji-item.selected .order-num { display: none; }
+  .emoji-item img { width: 100%; height: 100%; object-fit: contain; padding: 6px; }
+  .emoji-item .emoji-label { position: absolute; bottom: 2px; left: 2px; right: 2px; font-size: 9px; color: var(--text-muted); text-align: center; background: rgba(255,255,255,0.8); border-radius: 3px; padding: 1px 0; pointer-events: none; }
+  .emoji-item .delete-x { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border-radius: 50%; background: var(--danger); color: #fff; font-size: 12px; display: none; align-items: center; justify-content: center; cursor: pointer; border: none; line-height: 1; }
+  .emoji-item:hover .delete-x { display: flex; }
+  .emoji-item .order-num { position: absolute; top: 2px; left: 2px; font-size: 10px; color: var(--text-muted); background: rgba(255,255,255,0.8); border-radius: 3px; padding: 1px 4px; }
+
+  .recycle-section { margin-top: 32px; }
+  .recycle-header { display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 12px 16px; background: var(--warning-soft); border-radius: var(--radius-md); border: 1px solid var(--warning); margin-bottom: 12px; }
+  .recycle-header h3 { font-size: 15px; font-weight: 600; color: #92400e; }
+  .recycle-header .arrow { margin-left: auto; transition: transform .2s; }
+  .recycle-header.open .arrow { transform: rotate(180deg); }
+  .recycle-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); gap: 8px; margin-bottom: 16px; }
+  .recycle-item { position: relative; aspect-ratio: 1; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .recycle-item img { width: 100%; height: 100%; object-fit: contain; padding: 6px; opacity: .5; }
+  .recycle-item .actions { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 4px; background: rgba(0,0,0,0.4); opacity: 0; transition: opacity .15s; }
+  .recycle-item:hover .actions { opacity: 1; }
+  .recycle-item .actions button { padding: 4px 8px; border: none; border-radius: 4px; font-size: 12px; cursor: pointer; font-family: var(--font); }
+  .recycle-item .actions .restore { background: var(--success); color: #fff; }
+  .recycle-item .actions .destroy { background: var(--danger); color: #fff; }
+
+  .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 100; display: none; align-items: center; justify-content: center; }
+  .modal-mask.open { display: flex; }
+  .modal { background: var(--surface); border-radius: var(--radius-lg); padding: 24px; width: 90%; max-width: 480px; box-shadow: 0 20px 60px rgba(0,0,0,0.15); }
+  .modal h2 { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
+  .modal-btn { display: block; width: 100%; padding: 12px; margin-bottom: 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); font-size: 15px; cursor: pointer; transition: all .15s; font-family: var(--font); text-align: center; }
+  .modal-btn:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .modal-close { width: 100%; padding: 10px; border: none; background: var(--surface-hover); border-radius: var(--radius-sm); font-size: 14px; cursor: pointer; margin-top: 8px; font-family: var(--font); }
+
+  .upload-area { border: 2px dashed var(--border-strong); border-radius: var(--radius-md); padding: 32px; text-align: center; cursor: pointer; transition: all .15s; }
+  .upload-area:hover { border-color: var(--accent); background: var(--accent-soft); }
+  .upload-area.drag { border-color: var(--accent); background: var(--accent-soft); }
+  .upload-area p { color: var(--text-muted); font-size: 14px; }
+  .upload-area .file-name { color: var(--accent); font-weight: 500; margin-top: 8px; }
+
+  #toastWrap { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 200; display: flex; flex-direction: column; gap: 8px; align-items: center; }
+  .toast { padding: 10px 20px; border-radius: var(--radius-sm); font-size: 14px; color: #fff; box-shadow: 0 4px 16px rgba(0,0,0,0.15); animation: toastIn .2s; }
+  .toast.ok { background: var(--success); }
+  .toast.err { background: var(--danger); }
+  .toast.info { background: var(--accent); }
+  @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+  .loading { text-align: center; padding: 48px; color: var(--text-muted); font-size: 15px; }
+  .empty { text-align: center; padding: 48px; color: var(--text-muted); }
+  .dirty-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--warning); margin-left: 4px; vertical-align: middle; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <div class="logo">SC</div>
+      <div class="brand-text"><div class="t">表情包管理</div><div class="s">StarClick</div></div>
+    </div>
+    <div class="nav-btns">
+      <a class="nav-btn" href="/admin">设备管理</a>
+      <a class="nav-btn" href="/publish">发布页</a>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>表情包管理</h1>
+
+  <div class="tabs">
+    <button class="tab active" data-cat="regular">普通表情包</button>
+    <button class="tab" data-cat="super">超级表情包</button>
+    <button class="tab" data-cat="custom">自定义表情包</button>
+  </div>
+
+  <div class="action-bar">
+    <button class="btn btn-primary" id="addBtn">+ 添加</button>
+    <button class="btn" id="recycleBtn">回收站</button>
+    <button class="btn" id="multiSelectBtn">多选</button>
+    <button class="btn" id="selectAllBtn" style="display:none;">全选</button>
+    <button class="btn btn-danger" id="batchDeleteBtn" style="display:none;">删除选中</button>
+    <span class="count-badge" id="countBadge"></span>
+    <span class="count-badge" id="selectCountBadge" style="display:none;"></span>
+    <span class="action-spacer"></span>
+    <button class="btn btn-primary" id="saveBtn" disabled><span id="saveBtnText">保存</span><span id="dirtyIndicator"></span></button>
+  </div>
+
+  <div id="gridContainer">
+    <div class="loading">加载中…</div>
+  </div>
+
+  <div class="recycle-section" id="recycleSection" style="display:none;">
+    <div class="recycle-header" id="recycleHeader">
+      <h3>回收站 <span id="recycleCount"></span></h3>
+      <span class="arrow">▼</span>
+    </div>
+    <div id="recycleContent" style="display:none;">
+      <div class="recycle-grid" id="recycleGrid"></div>
+    </div>
+  </div>
+</main>
+
+<div class="modal-mask" id="addModal">
+  <div class="modal">
+    <h2>添加表情</h2>
+    <button class="modal-btn" id="addUploadBtn">上传表情包</button>
+    <button class="modal-btn" id="addRecycleBtn">从回收站选择</button>
+    <button class="modal-close" id="addCloseBtn">取消</button>
+  </div>
+</div>
+
+<div class="modal-mask" id="uploadModal">
+  <div class="modal">
+    <h2 id="uploadTitle">上传表情</h2>
+    <div class="upload-area" id="uploadArea">
+      <p>点击或拖拽文件到此处</p>
+      <p style="font-size:12px;margin-top:4px;">普通表情: PNG/GIF | 超级表情: Lottie JSON</p>
+      <div class="file-name" id="fileName"></div>
+    </div>
+    <input type="file" id="fileInput" style="display:none;">
+    <button class="btn btn-primary" id="uploadConfirmBtn" style="width:100%;margin-top:12px;justify-content:center;" disabled>确认上传</button>
+    <button class="modal-close" id="uploadCloseBtn">取消</button>
+  </div>
+</div>
+
+<div class="modal-mask" id="recycleSelectModal">
+  <div class="modal" style="max-width:600px;">
+    <h2>从回收站选择</h2>
+    <div class="recycle-grid" id="recycleSelectGrid" style="max-height:400px;overflow-y:auto;"></div>
+    <button class="btn btn-primary" id="recycleSelectConfirmBtn" style="width:100%;margin-top:12px;justify-content:center;">恢复选中项</button>
+    <button class="modal-close" id="recycleSelectCloseBtn">取消</button>
+  </div>
+</div>
+
+<div id="toastWrap"></div>
+
+<script>
+let state = { regular: [], super: [], custom: [] };
+let recycle = { regular: [], super: [], custom: [] };
+let currentCat = 'regular';
+let dirty = false;
+let pendingUpload = null;
+let recycleSelectSet = new Set();
+let lottieLoaded = false;
+let lottieInstances = new Map();
+let thumbCache = new Map();
+let lottieIO = null;
+let hoverAnim = null;
+let pendingDeleted = { regular: [], super: [], custom: [] };
+let pendingRestored = { regular: [], super: [], custom: [] };
+let multiSelectMode = false;
+let selectedIds = new Set();
+
+function toast(msg, type) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + (type || 'info');
+  el.textContent = msg;
+  document.getElementById('toastWrap').appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 300); }, 2500);
+}
+
+function emojiUrl(entry) {
+  return entry.file;
+}
+
+function emojiThumb(entry, cat) {
+  if (cat === 'super') {
+    return `<div class="emoji-canvas" data-file="${entry.file}" style="width:100%;height:100%;"></div>`;
+  }
+  return `<img src="${entry.file}" loading="lazy" alt="${entry.id}">`;
+}
+
+function renderGrid() {
+  const container = document.getElementById('gridContainer');
+  const items = state[currentCat];
+  if (items.length === 0) {
+    container.innerHTML = '<div class="empty">暂无表情，点击「添加」上传</div>';
+  } else {
+    container.innerHTML = `<div class="emoji-grid">${items.map((e, i) => `
+      <div class="emoji-item${selectedIds.has(e.id) ? ' selected' : ''}" draggable="true" data-id="${e.id}" data-idx="${i}">
+        <span class="checkmark">✓</span>
+        <span class="order-num">${i + 1}</span>
+        ${emojiThumb(e, currentCat)}
+        <span class="emoji-label">${e.id}</span>
+        <button class="delete-x" data-id="${e.id}">×</button>
+      </div>`).join('')}</div>`;
+    bindDragEvents();
+    bindDeleteButtons();
+    if (multiSelectMode) bindSelectClicks();
+    if (currentCat === 'super') { renderLottieThumbs(); bindHoverPreview(); }
+  }
+  document.getElementById('countBadge').textContent = `${items.length} 个`;
+}
+
+function destroyAllLottie() {
+  lottieInstances.forEach(anim => { try { anim.destroy(); } catch(e){} });
+  lottieInstances.clear();
+  if (hoverAnim) { try { hoverAnim.destroy(); } catch(e){} hoverAnim = null; }
+  document.querySelectorAll('.hover-anim').forEach(el => el.remove());
+}
+
+function renderLottieThumbs() {
+  destroyAllLottie();
+  if (lottieIO) { lottieIO.disconnect(); lottieIO = null; }
+  if (!lottieLoaded) {
+    const s = document.createElement('script');
+    s.src = 'https://unpkg.com/lottie-web@5.12.2/build/player/lottie.min.js';
+    s.onload = () => { lottieLoaded = true; doRenderLottieThumbs(); };
+    document.head.appendChild(s);
+  } else {
+    doRenderLottieThumbs();
+  }
+}
+
+function doRenderLottieThumbs() {
+  if (typeof lottie === 'undefined') return;
+  const canvases = document.querySelectorAll('.emoji-canvas');
+  if (canvases.length === 0) return;
+  lottieIO = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        renderSingleThumb(entry.target);
+        lottieIO.unobserve(entry.target);
+      }
+    });
+  }, { rootMargin: '200px' });
+  canvases.forEach(el => {
+    const file = el.dataset.file;
+    if (thumbCache.has(file)) {
+      replaceCanvasWithImg(el, thumbCache.get(file));
+    } else {
+      lottieIO.observe(el);
+    }
+  });
+}
+
+function replaceCanvasWithImg(el, dataUrl) {
+  if (!el.parentNode) return;
+  const img = document.createElement('img');
+  img.src = dataUrl;
+  img.style.cssText = 'width:100%;height:100%;object-fit:contain;padding:6px;';
+  img.dataset.file = el.dataset.file;
+  img.classList.add('lottie-thumb');
+  el.replaceWith(img);
+}
+
+function renderSingleThumb(el) {
+  const file = el.dataset.file;
+  if (!el.parentNode) return;
+  fetch(file).then(r => r.json()).then(data => {
+    if (!el.parentNode) return;
+    const anim = lottie.loadAnimation({
+      container: el, renderer: 'canvas', loop: false, autoplay: false, animationData: data
+    });
+    lottieInstances.set(file, anim);
+    anim.addEventListener('DOMLoaded', () => {
+      anim.goToAndStop(0, true);
+      const canvas = el.querySelector('canvas');
+      if (canvas) {
+        try {
+          const dataUrl = canvas.toDataURL('image/png');
+          thumbCache.set(file, dataUrl);
+          anim.destroy();
+          lottieInstances.delete(file);
+          replaceCanvasWithImg(el, dataUrl);
+        } catch(e) {}
+      }
+    });
+  }).catch(() => { el.textContent = '!'; });
+}
+
+function bindHoverPreview() {
+  const container = document.getElementById('gridContainer');
+  container.onmouseover = (e) => {
+    const item = e.target.closest('.emoji-item');
+    if (!item) return;
+    const thumb = item.querySelector('.lottie-thumb, .emoji-canvas');
+    if (!thumb) return;
+    const file = thumb.dataset.file;
+    if (!file) return;
+    if (hoverAnim) { try { hoverAnim.destroy(); } catch(e){} hoverAnim = null; }
+    document.querySelectorAll('.hover-anim').forEach(el => el.remove());
+    const overlay = document.createElement('div');
+    overlay.className = 'hover-anim';
+    overlay.style.cssText = 'position:absolute;inset:0;z-index:1;pointer-events:none;';
+    item.appendChild(overlay);
+    fetch(file).then(r => r.json()).then(data => {
+      if (!overlay.parentNode) return;
+      hoverAnim = lottie.loadAnimation({
+        container: overlay, renderer: 'canvas', loop: false, autoplay: true, animationData: data
+      });
+      hoverAnim.addEventListener('complete', () => {
+        if (hoverAnim) { try { hoverAnim.destroy(); } catch(e){} hoverAnim = null; }
+        overlay.remove();
+      });
+    });
+  };
+  container.onmouseout = (e) => {
+    const item = e.target.closest('.emoji-item');
+    if (!item) return;
+    const related = e.relatedTarget;
+    if (related && item.contains(related)) return;
+    if (hoverAnim) { try { hoverAnim.destroy(); } catch(e){} hoverAnim = null; }
+    document.querySelectorAll('.hover-anim').forEach(el => el.remove());
+  };
+}
+
+function bindDragEvents() {
+  let dragIdx = null;
+  document.querySelectorAll('.emoji-item').forEach(item => {
+    item.addEventListener('dragstart', (e) => {
+      dragIdx = parseInt(item.dataset.idx);
+      // 多选模式下：如果拖拽的项未选中，先清空选择并选中它
+      if (multiSelectMode && !selectedIds.has(item.dataset.id)) {
+        selectedIds.clear();
+        selectedIds.add(item.dataset.id);
+        renderGrid();
+      }
+      // 标记所有选中项为 dragging
+      if (selectedIds.has(item.dataset.id)) {
+        document.querySelectorAll('.emoji-item.selected').forEach(x => x.classList.add('dragging'));
+      } else {
+        item.classList.add('dragging');
+      }
+      e.dataTransfer.effectAllowed = 'move';
+      // 拖拽预览：多选时显示数量
+      if (selectedIds.size > 1) {
+        e.dataTransfer.setData('text/plain', `${selectedIds.size} items`);
+      }
+    });
+    item.addEventListener('dragend', () => {
+      document.querySelectorAll('.dragging').forEach(x => x.classList.remove('dragging'));
+      document.querySelectorAll('.drag-over').forEach(x => x.classList.remove('drag-over'));
+    });
+    item.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; });
+    item.addEventListener('dragenter', (e) => { e.preventDefault(); item.classList.add('drag-over'); });
+    item.addEventListener('dragleave', () => { item.classList.remove('drag-over'); });
+    item.addEventListener('drop', (e) => {
+      e.preventDefault();
+      item.classList.remove('drag-over');
+      const dropIdx = parseInt(item.dataset.idx);
+      if (dragIdx === null) return;
+      const arr = state[currentCat];
+      if (multiSelectMode && selectedIds.size > 0) {
+        // 批量移动：按选择顺序取出选中项，插入到 dropIdx 位置
+        const moved = Array.from(selectedIds).map(id => arr.find(x => x.id === id)).filter(Boolean);
+        const remaining = arr.filter(x => !selectedIds.has(x.id));
+        // 计算 dropIdx 在 remaining 中的插入位置
+        let insertAt = 0;
+        for (let i = 0; i < dropIdx; i++) { if (!selectedIds.has(arr[i].id)) insertAt++; }
+        remaining.splice(insertAt, 0, ...moved);
+        state[currentCat] = remaining;
+      } else {
+        if (dragIdx === dropIdx) return;
+        const [moved] = arr.splice(dragIdx, 1);
+        arr.splice(dropIdx, 0, moved);
+      }
+      markDirty();
+      renderGrid();
+    });
+  });
+}
+
+function bindSelectClicks() {
+  document.querySelectorAll('.emoji-item').forEach(item => {
+    item.addEventListener('click', (e) => {
+      // 忽略删除按钮点击
+      if (e.target.classList.contains('delete-x')) return;
+      const id = item.dataset.id;
+      if (selectedIds.has(id)) selectedIds.delete(id);
+      else selectedIds.add(id);
+      item.classList.toggle('selected');
+      updateSelectCount();
+    });
+  });
+}
+
+function updateSelectCount() {
+  const badge = document.getElementById('selectCountBadge');
+  badge.textContent = selectedIds.size > 0 ? `已选 ${selectedIds.size} 个` : '';
+  badge.style.display = selectedIds.size > 0 ? 'inline' : 'none';
+  document.getElementById('batchDeleteBtn').style.display = selectedIds.size > 0 ? 'inline-flex' : 'none';
+}
+
+function bindDeleteButtons() {
+  document.querySelectorAll('.delete-x').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      const arr = state[currentCat];
+      const idx = arr.findIndex(x => x.id === id);
+      if (idx < 0) return;
+      const entry = arr[idx];
+      arr.splice(idx, 1);
+      if (!recycle[currentCat]) recycle[currentCat] = [];
+      recycle[currentCat].push({ ...entry, deletedAt: Date.now() });
+      if (!pendingDeleted[currentCat].includes(id)) pendingDeleted[currentCat].push(id);
+      markDirty();
+      renderGrid();
+      renderRecycle();
+      toast(`已移入回收站: ${id}`, 'info');
+    });
+  });
+}
+
+function renderRecycle() {
+  const section = document.getElementById('recycleSection');
+  const grid = document.getElementById('recycleGrid');
+  const items = recycle[currentCat] || [];
+  document.getElementById('recycleCount').textContent = items.length ? `(${items.length})` : '';
+  if (items.length === 0) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  grid.innerHTML = items.map(e => `
+    <div class="recycle-item" data-id="${e.id}">
+      ${currentCat === 'super' ? '<div style="color:var(--text-muted);font-size:12px;">' + e.id + '</div>' : `<img src="${e.file}" alt="${e.id}">`}
+      <div class="actions">
+        <button class="restore" data-id="${e.id}">恢复</button>
+        <button class="destroy" data-id="${e.id}">删除</button>
+      </div>
+    </div>`).join('');
+  grid.querySelectorAll('.restore').forEach(btn => btn.addEventListener('click', () => restoreFromRecycle(btn.dataset.id)));
+  grid.querySelectorAll('.destroy').forEach(btn => btn.addEventListener('click', () => destroyFromRecycle(btn.dataset.id)));
+}
+
+function restoreFromRecycle(id) {
+  const rArr = recycle[currentCat] || [];
+  const idx = rArr.findIndex(x => x.id === id);
+  if (idx < 0) return;
+  const entry = rArr[idx];
+  rArr.splice(idx, 1);
+  delete entry.deletedAt;
+  state[currentCat].push(entry);
+  if (!pendingRestored[currentCat].includes(id)) pendingRestored[currentCat].push(id);
+  markDirty();
+  renderGrid();
+  renderRecycle();
+  toast(`已恢复: ${id}`, 'ok');
+}
+
+function destroyFromRecycle(id) {
+  if (!confirm(`永久删除 ${id}？文件将被物理删除，不可恢复！`)) return;
+  fetch('/emoji/admin/destroy', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ category: currentCat, ids: [id] })
+  }).then(r => r.json()).then(r => {
+    if (r.success) {
+      const rArr = recycle[currentCat] || [];
+      const idx = rArr.findIndex(x => x.id === id);
+      if (idx >= 0) rArr.splice(idx, 1);
+      renderRecycle();
+      toast(`已永久删除: ${id}`, 'ok');
+    } else toast('删除失败: ' + (r.error || ''), 'err');
+  }).catch(() => toast('网络错误', 'err'));
+}
+
+function markDirty() {
+  dirty = true;
+  const btn = document.getElementById('saveBtn'); if (btn) btn.disabled = false;
+  const ind = document.getElementById('dirtyIndicator'); if (ind) ind.innerHTML = '<span class="dirty-dot"></span>';
+}
+function clearDirty() {
+  dirty = false;
+  const btn = document.getElementById('saveBtn'); if (btn) btn.disabled = true;
+  const ind = document.getElementById('dirtyIndicator'); if (ind) ind.innerHTML = '';
+}
+
+function switchCat(cat) {
+  destroyAllLottie();
+  if (lottieIO) { lottieIO.disconnect(); lottieIO = null; }
+  currentCat = cat;
+  selectedIds.clear();
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.cat === cat));
+  renderGrid();
+  renderRecycle();
+  updateSelectCount();
+}
+
+async function loadState() {
+  document.getElementById('gridContainer').innerHTML = '<div class="loading">加载中…</div>';
+  try {
+    const r = await fetch('/emoji/admin/state');
+    const data = await r.json();
+    if (!data.success) throw new Error(data.error);
+    state = data.catalog;
+    recycle = data.recycle || {};
+    if (!recycle.regular) recycle.regular = [];
+    if (!recycle.super) recycle.super = [];
+    if (!recycle.custom) recycle.custom = [];
+    pendingDeleted = { regular: [], super: [], custom: [] };
+    pendingRestored = { regular: [], super: [], custom: [] };
+    selectedIds.clear();
+    renderGrid();
+    renderRecycle();
+    clearDirty();
+  } catch (e) {
+    document.getElementById('gridContainer').innerHTML = '<div class="empty">加载失败: ' + e.message + '</div>';
+  }
+}
+
+async function save() {
+  const order = { regular: state.regular.map(e => e.id), super: state.super.map(e => e.id), custom: state.custom.map(e => e.id) };
+  const deleted = { regular: pendingDeleted.regular, super: pendingDeleted.super, custom: pendingDeleted.custom };
+  const restored = { regular: pendingRestored.regular, super: pendingRestored.super, custom: pendingRestored.custom };
+  try {
+    document.getElementById('saveBtnText').textContent = '保存中…';
+    const r = await fetch('/emoji/admin/save', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order, deleted, restored })
+    });
+    const data = await r.json();
+    if (data.success) {
+      toast('保存成功，已通知客户端更新', 'ok');
+      pendingDeleted = { regular: [], super: [], custom: [] };
+      pendingRestored = { regular: [], super: [], custom: [] };
+      clearDirty();
+    } else throw new Error(data.error);
+  } catch (e) {
+    toast('保存失败: ' + e.message, 'err');
+  } finally {
+    document.getElementById('saveBtnText').textContent = '保存';
+  }
+}
+
+function openModal(id) { document.getElementById(id).classList.add('open'); }
+function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+
+function setupUpload() {
+  const area = document.getElementById('uploadArea');
+  const input = document.getElementById('fileInput');
+  const confirmBtn = document.getElementById('uploadConfirmBtn');
+  const nameEl = document.getElementById('fileName');
+
+  area.addEventListener('click', () => input.click());
+  area.addEventListener('dragover', (e) => { e.preventDefault(); area.classList.add('drag'); });
+  area.addEventListener('dragleave', () => area.classList.remove('drag'));
+  area.addEventListener('drop', (e) => {
+    e.preventDefault(); area.classList.remove('drag');
+    if (e.dataTransfer.files.length) { input.files = e.dataTransfer.files; handleFileSelected(); }
+  });
+  input.addEventListener('change', handleFileSelected);
+
+  function handleFileSelected() {
+    if (!input.files.length) { pendingUpload = null; confirmBtn.disabled = true; nameEl.textContent = ''; return; }
+    pendingUpload = input.files[0];
+    nameEl.textContent = pendingUpload.name + ` (${(pendingUpload.size / 1024).toFixed(1)} KB)`;
+    confirmBtn.disabled = false;
+  }
+
+  confirmBtn.addEventListener('click', async () => {
+    if (!pendingUpload) return;
+    const fd = new FormData();
+    fd.append('emoji', pendingUpload);
+    fd.append('category', currentCat === 'custom' ? 'regular' : currentCat);
+    confirmBtn.disabled = true; confirmBtn.textContent = '上传中…';
+    try {
+      const r = await fetch('/emoji/admin/upload', { method: 'POST', body: fd });
+      const data = await r.json();
+      if (data.success) {
+        state[currentCat].push(data.entry);
+        markDirty();
+        renderGrid();
+        toast(`上传成功: ${data.entry.id}`, 'ok');
+        closeModal('uploadModal');
+        pendingUpload = null; nameEl.textContent = ''; confirmBtn.textContent = '确认上传';
+      } else throw new Error(data.error);
+    } catch (e) {
+      toast('上传失败: ' + e.message, 'err');
+      confirmBtn.textContent = '确认上传'; confirmBtn.disabled = false;
+    }
+  });
+}
+
+function showRecycleSelect() {
+  const grid = document.getElementById('recycleSelectGrid');
+  const items = recycle[currentCat] || [];
+  recycleSelectSet.clear();
+  if (items.length === 0) { toast('回收站为空', 'info'); return; }
+  grid.innerHTML = items.map(e => `
+    <div class="recycle-item" data-id="${e.id}" style="cursor:pointer;">
+      ${currentCat === 'super' ? '<div style="color:var(--text-muted);font-size:12px;">' + e.id + '</div>' : `<img src="${e.file}" alt="${e.id}">`}
+    </div>`).join('');
+  grid.querySelectorAll('.recycle-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const id = el.dataset.id;
+      if (recycleSelectSet.has(id)) { recycleSelectSet.delete(id); el.style.borderColor = ''; el.style.background = ''; }
+      else { recycleSelectSet.add(id); el.style.borderColor = 'var(--accent)'; el.style.background = 'var(--accent-soft)'; }
+    });
+  });
+  openModal('recycleSelectModal');
+}
+
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => switchCat(t.dataset.cat)));
+document.getElementById('saveBtn').addEventListener('click', save);
+document.getElementById('addBtn').addEventListener('click', () => openModal('addModal'));
+document.getElementById('addCloseBtn').addEventListener('click', () => closeModal('addModal'));
+document.getElementById('addUploadBtn').addEventListener('click', () => { closeModal('addModal'); document.getElementById('uploadTitle').textContent = `上传${currentCat === 'regular' ? '普通' : currentCat === 'super' ? '超级' : '自定义'}表情`; openModal('uploadModal'); });
+document.getElementById('addRecycleBtn').addEventListener('click', () => { closeModal('addModal'); showRecycleSelect(); });
+document.getElementById('uploadCloseBtn').addEventListener('click', () => closeModal('uploadModal'));
+document.getElementById('recycleSelectCloseBtn').addEventListener('click', () => closeModal('recycleSelectModal'));
+document.getElementById('recycleSelectConfirmBtn').addEventListener('click', () => {
+  if (recycleSelectSet.size === 0) { toast('请选择要恢复的表情', 'info'); return; }
+  for (const id of recycleSelectSet) restoreFromRecycle(id);
+  recycleSelectSet.clear();
+  closeModal('recycleSelectModal');
+});
+
+document.getElementById('recycleBtn').addEventListener('click', () => {
+  const content = document.getElementById('recycleContent');
+  const header = document.getElementById('recycleHeader');
+  if (content.style.display === 'none') { content.style.display = 'block'; header.classList.add('open'); }
+  else { content.style.display = 'none'; header.classList.remove('open'); }
+});
+document.getElementById('recycleHeader').addEventListener('click', () => document.getElementById('recycleBtn').click());
+
+document.getElementById('multiSelectBtn').addEventListener('click', () => {
+  multiSelectMode = !multiSelectMode;
+  const btn = document.getElementById('multiSelectBtn');
+  if (multiSelectMode) {
+    btn.classList.add('btn-primary');
+    btn.textContent = '退出多选';
+    document.getElementById('selectAllBtn').style.display = 'inline-flex';
+  } else {
+    btn.classList.remove('btn-primary');
+    btn.textContent = '多选';
+    document.getElementById('selectAllBtn').style.display = 'none';
+    selectedIds.clear();
+    updateSelectCount();
+  }
+  renderGrid();
+});
+
+document.getElementById('selectAllBtn').addEventListener('click', () => {
+  const items = state[currentCat];
+  if (selectedIds.size === items.length) {
+    selectedIds.clear();
+  } else {
+    selectedIds = new Set(items.map(e => e.id));
+  }
+  renderGrid();
+  updateSelectCount();
+});
+
+document.getElementById('batchDeleteBtn').addEventListener('click', () => {
+  if (selectedIds.size === 0) return;
+  const ids = Array.from(selectedIds);
+  const arr = state[currentCat];
+  for (const id of ids) {
+    const idx = arr.findIndex(x => x.id === id);
+    if (idx < 0) continue;
+    const entry = arr[idx];
+    arr.splice(idx, 1);
+    if (!recycle[currentCat]) recycle[currentCat] = [];
+    recycle[currentCat].push({ ...entry, deletedAt: Date.now() });
+    if (!pendingDeleted[currentCat].includes(id)) pendingDeleted[currentCat].push(id);
+  }
+  selectedIds.clear();
+  markDirty();
+  renderGrid();
+  renderRecycle();
+  updateSelectCount();
+  toast(`已移入回收站 ${ids.length} 个`, 'info');
+});
+
+setupUpload();
+loadState();
+</script>
+</body>
+</html>

@@ -947,8 +947,11 @@ const EMOJI_DIR = path.join(__dirname, 'public', 'emoji');
 const EMOJI_REGULAR_DIR = path.join(EMOJI_DIR, 'regular');
 const EMOJI_CUSTOM_DIR = path.join(EMOJI_DIR, 'custom');
 const EMOJI_CUSTOM_JSON = path.join(__dirname, 'data', 'emoji', 'custom.json');
+const EMOJI_ORDER_JSON = path.join(__dirname, 'data', 'emoji', 'order.json');
+const EMOJI_RECYCLE_JSON = path.join(__dirname, 'data', 'emoji', 'recycle.json');
 fs.mkdirSync(EMOJI_REGULAR_DIR, { recursive: true });
 fs.mkdirSync(EMOJI_CUSTOM_DIR, { recursive: true });
+fs.mkdirSync(path.join(__dirname, 'data', 'emoji'), { recursive: true });
 
 // 自定义表情上传**独立的 multer 实例**：不能复用 APK 上传那个 200MB 限制的 upload，
 // 否则一张超大图就能把内存（memoryStorage）打爆。这里单独限 10MB。
@@ -1023,7 +1026,7 @@ async function buildEmojiCatalog() {
     if (emojiCatalogCache && (now - emojiCatalogCacheAt) < EMOJI_CATALOG_TTL) {
         return emojiCatalogCache;
     }
-    const regular = [];
+    let regular = [];
     try {
         const files = (await fs.promises.readdir(EMOJI_REGULAR_DIR)).filter(f => f.toLowerCase().endsWith('.png'));
         for (const f of files) {
@@ -1031,7 +1034,7 @@ async function buildEmojiCatalog() {
         }
     } catch (e) { console.warn('[emoji] 扫描 regular 失败:', e.message); }
 
-    const superList = [];
+    let superList = [];
     try {
         const manifestPath = path.join(LOTTIE_DIR, 'manifest.json');
         const manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8'));
@@ -1048,6 +1051,34 @@ async function buildEmojiCatalog() {
         custom = JSON.parse(await fs.promises.readFile(EMOJI_CUSTOM_JSON, 'utf8') || '[]');
     } catch (e) { custom = []; }
 
+    // 应用管理页排序：order.json 存储每个 category 的显式 id 顺序
+    let order = {};
+    try { order = JSON.parse(await fs.promises.readFile(EMOJI_ORDER_JSON, 'utf8') || '{}'); } catch (e) {}
+    // 读取回收站：过滤掉已删除的表情（文件仍在磁盘，但不应出现在 catalog 中）
+    let recycleIds = { regular: new Set(), super: new Set(), custom: new Set() };
+    try {
+        const recycle = JSON.parse(await fs.promises.readFile(EMOJI_RECYCLE_JSON, 'utf8') || '{}');
+        for (const cat of ['regular', 'super', 'custom']) {
+            if (Array.isArray(recycle[cat])) recycleIds[cat] = new Set(recycle[cat].map(e => e.id));
+        }
+    } catch (e) {}
+    // 先过滤回收站，再排序
+    const filterRecycle = (entries, cat) => entries.filter(e => !recycleIds[cat].has(e.id));
+    const applyOrder = (entries, orderedIds) => {
+        if (!Array.isArray(orderedIds) || orderedIds.length === 0) return entries;
+        const map = new Map(entries.map(e => [e.id, e]));
+        const result = [];
+        for (const id of orderedIds) { const e = map.get(id); if (e) { result.push(e); map.delete(id); } }
+        for (const e of map.values()) result.push(e); // order.json 未覆盖的追加到末尾
+        return result;
+    };
+    regular = filterRecycle(regular, 'regular');
+    superList = filterRecycle(superList, 'super');
+    custom = filterRecycle(custom, 'custom');
+    if (order.regular) regular = applyOrder(regular, order.regular);
+    if (order['super']) superList = applyOrder(superList, order['super']);
+    if (order.custom) custom = applyOrder(custom, order.custom);
+
     const catalog = { regular, super: superList, custom };
     emojiCatalogCache = catalog;
     emojiCatalogCacheAt = now;
@@ -1061,6 +1092,7 @@ app.get('/emoji/catalog', async (req, res) => {
         res.setHeader('Cache-Control', 'no-cache');
         res.json(catalog);
     } catch (e) {
+        console.error('[emoji] catalog 构建失败:', e.message, e.stack);
         res.status(500).json({ success: false, error: e.message });
     }
 });
@@ -1077,24 +1109,23 @@ app.post('/api/emoji/custom/upload', emojiUpload.single('emoji'), async (req, re
         if (!mime.startsWith('image/')) return res.status(400).json({ success: false, error: '仅支持图片文件' });
 
         const raw = sanitizeImageBuffer(req.file.buffer);
-        // ⚠️ 只有 **APNG（PNG + acTL）** 才能原样保留动画：
-        // 客户端解码器（ApngDecoder）仅支持 PNG/APNG，且本地文件固定按 `${id}.png` 命名。
-        // 若把 GIF 原样存成 .gif，客户端根本解不出来——**比"压成静态"更糟（直接显示不出来）**。
-        // 因此 GIF 仍走原有 Jimp 归一化（与本次改动前行为完全一致，无回归）；
-        // 待客户端支持 GIF 帧解码后再放开 GIF 动画。
+        // ⚠️ 只有 **APNG（PNG + acTL）** 与 **GIF（GIF87a/89a）** 能原样保留动画：
+        // - APNG：客户端 ApngDecoder 逐帧播放，本地按 `${id}.png` 落盘；
+        // - GIF：客户端 EmojiView 内置 Movie 解码播放（零依赖），本地按 `${id}.gif` 落盘；
+        // Jimp 只保留首帧，会把动画压成静态图，动图一律绕过 Jimp 原样落盘。体积已由 10MB 上限约束。
         const isGif = raw.length >= 3 && raw[0] === 0x47 && raw[1] === 0x49 && raw[2] === 0x46;
-        const animated = !isGif && isAnimatedImageBuffer(raw);
+        const animated = isGif || isAnimatedImageBuffer(raw);
         const id = 'c_' + crypto.randomBytes(6).toString('hex');
-        const fileName = `${id}.png`;
+        const fileName = isGif ? `${id}.gif` : `${id}.png`;
         const destPath = path.join(EMOJI_CUSTOM_DIR, fileName);
         fs.mkdirSync(EMOJI_CUSTOM_DIR, { recursive: true });
 
         if (animated) {
-            // 动图（APNG）：绝不能走 Jimp——Jimp 只保留首帧，会把动画压成静态图。
-            // 原样落盘保留全部帧，客户端据此逐帧播放。体积已由 10MB 上限约束。
+            // 动图（APNG/GIF）：绝不能走 Jimp——Jimp 只保留首帧，会把动画压成静态图。
+            // 原样落盘保留全部帧，客户端据此播放动画。
             fs.writeFileSync(destPath, raw);
         } else {
-            // 静态图 + GIF：按原逻辑归一化到 240×240（体积与显示一致，行为与改动前相同）
+            // 静态图：按原逻辑归一化到 240×240（体积与显示一致）
             const img = await Jimp.read(raw);
             img.cover(240, 240);
             await img.writeAsync(destPath);
@@ -1146,6 +1177,226 @@ app.post('/api/emoji/custom/upload', emojiUpload.single('emoji'), async (req, re
         console.error('[emoji] 自定义上传失败:', e);
         res.status(500).json({ success: false, error: '服务端处理失败: ' + e.message });
     }
+});
+
+// ==================== 表情包管理后台 API（/emoji/admin/*） ====================
+// 管理页 emoji-admin.html 使用，支持排序、删除（移入回收站）、恢复、上传新增、保存并通知客户端。
+// 鉴权：复用 requirePageAuthJson（与 /admin 设备管理页一致，需登录后台）。
+
+/** 读取回收站数据 { regular: [...], super: [...], custom: [...] } */
+async function readRecycleBin() {
+    try { return JSON.parse(await fs.promises.readFile(EMOJI_RECYCLE_JSON, 'utf8') || '{}'); }
+    catch (e) { return {}; }
+}
+
+/** 读取排序配置 { regular: [...ids], super: [...ids], custom: [...ids] } */
+async function readEmojiOrder() {
+    try { return JSON.parse(await fs.promises.readFile(EMOJI_ORDER_JSON, 'utf8') || '{}'); }
+    catch (e) { return {}; }
+}
+
+/** 超级表情 manifest 路径 */
+const LOTTIE_MANIFEST_PATH = path.join(LOTTIE_DIR, 'manifest.json');
+
+/** 获取管理状态：当前 catalog（含排序）+ 回收站 + 排序配置 */
+app.get('/emoji/admin/state', requirePageAuthJson, async (req, res) => {
+    try {
+        emojiCatalogCache = null; // 管理页强制刷新，跳过缓存
+        const catalog = await buildEmojiCatalog();
+        const recycle = await readRecycleBin();
+        const order = await readEmojiOrder();
+        res.json({ success: true, catalog, recycle, order });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
+ * 保存表情管理变更（批量操作）。
+ * Body: {
+ *   order: { regular: [...ids], super: [...ids], custom: [...ids] },  // 新排序
+ *   deleted: { regular: [...ids], super: [...ids], custom: [...ids] }, // 移入回收站
+ *   restored: { regular: [...ids], super: [...ids], custom: [...ids] } // 从回收站恢复
+ * }
+ * 保存后失效 catalog 缓存，广播 WebSocket 通知所有在线客户端增量更新。
+ */
+app.post('/emoji/admin/save', requirePageAuthJson, async (req, res) => {
+    try {
+        const { order, deleted, restored } = req.body || {};
+        const cats = ['regular', 'super', 'custom'];
+
+        // 1. 写排序配置
+        if (order && typeof order === 'object') {
+            const curOrder = await readEmojiOrder();
+            for (const cat of cats) {
+                if (Array.isArray(order[cat])) curOrder[cat] = order[cat].filter(id => typeof id === 'string');
+            }
+            safeWriteJSON(EMOJI_ORDER_JSON, curOrder);
+        }
+
+        // 2. 处理删除（移入回收站）和恢复（从回收站移回）
+        const recycle = await readRecycleBin();
+        for (const cat of cats) { if (!recycle[cat]) recycle[cat] = []; }
+
+        // 删除：从 active 集合移入回收站
+        if (deleted && typeof deleted === 'object') {
+            for (const cat of cats) {
+                const ids = Array.isArray(deleted[cat]) ? deleted[cat] : [];
+                if (ids.length === 0) continue;
+                // 获取当前 active 条目
+                emojiCatalogCache = null;
+                const catalog = await buildEmojiCatalog();
+                const activeMap = new Map(catalog[cat].map(e => [e.id, e]));
+                for (const id of ids) {
+                    const entry = activeMap.get(id);
+                    if (!entry) continue;
+                    recycle[cat].push({ ...entry, deletedAt: Date.now() });
+                    // 从物理文件层面：不删除文件，仅从 catalog 排序中排除
+                    // 对于 super：从 manifest 移除 id（去掉 s 前缀）
+                    // 对于 regular/custom：从 order 中排除即可（文件保留，回收站可恢复）
+                }
+                // super 需同步更新 manifest
+                if (cat === 'super') {
+                    try {
+                        const manifest = JSON.parse(await fs.promises.readFile(LOTTIE_MANIFEST_PATH, 'utf8'));
+                        const delNums = new Set(ids.map(id => String(id).replace(/^s/, '')));
+                        const newManifest = manifest.filter(x => !delNums.has(String(x)));
+                        safeWriteJSON(LOTTIE_MANIFEST_PATH, newManifest);
+                    } catch (e) { console.warn('[emoji-admin] 更新 manifest 失败:', e.message); }
+                }
+            }
+        }
+
+        // 恢复：从回收站移回 active 集合
+        if (restored && typeof restored === 'object') {
+            for (const cat of cats) {
+                const ids = Array.isArray(restored[cat]) ? restored[cat] : [];
+                if (ids.length === 0) continue;
+                const restoreSet = new Set(ids);
+                recycle[cat] = recycle[cat].filter(e => {
+                    if (!restoreSet.has(e.id)) return true;
+                    // 恢复到 active：super 需重新加入 manifest
+                    if (cat === 'super') {
+                        try {
+                            const manifest = JSON.parse(fs.readFileSync(LOTTIE_MANIFEST_PATH, 'utf8'));
+                            const num = String(e.id).replace(/^s/, '');
+                            if (!manifest.includes(num)) { manifest.push(num); manifest.sort((a, b) => Number(a) - Number(b)); }
+                            safeWriteJSON(LOTTIE_MANIFEST_PATH, manifest);
+                        } catch (err) { console.warn('[emoji-admin] 恢复 manifest 失败:', err.message); }
+                    }
+                    return false; // 从回收站移除
+                });
+            }
+        }
+
+        safeWriteJSON(EMOJI_RECYCLE_JSON, recycle);
+        emojiCatalogCache = null; // 失效缓存
+
+        // 3. 广播通知所有在线客户端增量更新
+        try {
+            if (typeof remoteAssist.broadcastEmojiCatalogUpdate === 'function') {
+                remoteAssist.broadcastEmojiCatalogUpdate();
+            }
+        } catch (e) { console.warn('[emoji-admin] 广播失败:', e.message); }
+
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[emoji-admin] 保存失败:', e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
+ * 上传新增表情（普通 PNG 或超级 Lottie JSON）。
+ * multipart: field "emoji" = 文件, field "category" = "regular" | "super", field "emojiId" = 自定义ID(可选)
+ * 自定义表情仍走 /api/emoji/custom/upload。
+ */
+app.post('/emoji/admin/upload', requirePageAuthJson, emojiUpload.single('emoji'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ success: false, error: '未收到文件' });
+        const category = req.body?.category || '';
+        const mime = req.file.mimetype || '';
+
+        if (category === 'regular') {
+            if (!mime.startsWith('image/')) return res.status(400).json({ success: false, error: '普通表情仅支持图片文件' });
+            const raw = sanitizeImageBuffer(req.file.buffer);
+            const isGif = raw.length >= 3 && raw[0] === 0x47 && raw[1] === 0x49 && raw[2] === 0x46;
+            const isPng = raw.length >= 4 && raw[0] === 0x89 && raw[1] === 0x50 && raw[2] === 0x4E && raw[3] === 0x47;
+            if (!isPng && !isGif) return res.status(400).json({ success: false, error: '仅支持 PNG/GIF' });
+            // 生成 ID：s + 递增数字，基于现有文件最大编号
+            const files = (await fs.promises.readdir(EMOJI_REGULAR_DIR)).filter(f => f.match(/^s(\d+)\.(png|gif)$/i));
+            const maxNum = files.reduce((m, f) => Math.max(m, parseInt(f.match(/^s(\d+)/)[1])), 0);
+            const id = `s${maxNum + 1}`;
+            const ext = isGif ? '.gif' : '.png';
+            const destPath = path.join(EMOJI_REGULAR_DIR, `${id}${ext}`);
+            if (isGif) {
+                fs.writeFileSync(destPath, raw);
+            } else {
+                const img = await Jimp.read(raw);
+                img.cover(240, 240);
+                await img.writeAsync(destPath);
+            }
+            const fileBuf = fs.readFileSync(destPath);
+            emojiCatalogCache = null;
+            res.json({ success: true, entry: { id, file: `/emoji/regular/${id}${ext}`, hash: emojiFileHash(fileBuf), size: fileBuf.length } });
+        } else if (category === 'super') {
+            if (!mime.includes('json') && !mime.includes('text')) return res.status(400).json({ success: false, error: '超级表情仅支持 Lottie JSON 文件' });
+            const jsonStr = req.file.buffer.toString('utf8');
+            let parsed;
+            try { parsed = JSON.parse(jsonStr); } catch (e) { return res.status(400).json({ success: false, error: '无效的 JSON 文件' }); }
+            // 生成 ID：基于现有 manifest 最大编号 +1
+            let manifest = [];
+            try { manifest = JSON.parse(await fs.promises.readFile(LOTTIE_MANIFEST_PATH, 'utf8')); } catch (e) { manifest = []; }
+            const maxNum = manifest.reduce((m, x) => Math.max(m, Number(x) || 0), 0);
+            const num = String(maxNum + 1);
+            const id = `s${num}`;
+            const destPath = path.join(LOTTIE_DIR, `${num}.json`);
+            fs.writeFileSync(destPath, jsonStr);
+            if (!manifest.includes(num)) { manifest.push(num); manifest.sort((a, b) => Number(a) - Number(b)); }
+            safeWriteJSON(LOTTIE_MANIFEST_PATH, manifest);
+            const fileBuf = fs.readFileSync(destPath);
+            emojiCatalogCache = null;
+            res.json({ success: true, entry: { id, file: `/lottie/${num}.json`, hash: emojiFileHash(fileBuf), size: fileBuf.length } });
+        } else {
+            return res.status(400).json({ success: false, error: 'category 必须为 regular 或 super' });
+        }
+    } catch (e) {
+        console.error('[emoji-admin] 上传失败:', e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/** 从回收站永久删除（物理删除文件） */
+app.post('/emoji/admin/destroy', requirePageAuthJson, async (req, res) => {
+    try {
+        const { category, ids } = req.body || {};
+        if (!['regular', 'super', 'custom'].includes(category) || !Array.isArray(ids)) {
+            return res.status(400).json({ success: false, error: '参数错误' });
+        }
+        const recycle = await readRecycleBin();
+        if (!recycle[category]) recycle[category] = [];
+        const destroySet = new Set(ids);
+        recycle[category] = recycle[category].filter(e => {
+            if (!destroySet.has(e.id)) return true;
+            // 物理删除文件
+            try {
+                const filePath = e.file.startsWith('/lottie/')
+                    ? path.join(LOTTIE_DIR, path.basename(e.file))
+                    : path.join(e.file.startsWith('/emoji/regular/') ? EMOJI_REGULAR_DIR : EMOJI_CUSTOM_DIR, path.basename(e.file));
+                if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+            } catch (err) { console.warn('[emoji-admin] 物理删除失败:', err.message); }
+            return false;
+        });
+        safeWriteJSON(EMOJI_RECYCLE_JSON, recycle);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 表情管理页面路由
+app.get('/emoji-admin', requirePageAuth, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'emoji-admin.html'));
 });
 
 /**

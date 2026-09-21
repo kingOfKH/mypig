@@ -149,11 +149,13 @@ const TRUST_CMD_PRICE = {
     lockScreen: 1,
     battery: 0,
     telemetry: 0,
-    // �6 个 interact type（每次消耗 0.1 积分）
+    // 6 个 interact type（每次消耗 0.1 积分）
     'interact.emoji': 0.1,
     'interact.msg': 0.1,
     'interact.draw': 0.1,
-
+    // APP 使用限制：app.list / app.restrict 均免积分（bypass 从被控端扣费，在 trust.cmd_ack 中单独处理）
+    'app.list': 0,
+    'app.restrict': 0,
 };
 const DEFAULT_TRUST_CMD_COST = 1;
 
@@ -326,6 +328,8 @@ const sessions = new Map();
 const pendingDisconnects = new Map();
 // deviceId -> { standby:Boolean, code:String }  被控端待命状态（授权录屏后常驻在线等待）
 const standbyMap = new Map();
+// 离线互动消息暂存：peerId -> [{ from, action, ts }]  对方离线时存此，上线后批量推送
+const pendingInteractMsgs = new Map();
 // 设备名统一由 device-registry 提供（持久化、跨体系唯一）；此处不再维护内存副本。
 // deviceId -> 信任对象集合  { "对方deviceId": { addedAt } }  持久化于 TRUST_FILE
 // 注意：信任边只存「关系」，不再冗余存对方名称——冗余副本正是历史"改名串号"bug 的温床。
@@ -836,6 +840,27 @@ function attach(httpServer) {
         // 通知信任对端：该设备已上线，控制端列表实时点亮
         notifyTrustPeers(deviceId);
 
+        // 离线互动消息补投：该设备离线期间暂存的 interact.* 消息，现在批量推送
+        if (pendingInteractMsgs.has(deviceId)) {
+            const pending = pendingInteractMsgs.get(deviceId);
+            pendingInteractMsgs.delete(deviceId);
+            logInfo(`[trust.cmd] 设备 ${deviceId.slice(-8)} 上线，补投 ${pending.length} 条离线互动消息`);
+            for (const msg of pending) {
+                let pCost = DEFAULT_TRUST_CMD_COST, pAdmin = false, pType = '';
+                try {
+                    const actObj = JSON.parse(msg.action || '{}');
+                    const t = actObj && actObj.type;
+                    if (t && TRUST_CMD_PRICE[t] != null) pCost = TRUST_CMD_PRICE[t];
+                    pAdmin = !!(actObj && actObj.admin);
+                    pType = t || '';
+                } catch (e) {}
+                relayTo(deviceId, { op: 'trust.cmd', payload: { peer: msg.from, action: msg.action } });
+                if (pCost > 0 && !pAdmin) {
+                    deduct(msg.from, pCost, 'trust.cmd:' + pType);
+                }
+            }
+        }
+
         // 设备重连恢复：若该设备参与的活动会话有宽限定时器，取消它，会话无缝继续
         for (const [sid, session] of sessions) {
             if (session.status === 'terminated') continue;
@@ -1265,25 +1290,7 @@ async function handleMessage(ws, m) {
             const payload = m.payload || {};
             const peerId = payload.peer;
             console.log(`[trust.cmd] === 入口: from=${deviceId} payload.peer=${peerId} hasAction=${!!payload.action} peerOnline=${!!(online.get(peerId) && online.get(peerId).size > 0)} controllerIdKnown=${!!payload.action}`);
-            const peerSet = online.get(peerId);
-            if (!peerSet || peerSet.size === 0) {
-                // 对方不在线，直接回执失败
-                console.log(`[trust.cmd] 被控端 ${peerId} 不在线，回执失败`);
-                relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: false, reason: '对方不在线' } });
-                break;
-            }
-            if (!isTrusted(deviceId, peerId)) {
-                console.log(`[trust.cmd] ${deviceId} 不信任 ${peerId}，回执失败`);
-                relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: false, reason: '非信任设备' } });
-                break;
-            }
-            // 透传给受控端（relayTo 按 deviceId 遍历其所有在线连接发送），
-            // 携来源 deviceId（控制端，写入 payload.peer）以便其回执；action 为编码后的 ActionJson 字符串
-            console.log(`[trust.cmd] 转发 -> 被控端 ${peerId} action=${(payload.action || '').slice(0, 80)}`);
-            // 计费：解析指令类型，于【转发送达】当下即扣费（控制端付费），而非等被控端回执。
-            // 语义对齐产品：只要消息成功发到对方设备（转发成功）就算发送成功，立即扣积分，
-            // 不再等对方已读/解锁才扣。被控端离线/非信任已在上面拦截（不转发=不计费）。
-            // 管理设备（admin=true）不消耗积分，豁免扣费。
+            // 解析指令类型（离线暂存 & 计费共用）
             let cmdCost = DEFAULT_TRUST_CMD_COST;
             let cmdAdmin = false;
             let cmdType = '';
@@ -1293,9 +1300,40 @@ async function handleMessage(ws, m) {
                 if (t && TRUST_CMD_PRICE[t] != null) cmdCost = TRUST_CMD_PRICE[t];
                 cmdAdmin = !!(actObj && actObj.admin);
                 cmdType = t || '';
+                // app.restrict 动态计费：cost = durationMin（每个 APP 的限制时长即消耗积分）
+                // 管理设备豁免（cmdAdmin=true 时 trust.cmd 分支不扣费）
+                if (cmdType === 'app.restrict' && actObj && actObj.text) {
+                    try {
+                        const restrictInfo = JSON.parse(actObj.text);
+                        cmdCost = restrictInfo.durationMin || 0;
+                    } catch (e2) { cmdCost = 0; }
+                }
             } catch (e) { cmdCost = DEFAULT_TRUST_CMD_COST; }
+            const peerSet = online.get(peerId);
+            if (!peerSet || peerSet.size === 0) {
+                // 互动类消息（interact.*）对方离线时暂存，等对方上线后批量推送
+                if (cmdType.startsWith('interact.')) {
+                    if (!pendingInteractMsgs.has(peerId)) pendingInteractMsgs.set(peerId, []);
+                    pendingInteractMsgs.get(peerId).push({ from: deviceId, action: payload.action, ts: Date.now() });
+                    console.log(`[trust.cmd] 对方离线，暂存互动消息 type=${cmdType} pending=${pendingInteractMsgs.get(peerId).length}`);
+                    relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: true, type: cmdType, reason: 'offline_stored' } });
+                } else {
+                    console.log(`[trust.cmd] 被控端 ${peerId} 不在线，回执失败`);
+                    relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: false, type: cmdType, reason: '对方不在线' } });
+                }
+                break;
+            }
+            if (!isTrusted(deviceId, peerId)) {
+                console.log(`[trust.cmd] ${deviceId} 不信任 ${peerId}，回执失败`);
+                relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: false, type: cmdType, reason: '非信任设备' } });
+                break;
+            }
+            // 透传给受控端（relayTo 按 deviceId 遍历其所有在线连接发送），
+            // 携来源 deviceId（控制端，写入 payload.peer）以便其回执；action 为编码后的 ActionJson 字符串
+            console.log(`[trust.cmd] 转发 -> 被控端 ${peerId} action=${(payload.action || '').slice(0, 80)}`);
             relayTo(peerId, { op: 'trust.cmd', payload: { peer: deviceId, action: payload.action } });
             // 转发即送达：立即扣费（回执分支不再扣，避免重复计费）
+
             if (cmdCost > 0 && !cmdAdmin) {
                 deduct(deviceId, cmdCost, 'trust.cmd:' + cmdType);
             }
@@ -1307,6 +1345,41 @@ async function handleMessage(ws, m) {
             const payload = m.payload || {};
             const controllerId = payload.peer;
             console.log(`[trust.cmd_ack] === 入口: from=${deviceId} controllerId=${controllerId} ok=${payload.ok} reason=${payload.reason || ''} url=${(payload.url || '').slice(0, 80)} isReal=${payload.isReal}`);
+            // ── APP 使用限制 bypass：被控端消耗积分提前结束限制 ──
+            // 从被控端（deviceId = 消息来源方）扣除 ceil(cost) 积分，回执 app.restrict.bypass.result
+            // 管理设备豁免（不扣费，直接回执成功）
+            if (payload.type === 'app.restrict.bypass' && payload.ok) {
+                try {
+                    const bypassInfo = JSON.parse(payload.extra || '{}');
+                    const cost = Math.ceil(bypassInfo.cost || 0);
+                    // 检查被控端是否为管理设备（管理设备 bypass 免积分）
+                    const myPoints = getPoints(deviceId);
+                    const isAdmin = myPoints && myPoints.isAdmin === true;
+                    if (isAdmin || cost <= 0) {
+                        // 管理设备或 cost=0：直接回执成功，不扣费
+                        console.log(`[bypass] 管理设备/免积分 deviceId=${deviceId.slice(-8)} cost=${cost}`);
+                        relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: deviceId, ok: true, type: 'app.restrict.bypass.result' } });
+                    } else if (myPoints.balance < cost) {
+                        // 余额不足
+                        console.log(`[bypass] 余额不足 deviceId=${deviceId.slice(-8)} balance=${myPoints.balance} cost=${cost}`);
+                        relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: deviceId, ok: false, type: 'app.restrict.bypass.result', reason: '积分不足，当前余额 ' + myPoints.balance } });
+                    } else {
+                        // 扣费并回执成功
+                        deduct(deviceId, cost, 'app.restrict.bypass:' + (bypassInfo.pkg || ''));
+                        console.log(`[bypass] 扣费成功 deviceId=${deviceId.slice(-8)} cost=${cost} pkg=${bypassInfo.pkg || ''}`);
+                        relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: deviceId, ok: true, type: 'app.restrict.bypass.result' } });
+                        // 仅被控端非管理设备且扣费成功时，通知控制端（管理设备 bypass 不通知）
+                        if (controllerId && controllerId !== deviceId) {
+                            const notifyMsg = bypassInfo.pkg ? `对方已消耗 ${cost} 积分提前结束使用限制` : '对方已提前结束使用限制';
+                            relayTo(controllerId, { op: 'trust.cmd_ack', payload: { peer: deviceId, ok: true, type: 'app.restrict.bypass.notify', reason: notifyMsg } });
+                        }
+                    }
+                } catch (e) {
+                    console.error('[bypass] 解析失败', e);
+                    relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: deviceId, ok: false, type: 'app.restrict.bypass.result', reason: '服务器处理失败' } });
+                }
+                break; // 不走通用 trust.cmd_ack 转发逻辑
+            }
             // 计费已在「转发送达」时完成（见 trust.cmd 分支），此处不再扣费，
             // 仅清理待扣费登记，避免内存泄漏。
             const costKey = controllerId + ':' + deviceId;

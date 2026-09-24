@@ -149,7 +149,7 @@ const TRUST_CMD_PRICE = {
     lockScreen: 1,
     battery: 0,
     telemetry: 0,
-    // 6 个 interact type（每次消耗 0.1 积分）
+    // 互动指令（interact.*，每次消耗 0.1 积分）：emoji / msg / draw
     'interact.emoji': 0.1,
     'interact.msg': 0.1,
     'interact.draw': 0.1,
@@ -1353,8 +1353,10 @@ async function handleMessage(ws, m) {
                     const bypassInfo = JSON.parse(payload.extra || '{}');
                     const cost = Math.ceil(bypassInfo.cost || 0);
                     // 检查被控端是否为管理设备（管理设备 bypass 免积分）
+                    // 注意：管理设备标记来自 admins.json（isAdmin()），不在 points 对象里，
+                    // 故不能用 myPoints.isAdmin（恒为 undefined），否则管理设备也会被扣费、通知也会发全。
                     const myPoints = getPoints(deviceId);
-                    const isAdmin = myPoints && myPoints.isAdmin === true;
+                    const isAdmin = isAdmin(deviceId);
                     if (isAdmin || cost <= 0) {
                         // 管理设备或 cost=0：直接回执成功，不扣费
                         console.log(`[bypass] 管理设备/免积分 deviceId=${deviceId.slice(-8)} cost=${cost}`);

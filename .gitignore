@@ -1,6 +1,12 @@
 # 信任设备异步操作状态（运行时生成，含历史结果，勿提交）
 data/remote/trust-op-store.json
-data/
+# 忽略 data/ 下所有运行时状态；用 data/*（只忽略内容、不忽略目录本身）以便下方能放开 data/emoji/
+data/*
+# 表情包管理状态（排序/回收站/自定义元数据）属于可版本化的内容配置，
+# 需随 git 同步到生产；仅放开 data/emoji/ 下的 json，不放开 data/ 其它运行时状态
+# （如 trust.json / sessions.json / points 等分片等机器私有状态）。
+!data/emoji/
+!data/emoji/*.json
 node_modules/
 .git/
 .env

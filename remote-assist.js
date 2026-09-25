@@ -1356,8 +1356,8 @@ async function handleMessage(ws, m) {
                     // 注意：管理设备标记来自 admins.json（isAdmin()），不在 points 对象里，
                     // 故不能用 myPoints.isAdmin（恒为 undefined），否则管理设备也会被扣费、通知也会发全。
                     const myPoints = getPoints(deviceId);
-                    const isAdmin = isAdmin(deviceId);
-                    if (isAdmin || cost <= 0) {
+                    const isAdminDevice = isAdmin(deviceId);
+                    if (isAdminDevice || cost <= 0) {
                         // 管理设备或 cost=0：直接回执成功，不扣费
                         console.log(`[bypass] 管理设备/免积分 deviceId=${deviceId.slice(-8)} cost=${cost}`);
                         relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: deviceId, ok: true, type: 'app.restrict.bypass.result' } });

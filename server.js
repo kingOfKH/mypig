@@ -11,6 +11,8 @@ const path = require('path');
 const http = require('http');
 const zlib = require('zlib');
 const remoteAssist = require('./remote-assist');
+// 超级表情静态缩略图渲染（rlottie wasm，与 APP 同引擎，可渲染 lottie-web 渲染为空白的 v5.12.x 文件）
+const { renderLottieThumb } = require('./lottieThumb.cjs');
 // 统一设备档案：全服务唯一的设备名权威存储（HTTP 体系与 WS 体系共用）
 const deviceRegistry = require('./device-registry');
 
@@ -810,6 +812,141 @@ app.post('/api/remote/snapshot/upload', (req, res) => {
     }
 });
 
+// ==================== 聊天图片：上传 / 静态托管 / 闪照回收站 ====================
+// 设计要点：
+// - 只传 URL 不传二进制（WS 通道的离线互动消息是内存暂存，不适合承载大图）；
+// - 客户端负责压缩（或按用户选择发原图），服务端**只做校验不重压缩**：
+//   既避免 jimp 处理大图时的内存/耗时尖峰，也让「原图」语义真正成立；
+// - 闪照不做物理删除：查看方查看完毕后调用 /api/chat/image/recycle 把文件**移动到回收站目录**，
+//   使其在 /chat_images 静态路由下再也取不到（用户层面不可再查看），服务端仍保留源文件备用。
+const CHAT_IMAGE_DIR = path.join(DATA_DIR, 'chat_images');
+const CHAT_IMAGE_RECYCLE_DIR = path.join(DATA_DIR, 'chat_images_recycle');
+fs.mkdirSync(CHAT_IMAGE_DIR, { recursive: true });
+fs.mkdirSync(CHAT_IMAGE_RECYCLE_DIR, { recursive: true });
+
+// 单图上限：略高于客户端「原图阈值 10MB」，给 EXIF/封装差异留余量
+const CHAT_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+const chatImageUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: CHAT_IMAGE_MAX_BYTES, files: 1 }
+});
+// 轻量滥用防护（同 IP 频率）
+const CHAT_IMAGE_RATE_WINDOW = 60 * 1000;
+const CHAT_IMAGE_RATE_MAX = 30;
+const chatImageHits = new Map();
+function chatImageUploadAllowed(ip) {
+    const now = Date.now();
+    const arr = (chatImageHits.get(ip) || []).filter(t => now - t < CHAT_IMAGE_RATE_WINDOW);
+    arr.push(now);
+    chatImageHits.set(ip, arr);
+    if (chatImageHits.size > 5000) chatImageHits.clear();
+    return arr.length <= CHAT_IMAGE_RATE_MAX;
+}
+
+// 静态托管：/chat_images/<deviceId>/<file>
+app.use('/chat_images', express.static(CHAT_IMAGE_DIR, {
+    setHeaders: (res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+    }
+}));
+
+function safeChatRelative(rel) {
+    // 仅允许 chat_images 目录下的相对路径，杜绝 ../ 目录穿越
+    const abs = path.resolve(CHAT_IMAGE_DIR, rel);
+    if (abs !== CHAT_IMAGE_DIR && !abs.startsWith(CHAT_IMAGE_DIR + path.sep)) return null;
+    return abs;
+}
+
+app.post('/api/chat/image/upload', chatImageUpload.single('image'), async (req, res) => {
+    try {
+        if (!chatImageUploadAllowed(req.ip || req.connection?.remoteAddress || 'unknown')) {
+            return res.status(429).json({ ok: false, reason: '上传过于频繁，请稍后再试' });
+        }
+        if (!req.file) return res.status(400).json({ ok: false, reason: '未收到图片' });
+        const mime = req.file.mimetype || '';
+        if (!mime.startsWith('image/')) return res.status(400).json({ ok: false, reason: '仅支持图片文件' });
+
+        const deviceId = String(req.body?.deviceId || req.query?.deviceId || 'unknown')
+            .replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64) || 'unknown';
+        const buf = req.file.buffer;
+        if (!buf || buf.length === 0) return res.status(400).json({ ok: false, reason: '图片数据为空' });
+
+        // 动图（GIF / APNG）原样落盘，保持动画；静态图与 JPEG 同样原样落盘（客户端已完成压缩决策）
+        const ext = mime === 'image/gif' ? 'gif'
+            : mime === 'image/png' ? 'png'
+                : mime === 'image/webp' ? 'webp' : 'jpg';
+        const dir = path.join(CHAT_IMAGE_DIR, deviceId);
+        fs.mkdirSync(dir, { recursive: true });
+        const fileName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+        fs.writeFileSync(path.join(dir, fileName), buf);
+        const url = `/chat_images/${deviceId}/${fileName}`;
+        console.log(`[chat.image] 上传 device=${deviceId} size=${buf.length} mime=${mime} url=${url}`);
+        res.json({ ok: true, url, size: buf.length });
+    } catch (e) {
+        console.error('[chat.image] 上传失败:', e);
+        res.status(500).json({ ok: false, reason: '服务端保存失败: ' + e.message });
+    }
+});
+
+// 闪照回收：把已查看的闪照从 chat_images 移到 chat_images_recycle（保留目录结构）。
+// 语义：用户层面不可再查看（静态路由下 404），服务端仍保留源文件，便于后续功能复用。
+app.post('/api/chat/image/recycle', express.json({ limit: '1mb' }), (req, res) => {
+    try {
+        const rawUrl = String(req.body?.url || '');
+        const marker = '/chat_images/';
+        const idx = rawUrl.indexOf(marker);
+        if (idx < 0) return res.status(400).json({ ok: false, reason: '非聊天图片地址' });
+        const rel = rawUrl.substring(idx + marker.length).split('?')[0];
+        const abs = safeChatRelative(rel);
+        if (!abs) return res.status(400).json({ ok: false, reason: '非法图片地址' });
+        if (!fs.existsSync(abs)) {
+            // 已被回收过（或已清理）：视为成功，保证客户端状态机可收敛
+            return res.json({ ok: true, recycled: false, reason: '文件已不存在' });
+        }
+        const relDir = path.dirname(rel);
+        const destDir = path.join(CHAT_IMAGE_RECYCLE_DIR, relDir === '.' ? '' : relDir);
+        fs.mkdirSync(destDir, { recursive: true });
+        const dest = path.join(destDir, path.basename(rel));
+        fs.renameSync(abs, dest);
+        console.log(`[chat.image] 闪照回收 ${rel}`);
+        res.json({ ok: true, recycled: true });
+    } catch (e) {
+        console.error('[chat.image] 回收失败:', e);
+        res.status(500).json({ ok: false, reason: '回收失败: ' + e.message });
+    }
+});
+
+// 过期清理：普通聊天图 30 天、回收站 90 天（回收站保留更久，便于追溯/恢复）
+const CHAT_IMAGE_TTL_MS = 30 * 24 * 3600 * 1000;
+const CHAT_IMAGE_RECYCLE_TTL_MS = 90 * 24 * 3600 * 1000;
+function cleanupOldFiles(dir, ttlMs) {
+    if (!fs.existsSync(dir)) return;
+    const now = Date.now();
+    const walk = (d) => {
+        let entries = [];
+        try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+        for (const ent of entries) {
+            const p = path.join(d, ent.name);
+            if (ent.isDirectory()) { walk(p); continue; }
+            try {
+                const st = fs.statSync(p);
+                if (now - st.mtimeMs > ttlMs) fs.unlinkSync(p);
+            } catch (e) { /* 忽略单个文件清理失败 */ }
+        }
+    };
+    walk(dir);
+}
+const chatImageCleanupTimer = setInterval(() => {
+    cleanupOldFiles(CHAT_IMAGE_DIR, CHAT_IMAGE_TTL_MS);
+    cleanupOldFiles(CHAT_IMAGE_RECYCLE_DIR, CHAT_IMAGE_RECYCLE_TTL_MS);
+}, 6 * 3600 * 1000);
+if (chatImageCleanupTimer.unref) chatImageCleanupTimer.unref();
+setTimeout(() => {
+    cleanupOldFiles(CHAT_IMAGE_DIR, CHAT_IMAGE_TTL_MS);
+    cleanupOldFiles(CHAT_IMAGE_RECYCLE_DIR, CHAT_IMAGE_RECYCLE_TTL_MS);
+}, 30 * 1000);
+
 // 静态托管：/clipboards/<deviceId>/<file> 可直接访问（远程协助-获取实时剪切板内容）
 app.use('/clipboards', (req, res, next) => {
     console.log(`[clipboard.get] ${req.method} ${req.originalUrl}`);
@@ -834,6 +971,7 @@ app.use('/avatars', express.static(AVATAR_DIR, {
 // 资源位于 public/qqface-lottie/，由 scripts/build-lottie.js 从 QFace 仓库生成：
 //   /lottie/manifest.json  列出所有可用表情 id（数字串数组）
 //   /lottie/{id}.json      对应表情的 Lottie 矢量动画
+//   /lottie/{id}.tgs       Telegram 动图贴纸（= gzip 压缩的 Lottie JSON），与 .json 等价，客户端下载后就地解压
 // 免鉴权（与 /snapshots、/avatars 一致），并对客户端开放。
 const LOTTIE_DIR = path.join(__dirname, 'public', 'qqface-lottie');
 app.use('/lottie', express.static(LOTTIE_DIR, {
@@ -956,9 +1094,10 @@ fs.mkdirSync(path.join(__dirname, 'data', 'emoji'), { recursive: true });
 // 自定义表情上传**独立的 multer 实例**：不能复用 APK 上传那个 200MB 限制的 upload，
 // 否则一张超大图就能把内存（memoryStorage）打爆。这里单独限 10MB。
 const EMOJI_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+const MAX_EMOJI_BATCH = 50; // 单次批量上传文件数上限（与下方 emojiUpload.array 保持一致）
 const emojiUpload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: EMOJI_UPLOAD_MAX_BYTES, files: 1 }
+    limits: { fileSize: EMOJI_UPLOAD_MAX_BYTES, files: MAX_EMOJI_BATCH }
 });
 
 // 自定义表情总条数上限（全员共享，防止无限增长撑爆磁盘并拖慢 catalog）
@@ -1021,6 +1160,38 @@ async function buildFileEntry(dirPath, publicPrefix, id, fileName) {
     return { id, file: `${publicPrefix}/${fileName}`, hash, size: st.size };
 }
 
+/**
+ * 超级表情条目构造：同时支持 .json（Lottie 矢量）与 .tgs（Telegram 动图 = gzip 压缩的 Lottie JSON）。
+ * 关键约定：无论源是 .json 还是 .tgs，catalog 返回的 `hash`/`size` 一律基于「解压后的 Lottie JSON」，
+ * 这样客户端无需感知格式——下载后把 .tgs 就地 gunzip 成 {id}.json 落盘，增量比对（hash+size）逻辑完全不变。
+ * `file` 字段如实返回 /lottie/{id}.json 或 /lottie/{id}.tgs，客户端据此决定是否解压。
+ */
+async function buildSuperEntry(id) {
+    const jsonPath = path.join(LOTTIE_DIR, `${id}.json`);
+    const tgsPath = path.join(LOTTIE_DIR, `${id}.tgs`);
+    let absPath, publicFile, isTgs = false;
+    if (fs.existsSync(jsonPath)) {
+        absPath = jsonPath; publicFile = `${id}.json`;
+    } else if (fs.existsSync(tgsPath)) {
+        absPath = tgsPath; publicFile = `${id}.tgs`; isTgs = true;
+    } else {
+        return null;
+    }
+    const st = await fs.promises.stat(absPath);
+    const cached = emojiFileMetaCache.get(absPath);
+    let hash = (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) ? cached.hash : null;
+    const raw = await fs.promises.readFile(absPath);
+    const logicalBuf = isTgs ? zlib.gunzipSync(raw) : raw; // tgs 解压得到 Lottie JSON 字节
+    if (!hash) {
+        hash = emojiFileHash(logicalBuf);
+        // 缓存同时记 logicalSize（解压后大小），命中缓存时免二次解压；size 字段仍用物理大小做失效判定
+        emojiFileMetaCache.set(absPath, { mtimeMs: st.mtimeMs, size: st.size, hash, logicalSize: logicalBuf.length });
+    }
+    const logicalSize = cached?.logicalSize ?? logicalBuf.length;
+    // size 返回「解压后 Lottie JSON」大小，与 hash 语义一致（客户端据此做落盘校验/增量比对）
+    return { id: `s${id}`, file: `/lottie/${publicFile}`, hash, size: logicalSize, format: isTgs ? 'tgs' : 'json' };
+}
+
 async function buildEmojiCatalog() {
     const now = Date.now();
     if (emojiCatalogCache && (now - emojiCatalogCacheAt) < EMOJI_CATALOG_TTL) {
@@ -1042,7 +1213,8 @@ async function buildEmojiCatalog() {
             // 白名单：manifest 若被污染（含 ../ 等）会导致路径穿越，这里先规范化
             const id = String(rawId).replace(/[^0-9a-zA-Z_-]/g, '');
             if (!id) continue;
-            superList.push(await buildFileEntry(LOTTIE_DIR, '/lottie', `s${id}`, `${id}.json`));
+            const entry = await buildSuperEntry(id);
+            if (entry) superList.push(entry);
         }
     } catch (e) { console.warn('[emoji] 扫描 super 失败:', e.message); }
 
@@ -1311,55 +1483,91 @@ app.post('/emoji/admin/save', requirePageAuthJson, async (req, res) => {
  * multipart: field "emoji" = 文件, field "category" = "regular" | "super", field "emojiId" = 自定义ID(可选)
  * 自定义表情仍走 /api/emoji/custom/upload。
  */
-app.post('/emoji/admin/upload', requirePageAuthJson, emojiUpload.single('emoji'), async (req, res) => {
+app.post('/emoji/admin/upload', requirePageAuthJson, emojiUpload.array('emoji', MAX_EMOJI_BATCH), async (req, res) => {
     try {
-        if (!req.file) return res.status(400).json({ success: false, error: '未收到文件' });
+        const files = req.files;
+        if (!files || files.length === 0) return res.status(400).json({ success: false, error: '未收到文件' });
         const category = req.body?.category || '';
-        const mime = req.file.mimetype || '';
-
-        if (category === 'regular') {
-            if (!mime.startsWith('image/')) return res.status(400).json({ success: false, error: '普通表情仅支持图片文件' });
-            const raw = sanitizeImageBuffer(req.file.buffer);
-            const isGif = raw.length >= 3 && raw[0] === 0x47 && raw[1] === 0x49 && raw[2] === 0x46;
-            const isPng = raw.length >= 4 && raw[0] === 0x89 && raw[1] === 0x50 && raw[2] === 0x4E && raw[3] === 0x47;
-            if (!isPng && !isGif) return res.status(400).json({ success: false, error: '仅支持 PNG/GIF' });
-            // 生成 ID：s + 递增数字，基于现有文件最大编号
-            const files = (await fs.promises.readdir(EMOJI_REGULAR_DIR)).filter(f => f.match(/^s(\d+)\.(png|gif)$/i));
-            const maxNum = files.reduce((m, f) => Math.max(m, parseInt(f.match(/^s(\d+)/)[1])), 0);
-            const id = `s${maxNum + 1}`;
-            const ext = isGif ? '.gif' : '.png';
-            const destPath = path.join(EMOJI_REGULAR_DIR, `${id}${ext}`);
-            if (isGif) {
-                fs.writeFileSync(destPath, raw);
-            } else {
-                const img = await Jimp.read(raw);
-                img.cover(240, 240);
-                await img.writeAsync(destPath);
-            }
-            const fileBuf = fs.readFileSync(destPath);
-            emojiCatalogCache = null;
-            res.json({ success: true, entry: { id, file: `/emoji/regular/${id}${ext}`, hash: emojiFileHash(fileBuf), size: fileBuf.length } });
-        } else if (category === 'super') {
-            if (!mime.includes('json') && !mime.includes('text')) return res.status(400).json({ success: false, error: '超级表情仅支持 Lottie JSON 文件' });
-            const jsonStr = req.file.buffer.toString('utf8');
-            let parsed;
-            try { parsed = JSON.parse(jsonStr); } catch (e) { return res.status(400).json({ success: false, error: '无效的 JSON 文件' }); }
-            // 生成 ID：基于现有 manifest 最大编号 +1
-            let manifest = [];
-            try { manifest = JSON.parse(await fs.promises.readFile(LOTTIE_MANIFEST_PATH, 'utf8')); } catch (e) { manifest = []; }
-            const maxNum = manifest.reduce((m, x) => Math.max(m, Number(x) || 0), 0);
-            const num = String(maxNum + 1);
-            const id = `s${num}`;
-            const destPath = path.join(LOTTIE_DIR, `${num}.json`);
-            fs.writeFileSync(destPath, jsonStr);
-            if (!manifest.includes(num)) { manifest.push(num); manifest.sort((a, b) => Number(a) - Number(b)); }
-            safeWriteJSON(LOTTIE_MANIFEST_PATH, manifest);
-            const fileBuf = fs.readFileSync(destPath);
-            emojiCatalogCache = null;
-            res.json({ success: true, entry: { id, file: `/lottie/${num}.json`, hash: emojiFileHash(fileBuf), size: fileBuf.length } });
-        } else {
+        if (category !== 'regular' && category !== 'super') {
             return res.status(400).json({ success: false, error: 'category 必须为 regular 或 super' });
         }
+        const entries = [];
+        const errors = [];
+
+        if (category === 'regular') {
+            const existing = (await fs.promises.readdir(EMOJI_REGULAR_DIR)).filter(f => f.match(/^s(\d+)\.(png|gif)$/i));
+            let maxNum = existing.reduce((m, f) => Math.max(m, parseInt(f.match(/^s(\d+)/)[1])), 0);
+            for (const file of files) {
+                const mime = file.mimetype || '';
+                if (!mime.startsWith('image/')) { errors.push({ name: file.originalname, error: '仅支持图片文件' }); continue; }
+                const raw = sanitizeImageBuffer(file.buffer);
+                const isGif = raw.length >= 3 && raw[0] === 0x47 && raw[1] === 0x49 && raw[2] === 0x46;
+                const isPng = raw.length >= 4 && raw[0] === 0x89 && raw[1] === 0x50 && raw[2] === 0x4E && raw[3] === 0x47;
+                if (!isPng && !isGif) { errors.push({ name: file.originalname, error: '仅支持 PNG/GIF' }); continue; }
+                maxNum += 1;
+                const id = `s${maxNum}`;
+                const ext = isGif ? '.gif' : '.png';
+                const destPath = path.join(EMOJI_REGULAR_DIR, `${id}${ext}`);
+                if (isGif) {
+                    fs.writeFileSync(destPath, raw);
+                } else {
+                    const img = await Jimp.read(raw);
+                    img.cover(240, 240);
+                    await img.writeAsync(destPath);
+                }
+                const fileBuf = fs.readFileSync(destPath);
+                entries.push({ id, file: `/emoji/regular/${id}${ext}`, hash: emojiFileHash(fileBuf), size: fileBuf.length });
+            }
+        } else if (category === 'super') {
+            // 支持 .tgs（Telegram 动图 = gzip 压缩的 Lottie JSON）：解压后按 Lottie JSON 校验并落盘。
+            let manifest = [];
+            try { manifest = JSON.parse(await fs.promises.readFile(LOTTIE_MANIFEST_PATH, 'utf8')); } catch (e) { manifest = []; }
+            let maxNum = manifest.reduce((m, x) => Math.max(m, Number(x) || 0), 0);
+            for (const file of files) {
+                const mime = file.mimetype || '';
+                const lowerName = (file.originalname || '').toLowerCase();
+                const isTgs = lowerName.endsWith('.tgs') || (file.buffer[0] === 0x1f && file.buffer[1] === 0x8b);
+                let jsonStr;
+                try {
+                    jsonStr = isTgs ? zlib.gunzipSync(file.buffer).toString('utf8') : file.buffer.toString('utf8');
+                } catch (e) { const tgsTrunc = /unexpected end|end of file|not a gzip|incorrect header/i.test(e.message); errors.push({ name: file.originalname, error: '无效的 TGS 文件（gzip 解压失败，需为 gzip 压缩的 Lottie JSON' + (tgsTrunc ? '，文件可能被截断/不完整' : '') + '）' }); continue; }
+                if (!isTgs && !mime.includes('json') && !mime.includes('text')) { errors.push({ name: file.originalname, error: '超级表情仅支持 Lottie JSON / TGS 文件' }); continue; }
+                try {
+                    JSON.parse(jsonStr);
+                } catch (e) {
+                    const truncated = /end of (json|input)/i.test(e.message);
+                    const kind = isTgs ? 'TGS 解压后的 Lottie JSON' : 'Lottie JSON';
+                    const hint = truncated ? '（文件可能被截断或不完整）' : '（不是合法 JSON）';
+                    errors.push({ name: file.originalname, error: `无效的 ${kind}${hint}` });
+                    continue;
+                }
+                maxNum += 1;
+                const num = String(maxNum);
+                const id = `s${num}`;
+                // 统一以 .tgs 落盘：tgs 上传保留原始 gzip 字节；json 上传自动 gzip 压缩后保存，减小传输体积
+                // （与 buildSuperEntry 的探测逻辑一致：catalog 只认 .tgs，客户端下载后再解压渲染）。
+                const destPath = path.join(LOTTIE_DIR, `${num}.tgs`);
+                const outBytes = isTgs ? file.buffer : zlib.gzipSync(Buffer.from(jsonStr, 'utf8'));
+                fs.writeFileSync(destPath, outBytes);
+                if (!manifest.includes(num)) manifest.push(num);
+                // 返回解压后 Lottie JSON 的 hash/size（与 buildSuperEntry 语义一致），前端即时显示无需等下次预拉取
+                const logicalBuf = Buffer.from(jsonStr, 'utf8');
+                entries.push({ id, file: `/lottie/${num}.tgs`, hash: emojiFileHash(logicalBuf), size: logicalBuf.length, format: 'tgs' });
+            }
+            manifest.sort((a, b) => Number(a) - Number(b));
+            safeWriteJSON(LOTTIE_MANIFEST_PATH, manifest);
+        }
+        emojiCatalogCache = null;
+        // 批量上传：返回 entries（成功列表）与 errors（失败明细），前端据此报告「成功 N / 失败 M」
+        res.json({
+            success: entries.length > 0,
+            entries,
+            errors,
+            count: entries.length,
+            failCount: errors.length,
+            entry: entries[0] || null,
+            error: entries.length === 0 && errors.length ? (errors[0].error || '全部上传失败') : undefined
+        });
     } catch (e) {
         console.error('[emoji-admin] 上传失败:', e);
         res.status(500).json({ success: false, error: e.message });
@@ -1378,12 +1586,20 @@ app.post('/emoji/admin/destroy', requirePageAuthJson, async (req, res) => {
         const destroySet = new Set(ids);
         recycle[category] = recycle[category].filter(e => {
             if (!destroySet.has(e.id)) return true;
-            // 物理删除文件
+            // 物理删除文件：super 按编号解析（历史数据 file 可能是 .json，磁盘实为 .tgs），regular/custom 用 file 文件名
             try {
-                const filePath = e.file.startsWith('/lottie/')
-                    ? path.join(LOTTIE_DIR, path.basename(e.file))
-                    : path.join(e.file.startsWith('/emoji/regular/') ? EMOJI_REGULAR_DIR : EMOJI_CUSTOM_DIR, path.basename(e.file));
-                if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                if (category === 'super') {
+                    const num = String(e.id).replace(/^s/i, '');
+                    for (const ext of ['tgs', 'json']) {
+                        const fp = path.join(LOTTIE_DIR, `${num}.${ext}`);
+                        if (fs.existsSync(fp)) fs.unlinkSync(fp);
+                    }
+                } else {
+                    const base = path.basename(e.file || '');
+                    const dir = category === 'custom' ? EMOJI_CUSTOM_DIR : EMOJI_REGULAR_DIR;
+                    const fp = path.join(dir, base);
+                    if (fs.existsSync(fp)) fs.unlinkSync(fp);
+                }
             } catch (err) { console.warn('[emoji-admin] 物理删除失败:', err.message); }
             return false;
         });
@@ -1391,6 +1607,51 @@ app.post('/emoji/admin/destroy', requirePageAuthJson, async (req, res) => {
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 超级表情 Lottie JSON 代理：统一解压 .tgs 后返回 JSON，避免前端依赖 DecompressionStream
+// （该 API 仅限安全上下文，内网 http 访问时可能不可用，导致 .tgs 缩略图部分/全部渲染失败）。普通 .json 亦兼容。
+// 按编号解析并兼容历史数据：磁盘统一以 .tgs 存储，回收站里可能存在 .json 旧路径，两种扩展名都尝试。
+app.get('/emoji/lottie', (req, res) => {
+    try {
+        const file = String(req.query.file || '');
+        const m = file.match(/\/(\d+)\.(tgs|json)$/i);
+        if (!m) return res.status(400).json({ success: false, error: '非法的表情文件' });
+        const num = m[1];
+        const candidates = [`${num}.tgs`, `${num}.json`];
+        let abs = null;
+        for (const c of candidates) { const p = path.join(LOTTIE_DIR, c); if (fs.existsSync(p)) { abs = p; break; } }
+        if (!abs) return res.status(404).json({ success: false, error: '未找到表情文件' });
+        let buf = fs.readFileSync(abs);
+        if (abs.endsWith('.tgs')) {
+            try { buf = zlib.gunzipSync(buf); } catch (e) { return res.status(500).json({ success: false, error: 'TGS 解压失败' }); }
+        }
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'public, max-age=300');
+        res.send(buf);
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 超级表情静态缩略图：服务端用 rlottie（wasm，与 APP 同引擎）渲染一帧为 PNG。
+// 彻底绕开 lottie-web 在浏览器中对部分 v5.12.x 文件渲染空白的问题。
+// 失败（文件缺失 / 解析失败 / 渲染为空）返回 404，前端据此显示编号兜底。
+app.get('/emoji/thumb', async (req, res) => {
+    try {
+        const file = String(req.query.file || '');
+        const m = file.match(/\/(\d+)\.(tgs|json)$/i);
+        if (!m) return res.status(400).end();
+        const num = m[1];
+        const size = Math.min(512, Math.max(64, parseInt(req.query.size || '256', 10) || 256));
+        const png = await renderLottieThumb(num, size);
+        if (!png) return res.status(404).end();
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.end(png);
+    } catch (e) {
+        res.status(500).end();
     }
 });
 
@@ -1733,11 +1994,21 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
-    console.error('错误:', err);
-    res.status(500).json({
+    if (res.headersSent) return next(err);
+    // multer 限制类错误：换算成中文可读原因，避免前端只收到「服务器内部错误」
+    let status = err.status || 500;
+    let reason = err.message || '未知错误';
+    if (err.code === 'LIMIT_FILE_SIZE') {
+        reason = `单个文件过大（上限 ${Math.round(EMOJI_UPLOAD_MAX_BYTES / 1024 / 1024)}MB）`;
+    } else if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+        reason = `单次上传文件数量过多（最多 ${MAX_EMOJI_BATCH} 个）`;
+    }
+    console.error(`[server-error] ${req.method} ${req.originalUrl} -> ${reason}`);
+    if (err.stack) console.error(err.stack);
+    res.status(status).json({
         success: false,
-        error: '服务器内部错误',
-        message: err.message
+        error: reason,
+        message: err.message || reason
     });
 });
 

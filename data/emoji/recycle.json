@@ -591,34 +591,6 @@
   ],
   "super": [
     {
-      "id": "s394",
-      "file": "/lottie/394.json",
-      "hash": "13c523febaf455a52cad004c28aa6adb",
-      "size": 6467,
-      "deletedAt": 1789823607753
-    },
-    {
-      "id": "s421",
-      "file": "/lottie/421.json",
-      "hash": "f55eb772f637b68151ca58b9852e21c4",
-      "size": 12161,
-      "deletedAt": 1789823607753
-    },
-    {
-      "id": "s417",
-      "file": "/lottie/417.json",
-      "hash": "9d887feda49396fbe3a49f2437017c76",
-      "size": 7085,
-      "deletedAt": 1789823607753
-    },
-    {
-      "id": "s431",
-      "file": "/lottie/431.json",
-      "hash": "fd594ca6afe77604e90dcf76c6ea25c5",
-      "size": 3521,
-      "deletedAt": 1789823607753
-    },
-    {
       "id": "s466",
       "file": "/lottie/466.json",
       "hash": "2a1ee1f8f283f919e9b97d244ac2b311",

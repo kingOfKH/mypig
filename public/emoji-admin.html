@@ -60,7 +60,7 @@
   .emoji-item .checkmark { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 11px; display: none; align-items: center; justify-content: center; z-index: 2; }
   .emoji-item.selected .checkmark { display: flex; }
   .emoji-item.selected .order-num { display: none; }
-  .emoji-item img { width: 100%; height: 100%; object-fit: contain; padding: 6px; }
+  .emoji-item img, .emoji-item svg, .emoji-canvas svg, .hover-anim svg { width: 100%; height: 100%; object-fit: contain; padding: 6px; display: block; }
   .emoji-item .emoji-label { position: absolute; bottom: 2px; left: 2px; right: 2px; font-size: 9px; color: var(--text-muted); text-align: center; background: rgba(255,255,255,0.8); border-radius: 3px; padding: 1px 0; pointer-events: none; }
   .emoji-item .delete-x { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border-radius: 50%; background: var(--danger); color: #fff; font-size: 12px; display: none; align-items: center; justify-content: center; cursor: pointer; border: none; line-height: 1; }
   .emoji-item:hover .delete-x { display: flex; }
@@ -79,6 +79,9 @@
   .recycle-item .actions button { padding: 4px 8px; border: none; border-radius: 4px; font-size: 12px; cursor: pointer; font-family: var(--font); }
   .recycle-item .actions .restore { background: var(--success); color: #fff; }
   .recycle-item .actions .destroy { background: var(--danger); color: #fff; }
+  .recycle-item.selected { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 2px var(--accent); }
+  .recycle-grid.multi .actions { display: none; }
+  .recycle-item[data-selectable="1"] { cursor: pointer; }
 
   .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 100; display: none; align-items: center; justify-content: center; }
   .modal-mask.open { display: flex; }
@@ -152,6 +155,12 @@
       <span class="arrow">▼</span>
     </div>
     <div id="recycleContent" style="display:none;">
+      <div class="action-bar" style="margin-bottom:12px;">
+        <button class="btn" id="recycleMultiBtn">多选</button>
+        <button class="btn btn-primary" id="recycleRestoreSelBtn" style="display:none;">恢复选中</button>
+        <button class="btn btn-danger" id="recycleDestroySelBtn" style="display:none;">彻底删除选中</button>
+        <span class="count-badge" id="recycleSelCount" style="display:none;"></span>
+      </div>
       <div class="recycle-grid" id="recycleGrid"></div>
     </div>
   </div>
@@ -171,10 +180,10 @@
     <h2 id="uploadTitle">上传表情</h2>
     <div class="upload-area" id="uploadArea">
       <p>点击或拖拽文件到此处</p>
-      <p style="font-size:12px;margin-top:4px;">普通表情: PNG/GIF | 超级表情: Lottie JSON</p>
+      <p style="font-size:12px;margin-top:4px;">普通表情: PNG/GIF | 超级表情: Lottie JSON / TGS（可多选批量上传）</p>
       <div class="file-name" id="fileName"></div>
     </div>
-    <input type="file" id="fileInput" style="display:none;">
+    <input type="file" id="fileInput" multiple style="display:none;">
     <button class="btn btn-primary" id="uploadConfirmBtn" style="width:100%;margin-top:12px;justify-content:center;" disabled>确认上传</button>
     <button class="modal-close" id="uploadCloseBtn">取消</button>
   </div>
@@ -196,7 +205,7 @@ let state = { regular: [], super: [], custom: [] };
 let recycle = { regular: [], super: [], custom: [] };
 let currentCat = 'regular';
 let dirty = false;
-let pendingUpload = null;
+let pendingUploads = [];
 let recycleSelectSet = new Set();
 let lottieLoaded = false;
 let lottieInstances = new Map();
@@ -207,6 +216,8 @@ let pendingDeleted = { regular: [], super: [], custom: [] };
 let pendingRestored = { regular: [], super: [], custom: [] };
 let multiSelectMode = false;
 let selectedIds = new Set();
+let recycleMultiMode = false;
+let recycleSelectedIds = new Set();
 
 function toast(msg, type) {
   const el = document.createElement('div');
@@ -222,9 +233,10 @@ function emojiUrl(entry) {
 
 function emojiThumb(entry, cat) {
   if (cat === 'super') {
-    return `<div class="emoji-canvas" data-file="${entry.file}" style="width:100%;height:100%;"></div>`;
+    // 服务端用 rlottie（与 APP 同引擎）把 .tgs 渲染成静态 PNG，可正常显示 lottie-web 在浏览器中渲染空白的 v5.12.x 文件
+    return `<img class="lottie-thumb" src="/emoji/thumb?file=${encodeURIComponent(entry.file)}" loading="lazy" alt="${entry.id}" data-file="${entry.file}">`;
   }
-  return `<img src="${entry.file}" loading="lazy" alt="${entry.id}">`;
+  return `<img src="${entry.file}" loading="lazy" alt="${entry.id}" data-file="${entry.file}">`;
 }
 
 function renderGrid() {
@@ -244,7 +256,7 @@ function renderGrid() {
     bindDragEvents();
     bindDeleteButtons();
     if (multiSelectMode) bindSelectClicks();
-    if (currentCat === 'super') { renderLottieThumbs(); bindHoverPreview(); }
+    bindHoverPreview();
   }
   document.getElementById('countBadge').textContent = `${items.length} 个`;
 }
@@ -256,39 +268,54 @@ function destroyAllLottie() {
   document.querySelectorAll('.hover-anim').forEach(el => el.remove());
 }
 
+// 确保 lottie 脚本已加载（只加载一次），加载完成后回调 cb
+function ensureLottie(cb) {
+  if (typeof lottie !== 'undefined') { cb(); return; }
+  if (lottieLoaded) {
+    const t = setInterval(() => { if (typeof lottie !== 'undefined') { clearInterval(t); cb(); } }, 50);
+    return;
+  }
+  lottieLoaded = true;
+  const s = document.createElement('script');
+  s.src = 'https://unpkg.com/lottie-web@5.12.2/build/player/lottie.min.js';
+  s.onload = () => cb();
+  s.onerror = () => { lottieLoaded = false; console.error('[emoji-admin] lottie 脚本加载失败'); };
+  document.head.appendChild(s);
+}
+
 function renderLottieThumbs() {
   destroyAllLottie();
   if (lottieIO) { lottieIO.disconnect(); lottieIO = null; }
-  if (!lottieLoaded) {
-    const s = document.createElement('script');
-    s.src = 'https://unpkg.com/lottie-web@5.12.2/build/player/lottie.min.js';
-    s.onload = () => { lottieLoaded = true; doRenderLottieThumbs(); };
-    document.head.appendChild(s);
-  } else {
-    doRenderLottieThumbs();
-  }
+  ensureLottie(() => enqueueLottie(Array.from(document.querySelectorAll('#gridContainer .emoji-canvas'))));
 }
 
-function doRenderLottieThumbs() {
-  if (typeof lottie === 'undefined') return;
-  const canvases = document.querySelectorAll('.emoji-canvas');
-  if (canvases.length === 0) return;
-  lottieIO = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        renderSingleThumb(entry.target);
-        lottieIO.unobserve(entry.target);
-      }
-    });
-  }, { rootMargin: '200px' });
-  canvases.forEach(el => {
+// 顺序渲染队列：逐个加载 lottie 缩略图，避免一次性实例化过多导致卡顿；按 file 去重，已缓存的跳过。
+// 采用队列而非 IntersectionObserver，确保所有超级表情都能渲染出缩略图，不会出现「长期留空」的错觉。
+let lottieQueue = [];
+let lottieQueueBusy = false;
+function enqueueLottie(list) {
+  const pending = new Set(lottieQueue.map(el => el.dataset.file));
+  for (const el of list) {
+    if (!el.parentNode) continue;
     const file = el.dataset.file;
-    if (thumbCache.has(file)) {
-      replaceCanvasWithImg(el, thumbCache.get(file));
-    } else {
-      lottieIO.observe(el);
-    }
-  });
+    if (thumbCache.has(file)) { el.innerHTML = thumbCache.get(file); continue; }
+    if (!pending.has(file)) { lottieQueue.push(el); pending.add(file); }
+  }
+  if (!lottieQueueBusy) processLottieQueue();
+}
+function processLottieQueue() {
+  if (lottieQueue.length === 0) { lottieQueueBusy = false; return; }
+  lottieQueueBusy = true;
+  const el = lottieQueue.shift();
+  if (!el || !el.parentNode) { setTimeout(processLottieQueue, 0); return; }
+  renderSingleThumb(el, () => setTimeout(processLottieQueue, 0));
+}
+
+// 回收站 / 回收站选择弹窗里的超级表情缩略图：仅在容器可见时渲染（隐藏容器会令 lottie 初始化失败）
+function renderRecycleThumbs() {
+  const content = document.getElementById('recycleContent');
+  if (content && content.style.display === 'none') return;
+  ensureLottie(() => enqueueLottie(Array.from(document.querySelectorAll('#recycleGrid .emoji-canvas, #recycleSelectGrid .emoji-canvas'))));
 }
 
 function replaceCanvasWithImg(el, dataUrl) {
@@ -301,64 +328,102 @@ function replaceCanvasWithImg(el, dataUrl) {
   el.replaceWith(img);
 }
 
-function renderSingleThumb(el) {
+// 拉取 Lottie JSON：统一走 /emoji/lottie 代理（服务端负责解压 .tgs），避免前端依赖 DecompressionStream
+// （该 API 仅限安全上下文，内网 http 访问时可能不可用，导致 .tgs 缩略图渲染失败）。
+async function fetchLottieJson(file) {
+  const r = await fetch('/emoji/lottie?file=' + encodeURIComponent(file));
+  if (!r.ok) throw new Error('加载失败 ' + r.status);
+  return r.json();
+}
+
+// 渲染失败兜底：显示编号（如 s494），至少让用户认出是哪个表情包
+function showIdLabel(el, label) {
+  el.textContent = '';
+  const span = document.createElement('div');
+  span.textContent = label || '?';
+  span.style.cssText = 'width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#0D9488;background:#F0FDFA;border-radius:6px;line-height:1.1;text-align:center;';
+  el.appendChild(span);
+}
+
+// 渲染单个 super 缩略图：使用 SVG 渲染器（lottie-web 的 canvas 渲染器对部分 v5.12.x 文件
+// 整片空白；SVG 渲染器与 APP 原生渲染器兼容，能正常显示）。直接把 lottie 生成的「活 SVG」
+// 留在 DOM 当缩略图，不做 data URL 序列化（复杂 SVG 序列化的 data URL 会超长，导致 <img>
+// 加载失败 → 被误判成空白）。缓存保存渲染后的 SVG innerHTML。真无内容（0 图层 / 损坏 /
+// 解析失败）则显示编号。done 用于队列推进。
+function renderSingleThumb(el, done) {
   const file = el.dataset.file;
-  if (!el.parentNode) return;
-  fetch(file).then(r => r.json()).then(data => {
-    if (!el.parentNode) return;
-    const anim = lottie.loadAnimation({
-      container: el, renderer: 'canvas', loop: false, autoplay: false, animationData: data
-    });
+  const num = (file.match(/\/(\d+)\./) || [])[1];
+  const label = 's' + (num || '?');
+  const doneSafe = () => { if (done) done(); };
+  if (!el.parentNode) { doneSafe(); return; }
+  if (thumbCache.has(file)) { el.innerHTML = thumbCache.get(file); doneSafe(); return; }
+  fetchLottieJson(file).then(data => {
+    if (!el.parentNode) { doneSafe(); return; }
+    if (!data || !data.layers || data.layers.length === 0) { showIdLabel(el, label); doneSafe(); return; }
+    let anim;
+    try {
+      anim = lottie.loadAnimation({ container: el, renderer: 'svg', loop: false, autoplay: false, animationData: data });
+    } catch (e) { showIdLabel(el, label); doneSafe(); return; }
     lottieInstances.set(file, anim);
+    let finished = false, domLoaded = false;
+    const fail = () => {
+      if (finished) return; finished = true;
+      try { anim.destroy(); } catch (e) {}
+      lottieInstances.delete(file);
+      showIdLabel(el, label);
+      doneSafe();
+    };
     anim.addEventListener('DOMLoaded', () => {
-      anim.goToAndStop(0, true);
-      const canvas = el.querySelector('canvas');
-      if (canvas) {
-        try {
-          const dataUrl = canvas.toDataURL('image/png');
-          thumbCache.set(file, dataUrl);
-          anim.destroy();
+      domLoaded = true;
+      const total = anim.totalFrames || 1;
+      const frame = Math.max(1, Math.floor(total * 0.5)); // 中段帧：多数「弹出」动画此时已完全可见
+      anim.goToAndStop(frame, true);
+      requestAnimationFrame(() => {
+        if (finished) return;
+        const svg = el.querySelector('svg');
+        // 只要 SVG 含形状元素即认为可渲染（APP 已验证这些文件可正常渲染）
+        if (svg && svg.querySelector('path,g,ellipse,rect,circle,polygon,polyline,line')) {
+          finished = true;
+          const html = el.innerHTML; // 已渲染的静态 SVG
+          try { anim.destroy(); } catch (e) {}
           lottieInstances.delete(file);
-          replaceCanvasWithImg(el, dataUrl);
-        } catch(e) {}
-      }
+          thumbCache.set(file, html);
+          el.innerHTML = html; // destroy 会移除其 DOM，重新写入静态 SVG
+          doneSafe();
+        } else {
+          fail();
+        }
+      });
     });
-  }).catch(() => { el.textContent = '!'; });
+    // 兜底：个别动画不触发 DOMLoaded 时，4s 后强制收尾
+    setTimeout(() => { if (!domLoaded) fail(); }, 4000);
+  }).catch(() => { showIdLabel(el, label); doneSafe(); });
 }
 
 function bindHoverPreview() {
   const container = document.getElementById('gridContainer');
+  if (!container) return;
   container.onmouseover = (e) => {
     const item = e.target.closest('.emoji-item');
     if (!item) return;
-    const thumb = item.querySelector('.lottie-thumb, .emoji-canvas');
-    if (!thumb) return;
-    const file = thumb.dataset.file;
-    if (!file) return;
-    if (hoverAnim) { try { hoverAnim.destroy(); } catch(e){} hoverAnim = null; }
-    document.querySelectorAll('.hover-anim').forEach(el => el.remove());
+    const img = item.querySelector('img'); // 超级表情已是服务端渲染的 PNG，普通表情也是 <img>
+    if (!img || !img.src || item.querySelector('.hover-anim')) return;
     const overlay = document.createElement('div');
     overlay.className = 'hover-anim';
-    overlay.style.cssText = 'position:absolute;inset:0;z-index:1;pointer-events:none;';
+    overlay.style.cssText = 'position:absolute;inset:0;z-index:1;pointer-events:none;display:flex;align-items:center;justify-content:center;';
+    const big = document.createElement('img');
+    big.src = img.src;
+    big.style.cssText = 'width:90%;height:90%;object-fit:contain;filter:drop-shadow(0 2px 6px rgba(0,0,0,.25));';
+    overlay.appendChild(big);
     item.appendChild(overlay);
-    fetch(file).then(r => r.json()).then(data => {
-      if (!overlay.parentNode) return;
-      hoverAnim = lottie.loadAnimation({
-        container: overlay, renderer: 'canvas', loop: false, autoplay: true, animationData: data
-      });
-      hoverAnim.addEventListener('complete', () => {
-        if (hoverAnim) { try { hoverAnim.destroy(); } catch(e){} hoverAnim = null; }
-        overlay.remove();
-      });
-    });
   };
   container.onmouseout = (e) => {
     const item = e.target.closest('.emoji-item');
     if (!item) return;
     const related = e.relatedTarget;
     if (related && item.contains(related)) return;
-    if (hoverAnim) { try { hoverAnim.destroy(); } catch(e){} hoverAnim = null; }
-    document.querySelectorAll('.hover-anim').forEach(el => el.remove());
+    const ov = item.querySelector('.hover-anim');
+    if (ov) ov.remove();
   };
 }
 
@@ -467,16 +532,20 @@ function renderRecycle() {
   document.getElementById('recycleCount').textContent = items.length ? `(${items.length})` : '';
   if (items.length === 0) { section.style.display = 'none'; return; }
   section.style.display = 'block';
+  grid.className = 'recycle-grid' + (recycleMultiMode ? ' multi' : '');
   grid.innerHTML = items.map(e => `
-    <div class="recycle-item" data-id="${e.id}">
-      ${currentCat === 'super' ? '<div style="color:var(--text-muted);font-size:12px;">' + e.id + '</div>' : `<img src="${e.file}" alt="${e.id}">`}
-      <div class="actions">
+    <div class="recycle-item${recycleSelectedIds.has(e.id) ? ' selected' : ''}" data-id="${e.id}"${recycleMultiMode ? ' data-selectable="1"' : ''}>
+      ${currentCat === 'super'
+        ? `<img class="lottie-thumb" src="/emoji/thumb?file=${encodeURIComponent(e.file)}" loading="lazy" alt="${e.id}" data-file="${e.file}">`
+        : `<img src="${e.file}" alt="${e.id}" data-file="${e.file}">`}
+      ${recycleMultiMode ? '' : `<div class="actions">
         <button class="restore" data-id="${e.id}">恢复</button>
         <button class="destroy" data-id="${e.id}">删除</button>
-      </div>
+      </div>`}
     </div>`).join('');
   grid.querySelectorAll('.restore').forEach(btn => btn.addEventListener('click', () => restoreFromRecycle(btn.dataset.id)));
   grid.querySelectorAll('.destroy').forEach(btn => btn.addEventListener('click', () => destroyFromRecycle(btn.dataset.id)));
+  if (recycleMultiMode) bindRecycleSelectClicks();
 }
 
 function restoreFromRecycle(id) {
@@ -488,6 +557,8 @@ function restoreFromRecycle(id) {
   delete entry.deletedAt;
   state[currentCat].push(entry);
   if (!pendingRestored[currentCat].includes(id)) pendingRestored[currentCat].push(id);
+  recycleSelectedIds.delete(id);
+  updateRecycleSelCount();
   markDirty();
   renderGrid();
   renderRecycle();
@@ -496,18 +567,31 @@ function restoreFromRecycle(id) {
 
 function destroyFromRecycle(id) {
   if (!confirm(`永久删除 ${id}？文件将被物理删除，不可恢复！`)) return;
-  fetch('/emoji/admin/destroy', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ category: currentCat, ids: [id] })
-  }).then(r => r.json()).then(r => {
-    if (r.success) {
+  destroyManyFromRecycle([id]);
+}
+
+async function destroyManyFromRecycle(ids) {
+  if (!ids || ids.length === 0) return;
+  try {
+    const r = await fetch('/emoji/admin/destroy', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category: currentCat, ids })
+    });
+    const data = await r.json();
+    if (data.success) {
       const rArr = recycle[currentCat] || [];
-      const idx = rArr.findIndex(x => x.id === id);
-      if (idx >= 0) rArr.splice(idx, 1);
+      for (const id of ids) {
+        const idx = rArr.findIndex(x => x.id === id);
+        if (idx >= 0) rArr.splice(idx, 1);
+        recycleSelectedIds.delete(id);
+      }
+      updateRecycleSelCount();
       renderRecycle();
-      toast(`已永久删除: ${id}`, 'ok');
-    } else toast('删除失败: ' + (r.error || ''), 'err');
-  }).catch(() => toast('网络错误', 'err'));
+      toast(`已永久删除 ${ids.length} 个`, 'ok');
+    } else toast('删除失败: ' + (data.error || ''), 'err');
+  } catch (e) {
+    toast('网络错误: ' + (e.message || ''), 'err');
+  }
 }
 
 function markDirty() {
@@ -526,6 +610,7 @@ function switchCat(cat) {
   if (lottieIO) { lottieIO.disconnect(); lottieIO = null; }
   currentCat = cat;
   selectedIds.clear();
+  resetRecycleMulti();
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.cat === cat));
   renderGrid();
   renderRecycle();
@@ -597,31 +682,51 @@ function setupUpload() {
   input.addEventListener('change', handleFileSelected);
 
   function handleFileSelected() {
-    if (!input.files.length) { pendingUpload = null; confirmBtn.disabled = true; nameEl.textContent = ''; return; }
-    pendingUpload = input.files[0];
-    nameEl.textContent = pendingUpload.name + ` (${(pendingUpload.size / 1024).toFixed(1)} KB)`;
+    if (!input.files.length) { pendingUploads = []; confirmBtn.disabled = true; nameEl.textContent = ''; return; }
+    pendingUploads = Array.from(input.files);
+    if (pendingUploads.length === 1) {
+      const f = pendingUploads[0];
+      nameEl.textContent = f.name + ` (${(f.size / 1024).toFixed(1)} KB)`;
+    } else {
+      const totalKB = pendingUploads.reduce((s, f) => s + f.size, 0) / 1024;
+      nameEl.textContent = `已选 ${pendingUploads.length} 个文件（共 ${totalKB.toFixed(1)} KB）`;
+    }
     confirmBtn.disabled = false;
   }
 
   confirmBtn.addEventListener('click', async () => {
-    if (!pendingUpload) return;
+    if (!pendingUploads || !pendingUploads.length) return;
     const fd = new FormData();
-    fd.append('emoji', pendingUpload);
+    // 批量：同一字段名 'emoji' 追加多个文件，服务端以数组接收
+    pendingUploads.forEach(f => fd.append('emoji', f));
     fd.append('category', currentCat === 'custom' ? 'regular' : currentCat);
-    confirmBtn.disabled = true; confirmBtn.textContent = '上传中…';
+    confirmBtn.disabled = true; confirmBtn.textContent = `上传中…(${pendingUploads.length})`;
     try {
       const r = await fetch('/emoji/admin/upload', { method: 'POST', body: fd });
-      const data = await r.json();
-      if (data.success) {
-        state[currentCat].push(data.entry);
+      const text = await r.text();
+      let data;
+      try { data = JSON.parse(text); } catch (e) { throw new Error(`服务端返回异常（HTTP ${r.status}），请查看服务端日志`); }
+      if (data.success || (data.entries && data.entries.length)) {
+        (data.entries || []).forEach(e => state[currentCat].push(e));
         markDirty();
         renderGrid();
-        toast(`上传成功: ${data.entry.id}`, 'ok');
+        let msg = `上传成功 ${data.entries.length} 个`;
+        if (data.failCount) msg += `，失败 ${data.failCount} 个`;
+        if (data.errors && data.errors.length) {
+          const detail = data.errors.map(x => (x.name ? `${x.name}: ${x.error}` : x.error)).join('；');
+          msg += `（失败明细：${detail}）`;
+        }
+        toast(msg, data.failCount ? 'info' : 'ok');
         closeModal('uploadModal');
-        pendingUpload = null; nameEl.textContent = ''; confirmBtn.textContent = '确认上传';
-      } else throw new Error(data.error);
+        pendingUploads = []; input.value = ''; nameEl.textContent = ''; confirmBtn.textContent = '确认上传';
+      } else {
+        // 优先用逐文件失败原因；再看 error/message；最后兜底「上传失败」
+        const reason = (data.errors && data.errors[0] && data.errors[0].error)
+          || data.error || data.message || '上传失败';
+        throw new Error(reason);
+      }
     } catch (e) {
-      toast('上传失败: ' + e.message, 'err');
+      toast('上传失败: ' + (e.message || e), 'err');
       confirmBtn.textContent = '确认上传'; confirmBtn.disabled = false;
     }
   });
@@ -634,7 +739,7 @@ function showRecycleSelect() {
   if (items.length === 0) { toast('回收站为空', 'info'); return; }
   grid.innerHTML = items.map(e => `
     <div class="recycle-item" data-id="${e.id}" style="cursor:pointer;">
-      ${currentCat === 'super' ? '<div style="color:var(--text-muted);font-size:12px;">' + e.id + '</div>' : `<img src="${e.file}" alt="${e.id}">`}
+      ${currentCat === 'super' ? `<img class="lottie-thumb" src="/emoji/thumb?file=${encodeURIComponent(e.file)}" loading="lazy" alt="${e.id}" data-file="${e.file}">` : `<img src="${e.file}" alt="${e.id}" data-file="${e.file}">`}
     </div>`).join('');
   grid.querySelectorAll('.recycle-item').forEach(el => {
     el.addEventListener('click', () => {
@@ -664,10 +769,69 @@ document.getElementById('recycleSelectConfirmBtn').addEventListener('click', () 
 document.getElementById('recycleBtn').addEventListener('click', () => {
   const content = document.getElementById('recycleContent');
   const header = document.getElementById('recycleHeader');
-  if (content.style.display === 'none') { content.style.display = 'block'; header.classList.add('open'); }
+  if (content.style.display === 'none') { content.style.display = 'block'; header.classList.add('open'); renderRecycle(); }
   else { content.style.display = 'none'; header.classList.remove('open'); }
 });
 document.getElementById('recycleHeader').addEventListener('click', () => document.getElementById('recycleBtn').click());
+
+// ---------- 回收站多选 + 批量彻底删除 ----------
+document.getElementById('recycleMultiBtn').addEventListener('click', () => {
+  recycleMultiMode = !recycleMultiMode;
+  const btn = document.getElementById('recycleMultiBtn');
+  if (recycleMultiMode) {
+    btn.classList.add('btn-primary');
+    btn.textContent = '退出多选';
+  } else {
+    btn.classList.remove('btn-primary');
+    btn.textContent = '多选';
+    recycleSelectedIds.clear();
+  }
+  updateRecycleSelCount();
+  renderRecycle();
+});
+
+document.getElementById('recycleRestoreSelBtn').addEventListener('click', () => {
+  if (recycleSelectedIds.size === 0) return;
+  for (const id of Array.from(recycleSelectedIds)) restoreFromRecycle(id);
+  recycleSelectedIds.clear();
+  updateRecycleSelCount();
+});
+
+document.getElementById('recycleDestroySelBtn').addEventListener('click', () => {
+  if (recycleSelectedIds.size === 0) return;
+  const ids = Array.from(recycleSelectedIds);
+  if (!confirm(`永久删除选中的 ${ids.length} 个表情？文件将被物理删除，不可恢复！`)) return;
+  destroyManyFromRecycle(ids);
+});
+
+function updateRecycleSelCount() {
+  const show = recycleMultiMode && recycleSelectedIds.size > 0;
+  const badge = document.getElementById('recycleSelCount');
+  badge.style.display = show ? 'inline' : 'none';
+  badge.textContent = show ? `已选 ${recycleSelectedIds.size} 个` : '';
+  document.getElementById('recycleRestoreSelBtn').style.display = show ? 'inline-flex' : 'none';
+  document.getElementById('recycleDestroySelBtn').style.display = show ? 'inline-flex' : 'none';
+}
+
+function bindRecycleSelectClicks() {
+  document.querySelectorAll('#recycleGrid .recycle-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const id = item.dataset.id;
+      if (recycleSelectedIds.has(id)) recycleSelectedIds.delete(id);
+      else recycleSelectedIds.add(id);
+      item.classList.toggle('selected');
+      updateRecycleSelCount();
+    });
+  });
+}
+
+function resetRecycleMulti() {
+  recycleMultiMode = false;
+  recycleSelectedIds.clear();
+  const btn = document.getElementById('recycleMultiBtn');
+  if (btn) { btn.classList.remove('btn-primary'); btn.textContent = '多选'; }
+  updateRecycleSelCount();
+}
 
 document.getElementById('multiSelectBtn').addEventListener('click', () => {
   multiSelectMode = !multiSelectMode;

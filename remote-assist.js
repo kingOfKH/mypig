@@ -154,6 +154,8 @@ const TRUST_CMD_PRICE = {
     'interact.msg': 0.1,
     'interact.draw': 0.1,
     'interact.image': 0.1,
+    // 消息撤回：免费（QQ 同款，撤回不扣积分）
+    'recall': 0,
     // APP 使用限制：app.list / app.restrict 均免积分（bypass 从被控端扣费，在 trust.cmd_ack 中单独处理）
     'app.list': 0,
     'app.restrict': 0,

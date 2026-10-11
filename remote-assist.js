@@ -843,6 +843,13 @@ function attach(httpServer) {
         // 通知信任对端：该设备已上线，控制端列表实时点亮
         notifyTrustPeers(deviceId);
 
+        // 表情 catalog 引导同步：设备连接建立（含服务端重启后的自动重连）即单发一次通知，
+        // 客户端收到后调用 EmojiCatalog.preload() 做 hash 增量同步（无变更时仅一次 catalog 拉取，零文件下载）。
+        // 背景：管理页保存会走 broadcastEmojiCatalogUpdate 全量广播，但「直接改表情文件+重启服务端」
+        // 没有这条路径，客户端只能等冷启动 preload；重启瞬间客户端尚未重连，启动时广播会落空，
+        // 故改为连接建立时逐连接单发（客户端侧有 mutex 合并与 5s 节流，多连接重复通知无害）。
+        try { ws.send(JSON.stringify({ op: 'emoji.catalog.update', payload: { ts: Date.now() } })); } catch (e) {}
+
         // 离线互动消息补投：该设备离线期间暂存的 interact.* 消息，现在批量推送
         if (pendingInteractMsgs.has(deviceId)) {
             const pending = pendingInteractMsgs.get(deviceId);

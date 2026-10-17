@@ -496,12 +496,15 @@ apiRouter.get('/admin/status', (req, res) => {
 // 管理页：已注册设备列表（含 admin 标记），需后台页面登录
 apiRouter.get('/admin/devices', requireAdminToken, requirePageAuthJson, (req, res) => {
     const devices = deviceRegistry.listAll();
+    const admins = remoteAssist.getAllAdmins();
     const list = devices.map(d => ({
         deviceId: d.deviceId,
         deviceName: d.deviceName || '',
         createdAt: d.createdAt || '',
         lastActiveAt: d.lastActiveAt || '',
         isAdmin: remoteAssist.isAdmin(d.deviceId),
+        // 「允许 APP 内自切换」：开启后该设备可长按远程设备标题直接修改自己的管理标记
+        allowSelfSwitch: !!(admins[d.deviceId] && admins[d.deviceId].allowSelfSwitch),
         points: remoteAssist.getPoints(d.deviceId).balance,
     }));
     res.json({ success: true, devices: list, total: list.length });
@@ -513,6 +516,14 @@ apiRouter.post('/admin/device', requireAdminToken, requirePageAuthJson, (req, re
     if (!deviceId) return res.status(400).json({ success: false, error: '缺少 deviceId' });
     remoteAssist.setAdmin(deviceId, isAdmin === true || isAdmin === 'true', 'admin_page');
     res.json({ success: true, deviceId, isAdmin: remoteAssist.isAdmin(deviceId) });
+});
+
+// 管理页：开启/关闭设备的「允许 APP 内自切换」，需后台页面登录
+apiRouter.post('/admin/device/self-switch', requireAdminToken, requirePageAuthJson, (req, res) => {
+    const { deviceId, allow } = req.body || {};
+    if (!deviceId) return res.status(400).json({ success: false, error: '缺少 deviceId' });
+    remoteAssist.setSelfSwitchAllowed(deviceId, allow === true || allow === 'true');
+    res.json({ success: true, deviceId, allowSelfSwitch: remoteAssist.isSelfSwitchAllowed(deviceId) });
 });
 
 // 管理页：查询指定设备的积分余额与变动明细（含后台调整备注），需后台页面登录
@@ -780,10 +791,11 @@ app.use('/snapshots', express.static(SNAPSHOT_DIR, {
     }
 }));
 
-// 被控端上传快照（base64 JSON，零额外依赖）：{ deviceId, peerId, data, ext }
+// 被控端上传快照（base64 JSON，零额外依赖）：{ deviceId, peerId, data, ext, prefix }
+// prefix：snap=截图快照（默认）/ cam=拍照照片，用于资产管理页分类展示
 app.post('/api/remote/snapshot/upload', (req, res) => {
     try {
-        const { deviceId, data, ext } = req.body || {};
+        const { deviceId, data, ext, prefix } = req.body || {};
         if (!deviceId || !data) {
             res.status(400).json({ ok: false, reason: '缺少 deviceId 或 data' });
             return;
@@ -799,7 +811,8 @@ app.post('/api/remote/snapshot/upload', (req, res) => {
         if (!fs.existsSync(deviceDir)) fs.mkdirSync(deviceDir, { recursive: true });
         const ts = Date.now();
         const extension = (ext === 'png') ? 'png' : 'jpg';
-        const fileName = `snap_${ts}.${extension}`;
+        const safePrefix = (prefix === 'cam') ? 'cam' : 'snap';
+        const fileName = `${safePrefix}_${ts}.${extension}`;
         const filePath = path.join(deviceDir, fileName);
         fs.writeFileSync(filePath, buf);
         // 返回相对路径，由客户端用其 baseUrl 拼接完整访问地址
@@ -996,6 +1009,166 @@ app.get('/publish', requirePageAuth, (req, res) => {
 // 便捷路由：浏览器访问 /admin 直接打开管理人员页
 app.get('/admin', requirePageAuth, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
+// 便捷路由：浏览器访问 /assets-admin 直接打开服务端资产管理页（快照/拍照/聊天图片）
+app.get('/assets-admin', requirePageAuth, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'assets-admin.html'));
+});
+
+// ==================== 服务端资产内容管理（assets-admin.html 使用） ====================
+// 分类：snapshot(截图快照 snap_*) / photo(拍照照片 cam_*) / chat(聊天图片) / chat_recycle(闪照回收站)
+// 说明：快照与拍照共用 snapshots 目录，靠文件名前缀区分（历史无 cam_ 前缀的文件归入截图快照）；
+//      聊天图片/闪照回收站有 TTL 自动清理，但管理页仍提供即时清理入口。
+// 鉴权：requirePageAuthJson（与 /admin、/emoji-admin 一致，需登录后台）。
+const ASSET_KIND_ROOTS = {
+    snapshot: SNAPSHOT_DIR,
+    photo: SNAPSHOT_DIR,
+    chat: CHAT_IMAGE_DIR,
+    chat_recycle: CHAT_IMAGE_RECYCLE_DIR,
+};
+
+/** kind + 相对路径 → 绝对路径；严格防目录穿越（resolve 后必须仍在该类目根目录内） */
+function assetAbsPath(kind, relPath) {
+    const root = ASSET_KIND_ROOTS[kind];
+    if (!root || !relPath) return null;
+    const abs = path.resolve(root, String(relPath));
+    if (abs !== root && !abs.startsWith(root + path.sep)) return null;
+    return abs;
+}
+
+/** 扫描全部类目资产文件（含设备子目录两级结构），按修改时间倒序 */
+function listAssetItems() {
+    const items = [];
+    // 快照目录：<设备>/<文件>，按文件名前缀分类（cam_=拍照照片，其余=截图快照）
+    if (fs.existsSync(SNAPSHOT_DIR)) {
+        for (const dev of fs.readdirSync(SNAPSHOT_DIR)) {
+            const devDir = path.join(SNAPSHOT_DIR, dev);
+            let st; try { st = fs.statSync(devDir); } catch (_) { continue; }
+            if (!st.isDirectory()) continue;
+            for (const f of fs.readdirSync(devDir)) {
+                let st2; try { st2 = fs.statSync(path.join(devDir, f)); } catch (_) { continue; }
+                if (!st2.isFile()) continue;
+                items.push({
+                    kind: f.startsWith('cam_') ? 'photo' : 'snapshot',
+                    device: dev, name: f, relPath: `${dev}/${f}`,
+                    url: `/snapshots/${encodeURIComponent(dev)}/${encodeURIComponent(f)}`,
+                    size: st2.size, mtime: st2.mtimeMs,
+                });
+            }
+        }
+    }
+    // 聊天图片 / 闪照回收站：<设备>/<文件>，结构一致；回收站无静态路由（已回收不可查看），仅清理
+    for (const [kind, root] of [['chat', CHAT_IMAGE_DIR], ['chat_recycle', CHAT_IMAGE_RECYCLE_DIR]]) {
+        if (!fs.existsSync(root)) continue;
+        for (const dev of fs.readdirSync(root)) {
+            const devDir = path.join(root, dev);
+            let st; try { st = fs.statSync(devDir); } catch (_) { continue; }
+            if (!st.isDirectory()) continue;
+            for (const f of fs.readdirSync(devDir)) {
+                let st2; try { st2 = fs.statSync(path.join(devDir, f)); } catch (_) { continue; }
+                if (!st2.isFile()) continue;
+                items.push({
+                    kind, device: dev, name: f, relPath: `${dev}/${f}`,
+                    url: kind === 'chat' ? `/chat_images/${encodeURIComponent(dev)}/${encodeURIComponent(f)}` : '',
+                    size: st2.size, mtime: st2.mtimeMs,
+                });
+            }
+        }
+    }
+    return items.sort((a, b) => b.mtime - a.mtime);
+}
+
+// 资产列表 + 分类统计
+app.get('/api/admin/assets/list', requirePageAuthJson, (req, res) => {
+    try {
+        const items = listAssetItems();
+        const stats = { total: { count: items.length, size: 0 }, byKind: {} };
+        for (const it of items) {
+            stats.total.size += it.size;
+            const k = stats.byKind[it.kind] || (stats.byKind[it.kind] = { count: 0, size: 0 });
+            k.count++; k.size += it.size;
+        }
+        res.json({ success: true, items, stats });
+    } catch (e) {
+        res.status(500).json({ success: false, error: '扫描资产失败: ' + e.message });
+    }
+});
+
+// 资产删除（多选）：items = [{ kind, relPath }]；返回成功数与失败清单
+app.post('/api/admin/assets/delete', requirePageAuthJson, (req, res) => {
+    try {
+        const list = Array.isArray(req.body && req.body.items) ? req.body.items : [];
+        if (list.length === 0) return res.status(400).json({ success: false, error: '缺少删除项' });
+        let deleted = 0;
+        const failed = [];
+        for (const it of list) {
+            const abs = assetAbsPath(it.kind, it.relPath);
+            if (!abs || !fs.existsSync(abs)) { failed.push(String(it.relPath || '?')); continue; }
+            try { fs.unlinkSync(abs); deleted++; }
+            catch (e) { failed.push(String(it.relPath || '?')); }
+        }
+        console.log(`[assets] 删除 ${deleted} 个资产文件（失败 ${failed.length}）`);
+        res.json({ success: true, deleted, failed });
+    } catch (e) {
+        res.status(500).json({ success: false, error: '删除失败: ' + e.message });
+    }
+});
+
+// 资产单文件下载
+app.get('/api/admin/assets/download', requirePageAuthJson, (req, res) => {
+    const abs = assetAbsPath(req.query.kind, req.query.path || '');
+    if (!abs || !fs.existsSync(abs)) return res.status(404).json({ success: false, error: '文件不存在' });
+    res.download(abs, path.basename(abs));
+});
+
+// 资产预览（管理页 <img>/灯箱使用）：闪照回收站类目无公开静态路由（回收后 APP 端不可查看是产品语义），
+// 经此接口走后台会话鉴权输出图片字节——管理页可预览，但不为回收站开放公开访问。
+const ASSET_PREVIEW_MIME = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp',
+};
+/** 文件头魔法数嗅探（兜底）：扩展名缺失/异常时按字节特征判图片类型 */
+function sniffImageMime(buf) {
+    if (buf.length >= 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'image/jpeg';
+    if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'image/png';
+    if (buf.length >= 6 && buf.slice(0, 3).toString('ascii') === 'GIF') return 'image/gif';
+    if (buf.length >= 12 && buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+    return null;
+}
+app.get('/api/admin/assets/preview', requirePageAuthJson, (req, res) => {
+    const abs = assetAbsPath(req.query.kind, req.query.path || '');
+    if (!abs || !fs.existsSync(abs)) return res.status(404).json({ success: false, error: '文件不存在' });
+    const buf = fs.readFileSync(abs);
+    // 优先按扩展名判 MIME，失败则按文件头魔法数嗅探（保证无扩展名文件也可预览）
+    const mime = ASSET_PREVIEW_MIME[path.extname(abs).toLowerCase()] || sniffImageMime(buf);
+    if (!mime) return res.status(415).json({ success: false, error: '不支持的图片格式' });
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Cache-Control', 'no-cache');
+    res.send(buf);
+});
+
+// 资产批量下载（zip 打包；AdmZip 纯 JS 实现零原生依赖）
+app.post('/api/admin/assets/download-zip', requirePageAuthJson, (req, res) => {
+    try {
+        const list = Array.isArray(req.body && req.body.items) ? req.body.items : [];
+        if (list.length === 0) return res.status(400).json({ success: false, error: '缺少下载项' });
+        const zip = new AdmZip();
+        const used = new Set();
+        for (const it of list) {
+            const abs = assetAbsPath(it.kind, it.relPath);
+            if (!abs || !fs.existsSync(abs)) continue;
+            let entry = `${it.kind}/${it.relPath}`;
+            if (used.has(entry)) entry = `${it.kind}/${Date.now()}_${it.relPath}`;
+            used.add(entry);
+            zip.addLocalFile(abs, path.dirname(entry), path.basename(entry));
+        }
+        if (zip.getEntries().length === 0) return res.status(400).json({ success: false, error: '没有可下载的文件' });
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Disposition', `attachment; filename="starclick_assets_${Date.now()}.zip"`);
+        res.send(zip.toBuffer());
+    } catch (e) {
+        res.status(500).json({ success: false, error: '打包失败: ' + e.message });
+    }
 });
 // 最新安装包不再单独放在根目录 starclick.apk，统一由 /updates 目录承载，
 // 通过 /api/app/download/:versionCode 路由下载（见下方接口）。

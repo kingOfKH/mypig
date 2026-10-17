@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#f6f7f9">
+<title>StarClick · 服务端资产管理</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --surface: #ffffff; --surface-hover: #f8f9fb;
+    --border: rgba(0,0,0,0.06); --border-strong: rgba(0,0,0,0.1);
+    --text: #0f1115; --text-secondary: #525866; --text-muted: #8b909a;
+    --accent: #5b5bf6; --accent-hover: #4848e0; --accent-soft: #eef0ff;
+    --success: #22c55e; --danger: #ef4444; --danger-soft: #fef2f2;
+    --radius-xl: 20px; --radius-lg: 16px; --radius-md: 12px; --radius-sm: 8px;
+    --shadow-card: 0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.03);
+    --shadow-card-hover: 0 4px 16px rgba(0,0,0,0.06), 0 8px 24px rgba(0,0,0,0.04);
+    --shadow-btn: 0 2px 8px rgba(91,91,246,0.25);
+    --font: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body { font-family: var(--font); min-height: 100vh; color: var(--text); -webkit-font-smoothing: antialiased; line-height: 1.5; padding: 0 24px calc(48px + env(safe-area-inset-bottom)); background: var(--bg); }
+
+  .topbar { position: sticky; top: 0; z-index: 40; margin: 0 -24px 32px; padding: calc(14px + env(safe-area-inset-top)) 24px 14px; background: rgba(246,247,249,0.92); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border-bottom: 1px solid var(--border); }
+  .topbar-inner { max-width: 1100px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo { width: 36px; height: 36px; border-radius: 10px; background: var(--accent); color: #fff; font-weight: 700; font-size: 15px; display: flex; align-items: center; justify-content: center; }
+  .brand-text .t { font-size: 16px; font-weight: 600; }
+  .brand-text .s { font-size: 12px; color: var(--text-muted); }
+  .nav-btns { display: flex; gap: 8px; }
+  .nav-btn { padding: 8px 16px; border-radius: var(--radius-sm); text-decoration: none; font-size: 14px; font-weight: 500; color: var(--text-secondary); background: var(--surface); border: 1px solid var(--border); transition: all .15s; }
+  .nav-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 24px; font-weight: 700; margin-bottom: 20px; }
+
+  /* 统计卡 */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .stat-card { background: var(--surface); border-radius: var(--radius-lg); padding: 14px 18px; box-shadow: var(--shadow-card); }
+  .stat-card .label { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
+  .stat-card .value { font-size: 20px; font-weight: 700; }
+  .stat-card .sub { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+
+  .tabs { display: flex; gap: 4px; margin-bottom: 20px; background: var(--surface); border-radius: var(--radius-md); padding: 4px; box-shadow: var(--shadow-card); flex-wrap: wrap; }
+  .tab { flex: 1; min-width: 120px; padding: 10px 16px; border: none; background: none; border-radius: var(--radius-sm); font-size: 14px; font-weight: 500; color: var(--text-secondary); cursor: pointer; transition: all .15s; font-family: var(--font); white-space: nowrap; }
+  .tab.active { background: var(--accent); color: #fff; }
+  .tab:not(.active):hover { background: var(--surface-hover); }
+
+  .action-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+  .btn { padding: 8px 18px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 14px; font-weight: 500; cursor: pointer; transition: all .15s; font-family: var(--font); display: inline-flex; align-items: center; gap: 6px; }
+  .btn:hover { background: var(--surface-hover); border-color: var(--border-strong); }
+  .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); box-shadow: var(--shadow-btn); }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-danger { color: var(--danger); }
+  .btn-danger:hover { background: var(--danger-soft); border-color: var(--danger); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .action-spacer { flex: 1; }
+  .count-badge { font-size: 13px; color: var(--text-muted); }
+
+  /* 资产网格 */
+  .asset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .asset-item { position: relative; background: var(--surface); border: 2px solid transparent; border-radius: var(--radius-md); overflow: hidden; cursor: pointer; transition: all .15s; box-shadow: var(--shadow-card); }
+  .asset-item:hover { border-color: var(--accent); box-shadow: var(--shadow-card-hover); }
+  .asset-item.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+  .asset-item .thumb { width: 100%; aspect-ratio: 4 / 3; background: var(--surface-hover); display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .asset-item .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .asset-item .thumb .no-preview { color: var(--text-muted); font-size: 12px; text-align: center; padding: 8px; }
+  .asset-item .checkmark { position: absolute; top: 6px; left: 6px; width: 20px; height: 20px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 12px; display: none; align-items: center; justify-content: center; z-index: 2; box-shadow: 0 1px 4px rgba(0,0,0,0.2); }
+  .asset-item.selected .checkmark { display: flex; }
+  .asset-item .meta { padding: 8px 10px 10px; }
+  .asset-item .meta .name { font-size: 12px; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .asset-item .meta .info { font-size: 11px; color: var(--text-muted); margin-top: 2px; display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+  .asset-item .meta .dl { border: none; background: none; color: var(--accent); font-size: 11px; cursor: pointer; padding: 2px 4px; font-family: var(--font); flex-shrink: 0; }
+  .asset-item .meta .dl:hover { text-decoration: underline; }
+  .asset-item .device-tag { position: absolute; top: 6px; right: 6px; font-size: 10px; padding: 2px 7px; border-radius: 999px; background: rgba(0,0,0,0.45); color: #fff; z-index: 2; max-width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .empty { text-align: center; padding: 64px 0; color: var(--text-muted); font-size: 14px; }
+  .loading { text-align: center; padding: 64px 0; color: var(--text-muted); font-size: 14px; }
+
+  /* 灯箱预览 */
+  .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.82); z-index: 100; display: flex; align-items: center; justify-content: center; padding: 32px; cursor: zoom-out; }
+  .lightbox img { max-width: 100%; max-height: 100%; border-radius: var(--radius-md); box-shadow: 0 8px 40px rgba(0,0,0,0.5); }
+  .lightbox .cap { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); color: #fff; font-size: 13px; background: rgba(0,0,0,0.5); padding: 6px 14px; border-radius: 999px; }
+
+  /* 确认对话框 */
+  .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 90; display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .modal { background: var(--surface); border-radius: var(--radius-lg); padding: 24px; max-width: 380px; width: 100%; box-shadow: 0 8px 40px rgba(0,0,0,0.18); }
+  .modal h3 { font-size: 16px; margin-bottom: 10px; }
+  .modal p { font-size: 14px; color: var(--text-secondary); margin-bottom: 20px; }
+  .modal .btns { display: flex; gap: 10px; justify-content: flex-end; }
+
+  .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--text); color: #fff; padding: 10px 20px; border-radius: 999px; font-size: 13px; z-index: 120; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .toast.show { opacity: .95; }
+</style>
+</head>
+<body>
+<div class="topbar"><div class="topbar-inner">
+  <div class="brand">
+    <div class="logo">SC</div>
+    <div class="brand-text"><div class="t">服务端资产管理</div><div class="s">快照 / 拍照 / 聊天图片 · 空间占用与清理</div></div>
+  </div>
+  <div class="nav-btns">
+    <a class="nav-btn" href="/admin">设备管理</a>
+    <a class="nav-btn" href="/emoji-admin">表情包管理</a>
+    <a class="nav-btn" href="/publish">发布页</a>
+  </div>
+</div></div>
+
+<div class="wrap">
+  <h1>服务端资产内容管理</h1>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="tabs" id="tabs"></div>
+
+  <div class="action-bar">
+    <button class="btn" id="btnSelectAll">全选当前筛选</button>
+    <button class="btn" id="btnClearSel">清除选择</button>
+    <span class="action-spacer"></span>
+    <span class="count-badge" id="selCount">已选 0 项 · 0 B</span>
+    <button class="btn" id="btnDownload" disabled>打包下载</button>
+    <button class="btn btn-danger" id="btnDelete" disabled>删除所选</button>
+    <button class="btn" id="btnReload">刷新</button>
+  </div>
+
+  <div id="content" class="loading">加载中…</div>
+</div>
+
+<div class="lightbox" id="lightbox" style="display:none" onclick="this.style.display='none'">
+  <img id="lightboxImg" alt="">
+  <div class="cap" id="lightboxCap"></div>
+</div>
+
+<div class="modal-mask" id="confirmMask" style="display:none">
+  <div class="modal">
+    <h3>删除所选资产</h3>
+    <p id="confirmText"></p>
+    <div class="btns">
+      <button class="btn" onclick="hideConfirm()">取消</button>
+      <button class="btn btn-danger" id="confirmOk">确认删除</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const KIND_LABEL = { snapshot: '截图快照', photo: '拍照照片', chat: '聊天图片', chat_recycle: '闪照回收站' };
+let allItems = [];
+let stats = null;
+let curTab = 'all';
+const selected = new Map(); // key = kind|relPath → item
+
+function fmtSize(bytes) {
+  if (!bytes || bytes <= 0) return '0 B';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+function fmtTime(ms) {
+  if (!ms) return '';
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._timer); t._timer = setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+async function load() {
+  const el = document.getElementById('content');
+  el.className = 'loading'; el.textContent = '扫描服务端资产中…';
+  try {
+    const resp = await fetch('/api/admin/assets/list');
+    const data = await resp.json();
+    if (!data.success) throw new Error(data.error || '加载失败');
+    allItems = data.items; stats = data.stats;
+    renderStats(); renderTabs(); render();
+  } catch (e) {
+    el.className = 'empty'; el.textContent = '加载失败：' + e.message;
+  }
+}
+
+function renderStats() {
+  const box = document.getElementById('stats');
+  const t = stats.total;
+  let html = `<div class="stat-card"><div class="label">总占用</div><div class="value">${fmtSize(t.size)}</div><div class="sub">共 ${t.count} 个文件</div></div>`;
+  for (const kind of ['snapshot', 'photo', 'chat', 'chat_recycle']) {
+    const k = stats.byKind[kind] || { count: 0, size: 0 };
+    html += `<div class="stat-card"><div class="label">${KIND_LABEL[kind]}</div><div class="value">${fmtSize(k.size)}</div><div class="sub">${k.count} 个文件</div></div>`;
+  }
+  box.innerHTML = html;
+}
+
+function renderTabs() {
+  const tabs = document.getElementById('tabs');
+  const counts = { all: stats.total.count, ...Object.fromEntries(Object.keys(KIND_LABEL).map(k => [k, (stats.byKind[k] || {}).count || 0])) };
+  const defs = [['all', '全部'], ...Object.entries(KIND_LABEL)];
+  tabs.innerHTML = defs.map(([k, label]) =>
+    `<button class="tab ${curTab === k ? 'active' : ''}" onclick="switchTab('${k}')">${label}（${counts[k]}）</button>`
+  ).join('');
+}
+
+function switchTab(k) { curTab = k; renderTabs(); render(); }
+
+/** 灯箱预览大图（点击缩略图打开，点击遮罩关闭） */
+function openLightbox(src, cap) {
+  document.getElementById('lightboxImg').src = src;
+  document.getElementById('lightboxCap').textContent = cap;
+  document.getElementById('lightbox').style.display = 'flex';
+}
+
+function filteredItems() {
+  return curTab === 'all' ? allItems : allItems.filter(i => i.kind === curTab);
+}
+
+function render() {
+  const el = document.getElementById('content');
+  const items = filteredItems();
+  el.className = '';
+  if (items.length === 0) { el.className = 'empty'; el.textContent = '该分类下暂无资产文件'; return; }
+  el.innerHTML = '<div class="asset-grid">' + items.map(it => {
+    const key = it.kind + '|' + it.relPath;
+    const sel = selected.has(key);
+    // 预览源：有公开静态路由的类目直连 URL；闪照回收站走后台鉴权预览接口（<img> 自动携带登录 Cookie）
+    const previewSrc = it.url || `/api/admin/assets/preview?kind=${it.kind}&path=${encodeURIComponent(it.relPath)}`;
+    const thumb = `<div class="thumb" onclick="event.stopPropagation(); openLightbox('${previewSrc}', '${it.name} · ${fmtSize(it.size)}')">
+      <img src="${previewSrc}" loading="lazy" alt="">
+    </div>`;
+    return `<div class="asset-item ${sel ? 'selected' : ''}" data-key="${key}" onclick="toggleItem('${key}')">
+      ${thumb}
+      <div class="checkmark">✓</div>
+      <div class="device-tag">${it.device.slice(-6)}</div>
+      <div class="meta">
+        <div class="name" title="${it.name}">${it.name}</div>
+        <div class="info"><span>${fmtSize(it.size)} · ${fmtTime(it.mtime)}</span>
+          <button class="dl" onclick="event.stopPropagation(); downloadOne('${it.kind}', '${it.relPath}', '${it.name}')">下载</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('') + '</div>';
+}
+
+function toggleItem(key) {
+  const it = allItems.find(i => (i.kind + '|' + i.relPath) === key);
+  if (!it) return;
+  if (selected.has(key)) selected.delete(key); else selected.set(key, it);
+  const node = document.querySelector(`.asset-item[data-key="${CSS.escape(key)}"]`);
+  if (node) node.classList.toggle('selected', selected.has(key));
+  updateSelBadge();
+}
+
+function updateSelBadge() {
+  let size = 0; selected.forEach(i => size += i.size);
+  document.getElementById('selCount').textContent = `已选 ${selected.size} 项 · ${fmtSize(size)}`;
+  document.getElementById('btnDownload').disabled = selected.size === 0;
+  document.getElementById('btnDelete').disabled = selected.size === 0;
+}
+
+document.getElementById('btnSelectAll').onclick = () => {
+  for (const it of filteredItems()) selected.set(it.kind + '|' + it.relPath, it);
+  render(); updateSelBadge();
+};
+document.getElementById('btnClearSel').onclick = () => { selected.clear(); render(); updateSelBadge(); };
+
+document.getElementById('btnDownload').onclick = () => {
+  if (selected.size === 0) return;
+  const items = [...selected.values()].map(i => ({ kind: i.kind, relPath: i.relPath }));
+  fetch('/api/admin/assets/download-zip', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items })
+  }).then(r => {
+    if (!r.ok) return r.json().then(j => { throw new Error(j.error || '打包失败'); });
+    return r.blob();
+  }).then(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `starclick_assets_${Date.now()}.zip`;
+    a.click(); URL.revokeObjectURL(a.href);
+    toast('打包下载已开始');
+  }).catch(e => toast(e.message));
+};
+
+function downloadOne(kind, relPath, name) {
+  const a = document.createElement('a');
+  a.href = `/api/admin/assets/download?kind=${encodeURIComponent(kind)}&path=${encodeURIComponent(relPath)}`;
+  a.download = name; a.click();
+}
+
+let pendingDelete = [];
+document.getElementById('btnDelete').onclick = () => {
+  if (selected.size === 0) return;
+  pendingDelete = [...selected.keys()];
+  document.getElementById('confirmText').textContent =
+    `将永久删除 ${selected.size} 个资产文件（共 ${fmtSize([...selected.values()].reduce((s, i) => s + i.size, 0))}），删除后不可恢复。确认继续？`;
+  document.getElementById('confirmMask').style.display = 'flex';
+};
+function hideConfirm() { document.getElementById('confirmMask').style.display = 'none'; }
+document.getElementById('confirmOk').onclick = async () => {
+  const items = pendingDelete.map(k => { const i = selected.get(k); return { kind: i.kind, relPath: i.relPath }; });
+  document.getElementById('confirmOk').disabled = true;
+  try {
+    const resp = await fetch('/api/admin/assets/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items })
+    });
+    const data = await resp.json();
+    if (!data.success) throw new Error(data.error || '删除失败');
+    toast(`已删除 ${data.deleted} 个文件${data.failed.length ? `（失败 ${data.failed.length}）` : ''}`);
+    hideConfirm(); selected.clear(); updateSelBadge(); load();
+  } catch (e) {
+    toast(e.message);
+  } finally { document.getElementById('confirmOk').disabled = false; }
+};
+
+document.getElementById('btnReload').onclick = load;
+load();
+</script>
+</body>
+</html>

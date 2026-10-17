@@ -303,6 +303,20 @@ const ADMIN_FILE = path.join(DATA_DIR, 'admins.json');
 let adminCache = readJson(ADMIN_FILE, {});
 function saveAdminCache() { writeJson(ADMIN_FILE, adminCache); }
 function isAdmin(deviceId) { return !!(adminCache[deviceId] && adminCache[deviceId].isAdmin); }
+// 「允许 APP 内自切换」：由管理页为设备开启后，该设备可在 APP 内长按「远程设备」标题
+// 直接修改自己的 admins.json 管理标记（免网页登录）。标记持久化在 admins.json 条目内。
+function isSelfSwitchAllowed(deviceId) { return !!(adminCache[deviceId] && adminCache[deviceId].allowSelfSwitch); }
+function setSelfSwitchAllowed(deviceId, on) {
+    if (!deviceId) return false;
+    if (!adminCache[deviceId]) adminCache[deviceId] = {};
+    adminCache[deviceId].allowSelfSwitch = !!on;
+    saveAdminCache();
+    // 若设备在线，推送其当前生效身份 + 自切换开关状态（客户端据此显隐长按手势）
+    try {
+        relayTo(deviceId, { op: 'admin.updated', payload: { isAdmin: isAdmin(deviceId), allowSelfSwitch: isSelfSwitchAllowed(deviceId) } });
+    } catch (e) { /* 忽略推送失败 */ }
+    return true;
+}
 function setAdmin(deviceId, on, by) {
     if (!deviceId) return false;
     if (!adminCache[deviceId]) adminCache[deviceId] = {};
@@ -312,8 +326,9 @@ function setAdmin(deviceId, on, by) {
     saveAdminCache();
     // 权限变更即时推送：若目标设备当前在线，立即经信令通知其刷新「管理设备」身份，
     // 无需重启 APP / 重连即可在下次进入远程设备页展示管理权限可见内容（升权/降权同路径）。
+    // payload 携带 allowSelfSwitch：客户端据此判定长按自切换手势是否可用。
     try {
-        const pushed = relayTo(deviceId, { op: 'admin.updated', payload: { isAdmin: !!on } });
+        const pushed = relayTo(deviceId, { op: 'admin.updated', payload: { isAdmin: !!on, allowSelfSwitch: isSelfSwitchAllowed(deviceId) } });
         logInfo(`[ADMIN] 设备 ${deviceId.slice(-8)} 管理权限已变更为 ${!!on}，推送 admin.updated=${pushed}`);
     } catch (e) {
         logError('[ADMIN] 推送 admin.updated 失败', e);
@@ -1483,7 +1498,26 @@ async function handleMessage(ws, m) {
 
         // 控制端查询自身是否为管理设备（仅查询，admin 标记实际由控制端在指令内携带）
         case 'admin.query': {
-            ws.send(JSON.stringify({ op: 'admin.status', payload: { isAdmin: isAdmin(deviceId) } }));
+            ws.send(JSON.stringify({ op: 'admin.status', payload: { isAdmin: isAdmin(deviceId), allowSelfSwitch: isSelfSwitchAllowed(deviceId) } }));
+            break;
+        }
+
+        // 管理设备 APP 内自切换：需管理页为该设备开启「允许自切换」，直接修改 admins.json
+        // 并走 setAdmin 的 admin.updated 推送链路（与网页后台开关完全同源，被控端无需感知）。
+        // 安全边界：仅当本机当前被授予自切换权限才可双向切换；未开启的设备请求会被拒绝。
+        case 'admin.self.switch': {
+            const sw = m.payload || {};
+            if (!isSelfSwitchAllowed(deviceId)) {
+                logWarn(`[ADMIN] 自切换被拒绝（未开启允许自切换）device=${deviceId.slice(-8)}`);
+                ws.send(JSON.stringify({ op: 'admin.status', payload: { isAdmin: isAdmin(deviceId), allowSelfSwitch: false } }));
+                break;
+            }
+            const want = !!sw.isAdmin;
+            if (isAdmin(deviceId) !== want) {
+                setAdmin(deviceId, want, 'self_switch');
+            } else {
+                ws.send(JSON.stringify({ op: 'admin.status', payload: { isAdmin: isAdmin(deviceId), allowSelfSwitch: true } }));
+            }
             break;
         }
 
@@ -1619,6 +1653,8 @@ module.exports = {
     isAdmin,
     setAdmin,
     getAllAdmins,
+    isSelfSwitchAllowed,
+    setSelfSwitchAllowed,
     getPoints,
     adjustPoints,
     _internal: { online, sessions, consumeControlCode, lookupControlCode, createControlCode },

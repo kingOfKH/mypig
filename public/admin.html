@@ -136,6 +136,11 @@
   }
   .status-badge.on { background: var(--accent-soft); color: var(--accent); }
 
+  /* ---------- 自切换（允许 APP 内长按标题切换管理权限） ---------- */
+  .self-switch-wrap { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .self-switch-label { font: 500 12px/1 var(--font); color: var(--text-muted); }
+  .self-switch-wrap .switch { width: 40px; height: 24px; }
+
   /* ---------- 开关 ---------- */
   .switch { position: relative; display: inline-block; width: 48px; height: 28px; flex-shrink: 0; }
   .switch input { opacity: 0; width: 0; height: 0; }
@@ -303,6 +308,7 @@
       </div>
     </div>
     <a class="nav-btn" href="/emoji-admin">表情管理</a>
+    <a class="nav-btn" href="/assets-admin">资产管理</a>
     <a class="nav-btn" href="/publish">发布页</a>
   </div>
 </header>
@@ -465,13 +471,49 @@
             <input type="checkbox" data-id="${d.deviceId}" data-name="${escapeHtml(d.deviceName || '')}" ${d.isAdmin ? 'checked' : ''}>
             <span class="slider"></span>
           </label>
+          <label class="self-switch-wrap" title="开启后，该设备可在 APP 内长按「远程设备」标题自切换管理权限">
+            <span class="self-switch-label">自切换</span>
+            <label class="switch">
+              <input type="checkbox" class="self-switch-cb" data-id="${d.deviceId}" ${d.allowSelfSwitch ? 'checked' : ''}>
+              <span class="slider"></span>
+            </label>
+          </label>
         </div>
       `;
       listEl.appendChild(card);
     });
     listEl.querySelectorAll('input[type=checkbox]').forEach(cb => {
-      cb.addEventListener('change', () => onToggle(cb));
+      if (cb.classList.contains('self-switch-cb')) {
+        cb.addEventListener('change', () => onSelfSwitchToggle(cb));
+      } else {
+        cb.addEventListener('change', () => onToggle(cb));
+      }
     });
+  }
+
+  // 「允许自切换」开关：开启后设备可在 APP 内长按远程设备标题直接切换自己的管理标记
+  async function onSelfSwitchToggle(cb) {
+    const id = cb.getAttribute('data-id');
+    const allow = cb.checked;
+    cb.disabled = true;
+    try {
+      const r = await fetch('/api/admin/device/self-switch', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, headers()),
+        body: JSON.stringify({ deviceId: id, allow }),
+      });
+      const j = await r.json();
+      if (r.ok && j.success) {
+        toast(allow ? '已允许该设备在 APP 内自切换管理权限' : '已禁止该设备在 APP 内自切换管理权限', true);
+      } else {
+        cb.checked = !allow;
+        toast('操作失败：' + (j.error || r.status), false);
+      }
+    } catch (e) {
+      cb.checked = !allow;
+      toast('请求失败：' + e.message, false);
+    }
+    cb.disabled = false;
   }
 
   async function onToggle(cb) {

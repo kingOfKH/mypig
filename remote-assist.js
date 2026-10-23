@@ -149,11 +149,12 @@ const TRUST_CMD_PRICE = {
     lockScreen: 1,
     battery: 0,
     telemetry: 0,
-    // 互动指令（interact.*，每次消耗 0.1 积分）：emoji / msg / draw / image
+    // 互动指令（interact.*，每次消耗 0.1 积分）：emoji / msg / draw / image / danmaku
     'interact.emoji': 0.1,
     'interact.msg': 0.1,
     'interact.draw': 0.1,
     'interact.image': 0.1,
+    'interact.danmaku': 0.1,
     // 消息撤回：免费（QQ 同款，撤回不扣积分）
     'recall': 0,
     // APP 使用限制：app.list / app.restrict 均免积分（bypass 从被控端扣费，在 trust.cmd_ack 中单独处理）

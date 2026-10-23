@@ -77,6 +77,15 @@
   .empty { text-align: center; padding: 64px 0; color: var(--text-muted); font-size: 14px; }
   .loading { text-align: center; padding: 64px 0; color: var(--text-muted); font-size: 14px; }
 
+  /* 分页栏 */
+  .pager { display: flex; align-items: center; justify-content: center; gap: 6px; margin: 0 0 24px; flex-wrap: wrap; }
+  .pager .pg { min-width: 36px; padding: 8px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface); color: var(--text-secondary); font-size: 13px; cursor: pointer; transition: all .15s; font-family: var(--font); }
+  .pager .pg:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .pager .pg.active { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+  .pager .pg:disabled { opacity: .4; cursor: not-allowed; }
+  .pager .pg-ellipsis { color: var(--text-muted); padding: 0 2px; }
+  .pager .pg-info { font-size: 12px; color: var(--text-muted); margin-right: 8px; }
+
   /* 灯箱预览 */
   .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.82); z-index: 100; display: flex; align-items: center; justify-content: center; padding: 32px; cursor: zoom-out; }
   .lightbox img { max-width: 100%; max-height: 100%; border-radius: var(--radius-md); box-shadow: 0 8px 40px rgba(0,0,0,0.5); }
@@ -124,6 +133,7 @@
   </div>
 
   <div id="content" class="loading">加载中…</div>
+  <div class="pager" id="pager"></div>
 </div>
 
 <div class="lightbox" id="lightbox" style="display:none" onclick="this.style.display='none'">
@@ -150,6 +160,9 @@ let allItems = [];
 let stats = null;
 let curTab = 'all';
 const selected = new Map(); // key = kind|relPath → item
+// 分页：一次渲染全部 DOM/缩略图会卡死浏览器（历史资产量大），只渲染当前页 50 条
+const PAGE_SIZE = 50;
+let curPage = 1;
 
 function fmtSize(bytes) {
   if (!bytes || bytes <= 0) return '0 B';
@@ -178,6 +191,7 @@ async function load() {
     const data = await resp.json();
     if (!data.success) throw new Error(data.error || '加载失败');
     allItems = data.items; stats = data.stats;
+    curPage = 1;
     renderStats(); renderTabs(); render();
   } catch (e) {
     el.className = 'empty'; el.textContent = '加载失败：' + e.message;
@@ -204,7 +218,7 @@ function renderTabs() {
   ).join('');
 }
 
-function switchTab(k) { curTab = k; renderTabs(); render(); }
+function switchTab(k) { curTab = k; curPage = 1; renderTabs(); render(); }
 
 /** 灯箱预览大图（点击缩略图打开，点击遮罩关闭） */
 function openLightbox(src, cap) {
@@ -217,12 +231,40 @@ function filteredItems() {
   return curTab === 'all' ? allItems : allItems.filter(i => i.kind === curTab);
 }
 
+/** 分页栏：页码窗口以当前页为中心最多展示 7 页，越界折叠为省略号 */
+function renderPager(totalPages, totalCount) {
+  const pager = document.getElementById('pager');
+  if (totalPages <= 1) { pager.innerHTML = ''; return; }
+  const mk = (p, label, disabled, active) =>
+    `<button class="pg ${active ? 'active' : ''}" ${disabled ? 'disabled' : ''} onclick="gotoPage(${p})">${label}</button>`;
+  let start = Math.max(1, curPage - 3), end = Math.min(totalPages, start + 6);
+  start = Math.max(1, end - 6);
+  let btns = `<span class="pg-info">共 ${totalCount} 项 · 第 ${curPage}/${totalPages} 页</span>`;
+  btns += mk(curPage - 1, '‹ 上一页', curPage === 1);
+  if (start > 1) btns += mk(1, '1') + (start > 2 ? '<span class="pg-ellipsis">…</span>' : '');
+  for (let p = start; p <= end; p++) btns += mk(p, p, false, p === curPage);
+  if (end < totalPages) btns += (end < totalPages - 1 ? '<span class="pg-ellipsis">…</span>' : '') + mk(totalPages, totalPages);
+  btns += mk(curPage + 1, '下一页 ›', curPage === totalPages);
+  pager.innerHTML = btns;
+}
+
+function gotoPage(p) {
+  curPage = Math.max(1, p);
+  render();
+  // 翻页后回到列表顶部，避免停留在上一页的滚动位置看不到新内容
+  document.getElementById('tabs').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
 function render() {
   const el = document.getElementById('content');
   const items = filteredItems();
+  const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+  if (curPage > totalPages) curPage = totalPages;
+  renderPager(totalPages, items.length);
   el.className = '';
   if (items.length === 0) { el.className = 'empty'; el.textContent = '该分类下暂无资产文件'; return; }
-  el.innerHTML = '<div class="asset-grid">' + items.map(it => {
+  const pageItems = items.slice((curPage - 1) * PAGE_SIZE, curPage * PAGE_SIZE);
+  el.innerHTML = '<div class="asset-grid">' + pageItems.map(it => {
     const key = it.kind + '|' + it.relPath;
     const sel = selected.has(key);
     // 预览源：有公开静态路由的类目直连 URL；闪照回收站走后台鉴权预览接口（<img> 自动携带登录 Cookie）

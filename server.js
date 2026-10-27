@@ -856,6 +856,80 @@ function chatImageUploadAllowed(ip) {
     return arr.length <= CHAT_IMAGE_RATE_MAX;
 }
 
+// ==================== 聊天图片缩略图（惰性生成 + 磁盘缓存） ====================
+// 背景：聊天记录搜索「图片」页签是 3 列网格、每页 60 张，而客户端 RemoteImageLoader 会把
+// **整张原图**下载下来再本地降采样（单页实测可达 18MB+）。这里由服务端提供长边 320px 的缩略图
+// （约 15~25KB/张），网格只拉缩略图 → 单页流量降到约 1.2MB（省约 93%）。
+//
+// 为什么是「惰性生成」而不是「上传时生成」：
+// ① 上传路径零改动，保住「服务端只做校验不重压缩」的设计原则（上传延迟/内存尖峰都不变）；
+// ② 历史图片首次被浏览时自动生成，**不需要迁移脚本**（本项目存量图片全部自动覆盖）；
+// ③ 家庭量级下首次生成的 jimp 开销（每张约 100~400ms，一次性）完全无感。
+//
+// URL 派生约定（客户端无需新增数据库字段 / Room 迁移，老消息立即生效）：
+//   原图 /chat_images/<设备>/<文件>  →  缩略 /chat_images/thumb/<设备>/<文件>
+const CHAT_THUMB_LONG_EDGE = 320;
+const CHAT_THUMB_QUALITY = 72;
+
+/** 缩略图落盘路径：与原图同目录，命名 `<原文件名去扩展名>_thumb.jpg`（统一 JPEG） */
+function chatThumbPathFor(rel) {
+    const dir = path.dirname(rel);
+    const base = path.basename(rel);
+    const dot = base.lastIndexOf('.');
+    const stem = dot > 0 ? base.substring(0, dot) : base;
+    return path.join(CHAT_IMAGE_DIR, dir === '.' ? '' : dir, `${stem}_thumb.jpg`);
+}
+
+/** 同名缩略图生成的在途去重：并发请求同一张图只真正生成一次（其余等待同一 Promise） */
+const chatThumbInflight = new Map();
+
+function sendChatThumb(res, file) {
+    res.setHeader('Content-Type', 'image/jpeg');
+    // 内容由文件名（时间戳+随机）唯一确定，不会变更 → 可长缓存
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.sendFile(file);
+}
+
+app.get('/chat_images/thumb/*', async (req, res) => {
+    try {
+        const rel = String(req.params[0] || '').split('?')[0];
+        const abs = safeChatRelative(rel);                 // 复用现成的目录穿越防护
+        if (!abs) return res.status(400).type('text/plain').send('非法图片地址');
+        const thumb = chatThumbPathFor(rel);
+        // ① 已生成过 → 直接发
+        if (fs.existsSync(thumb)) return sendChatThumb(res, thumb);
+        // ② 源文件已不存在（闪照已回收 / 已手动清理）→ 404（客户端按现有逻辑显示占位图标）
+        if (!fs.existsSync(abs)) return res.status(404).type('text/plain').send('图片不存在或已清理');
+        // ③ 惰性生成（同名在途合并）
+        let task = chatThumbInflight.get(rel);
+        if (!task) {
+            task = (async () => {
+                try {
+                    // sanitizeImageBuffer：部分 PNG 在 IEND 后带多余字节会让 jimp 的 pngjs 解析失败
+                    const img = await Jimp.read(sanitizeImageBuffer(fs.readFileSync(abs)));
+                    img.scaleToFit(CHAT_THUMB_LONG_EDGE, CHAT_THUMB_LONG_EDGE);   // 等比缩放，长边封顶
+                    img.quality(CHAT_THUMB_QUALITY);
+                    await img.writeAsync(thumb);
+                    return true;
+                } catch (e) {
+                    console.error(`[chat.image] 缩略图生成失败 ${rel}: ${e.message}`);
+                    return false;
+                } finally {
+                    chatThumbInflight.delete(rel);
+                }
+            })();
+            chatThumbInflight.set(rel, task);
+        }
+        const ok = await task;
+        if (!ok || !fs.existsSync(thumb)) return res.status(500).type('text/plain').send('缩略图生成失败');
+        return sendChatThumb(res, thumb);
+    } catch (e) {
+        console.error('[chat.image] 缩略图接口异常:', e.message);
+        return res.status(500).type('text/plain').send('缩略图服务异常');
+    }
+});
+
 // 静态托管：/chat_images/<deviceId>/<file>
 app.use('/chat_images', express.static(CHAT_IMAGE_DIR, {
     setHeaders: (res) => {
@@ -922,6 +996,16 @@ app.post('/api/chat/image/recycle', express.json({ limit: '1mb' }), (req, res) =
         fs.mkdirSync(destDir, { recursive: true });
         const dest = path.join(destDir, path.basename(rel));
         fs.renameSync(abs, dest);
+        // 同步搬走**缩略图**（若已生成）：原图虽已移出静态目录，但缩略图仍躺在 chat_images 下，
+        // 会导致「已回收的闪照仍可通过 /chat_images/thumb/... 取到清晰图」——闪照语义直接失效。
+        const thumb = chatThumbPathFor(rel);
+        if (fs.existsSync(thumb)) {
+            try {
+                fs.renameSync(thumb, path.join(destDir, path.basename(thumb)));
+            } catch (e) {
+                console.warn(`[chat.image] 缩略图回收失败 ${rel}: ${e.message}`);
+            }
+        }
         console.log(`[chat.image] 闪照回收 ${rel}`);
         res.json({ ok: true, recycled: true });
     } catch (e) {
@@ -930,10 +1014,25 @@ app.post('/api/chat/image/recycle', express.json({ limit: '1mb' }), (req, res) =
     }
 });
 
-// 过期清理：普通聊天图 30 天、回收站 90 天（回收站保留更久，便于追溯/恢复）
-const CHAT_IMAGE_TTL_MS = 30 * 24 * 3600 * 1000;
-const CHAT_IMAGE_RECYCLE_TTL_MS = 90 * 24 * 3600 * 1000;
+// 过期清理：**默认关闭**（家庭/小团队自托管场景，图片量极小，长期保留远比自动删除有价值）。
+// 需要自动清理时用环境变量开启（单位天，<=0 或留空 = 永不清理）：
+//   CHAT_IMAGE_TTL_DAYS         普通聊天图，默认 0（永不清理）
+//   CHAT_IMAGE_RECYCLE_TTL_DAYS 闪照回收站，默认 90 天（闪照语义是「阅后即焚」，源文件最终应消失）
+// 无论是否开启自动清理，后台资产管理页都提供即时删除入口（/api/admin/assets/delete）作人工兜底。
+function chatTtlDaysToMs(envVal, defDays) {
+    const raw = (envVal === undefined || envVal === '') ? String(defDays) : envVal;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n * 24 * 3600 * 1000 : 0;   // 0 = 永不清理
+}
+const CHAT_IMAGE_TTL_MS = chatTtlDaysToMs(process.env.CHAT_IMAGE_TTL_DAYS, 0);
+const CHAT_IMAGE_RECYCLE_TTL_MS = chatTtlDaysToMs(process.env.CHAT_IMAGE_RECYCLE_TTL_DAYS, 90);
+if (CHAT_IMAGE_TTL_MS > 0 || CHAT_IMAGE_RECYCLE_TTL_MS > 0) {
+    console.log(`[chat.image] 自动清理已开启：聊天图 ${CHAT_IMAGE_TTL_MS / 86400000} 天 / 回收站 ${CHAT_IMAGE_RECYCLE_TTL_MS / 86400000} 天`);
+} else {
+    console.log('[chat.image] 自动清理已关闭（图片永久保留；如需清理用后台资产管理页手动删除）');
+}
 function cleanupOldFiles(dir, ttlMs) {
+    if (ttlMs <= 0) return;          // 关闭时直接返回，避免每 6 小时无谓的同步磁盘遍历
     if (!fs.existsSync(dir)) return;
     const now = Date.now();
     const walk = (d) => {
@@ -1065,6 +1164,9 @@ function listAssetItems() {
             let st; try { st = fs.statSync(devDir); } catch (_) { continue; }
             if (!st.isDirectory()) continue;
             for (const f of fs.readdirSync(devDir)) {
+                // 缩略图（*_thumb.jpg）是原图的派生文件：不进资产清单，避免清单翻倍、占用统计虚高；
+                // 清理/删除原图时由 recycle/删除逻辑一并处理，不单独暴露给用户操作
+                if (f.endsWith('_thumb.jpg')) continue;
                 let st2; try { st2 = fs.statSync(path.join(devDir, f)); } catch (_) { continue; }
                 if (!st2.isFile()) continue;
                 items.push({

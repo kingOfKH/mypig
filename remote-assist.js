@@ -762,9 +762,9 @@ function relayTo(deviceId, obj) {
     return sent;
 }
 
-// MediaMTX WHIP/WHEP 端点 base：code.matched 时随信令下发给两端，被控端 /whip 推流、控制端 /whep 拉流。
-// 默认与信令服务同机 8889 端口；生产环境用 MEDIAMTX_BASE 覆盖（如 https://mtx.example.com/starclick）。
-const mediamtxBase = (process.env.MEDIAMTX_BASE || 'http://localhost:8889/starclick').replace(/\/+$/, '');
+// ---- MediaMTX WHIP/WHEP 端点 base（客户端侧） ----
+// 客户端始终走本服务的 HTTPS 反向代理 /mtx/*（见 server.js 的 proxyToMtx），享受 TLS + TOFU 证书信任，
+// 无需直连 MediaMTX、也无需 MediaMTX 自身配证书。MediaMTX 实际地址由 server.js 从 MEDIAMTX_BASE 解析（内部转发用）。
 
 // 从 WebSocket 升级请求中提取服务端可达地址（手机连接时用的 IP/域名，而非 localhost）。
 function extractServerHost(req) {
@@ -785,16 +785,18 @@ function extractServerHost(req) {
     return ip;
 }
 
-// 为指定设备构建 mediamtx base URL：优先用该设备 WebSocket 连接时记录的服务端 IP，避免 localhost 在手机上指向手机自身。
+// 为指定设备构建 mediamtx base URL：客户端连的是信令服务的 10000 端口 HTTPS（/mtx 代理），
+// 优先用该设备 WebSocket 连接时记录的服务端 IP，避免 localhost 在手机上指向手机自身。
 function getMediamtxBaseForDevice(deviceId) {
-    if (process.env.MEDIAMTX_BASE) return mediamtxBase; // 生产环境显式配置，直接用
     const set = online.get(deviceId);
     if (set) for (const ws of set) {
         if (ws && ws.readyState === ws.OPEN && ws.serverHost) {
-            return `http://${ws.serverHost}:8889/starclick`;
+            return `https://${ws.serverHost}:10000/mtx`;
         }
     }
-    return mediamtxBase; // 兜底
+    // 兜底：仅在设备没有任何在线连接时（极端情况）；用显式配置的公网地址，否则 localhost（仅本机调试有意义）。
+    const fallbackHost = process.env.PUBLIC_HOST || 'localhost';
+    return `https://${fallbackHost}:10000/mtx`;
 }
 
 // ---- 认证（复用 server.js 的 deviceId token 思路） ----

@@ -17,6 +17,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const DEVICES_DIR = path.join(DATA_DIR, 'devices');
@@ -227,6 +228,41 @@ function listAll() {
     }));
 }
 
+/**
+ * 签发/补发设备密钥（幂等）：每台设备稳定持有一个 48 字符十六进制密钥，
+ * 用于 WS/API 的强身份校验（remote-assist.js 的 verifyToken 据此比对），杜绝冒充设备。
+ * 复用 withLock 保证与 upsertDevice 互斥，避免并发写 registry.json 丢字段。
+ */
+async function getOrCreateSecret(deviceId) {
+    return withLock(REGISTRY_FILE, async () => {
+        const list = readAll();
+        let dev = list.find(d => d.deviceId === deviceId);
+        if (dev && dev.secret) return dev.secret;
+        const secret = crypto.randomBytes(24).toString('hex');
+        if (dev) {
+            dev.secret = secret;
+        } else {
+            list.push({
+                deviceId,
+                deviceName: fallbackName(deviceId),
+                secret,
+                createdAt: getChinaTime(),
+                lastActiveAt: getChinaTime()
+            });
+        }
+        writeAll(list);
+        refreshIndex(list);
+        return secret;
+    });
+}
+
+/** 同步读设备密钥（verifyToken 热路径用，避免 async）：无则返回 null（老设备向后兼容）。 */
+function getDeviceSecretSync(deviceId) {
+    const list = readAll();
+    const dev = list.find(d => d.deviceId === deviceId);
+    return (dev && dev.secret) ? dev.secret : null;
+}
+
 module.exports = {
     REGISTRY_FILE,
     getName,
@@ -239,4 +275,6 @@ module.exports = {
     listAll,
     fallbackName,
     getChinaTime,
+    getOrCreateSecret,
+    getDeviceSecretSync,
 };

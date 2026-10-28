@@ -24,6 +24,7 @@
     "jimp": "^0.22.12",
     "multer": "^2.2.0",
     "rlottie": "0.1.2",
+    "selfsigned": "^2.4.1",
     "ws": "^8.21.1"
   },
   "devDependencies": {

@@ -15,6 +15,10 @@ const remoteAssist = require('./remote-assist');
 const { renderLottieThumb } = require('./lottieThumb.cjs');
 // 统一设备档案：全服务唯一的设备名权威存储（HTTP 体系与 WS 体系共用）
 const deviceRegistry = require('./device-registry');
+const https = require('https');
+// 纯 JS 自签名证书库：无需系统 openssl、无原生编译，首次启动自动生成证书（含长期有效、无域名/IP SAN，
+// 因 Android 客户端采用「首次信任学习(TOFU)式公钥锁定」+ 自定义主机名校验，不依赖证书里的主机名/IP）。
+const selfsigned = require('selfsigned');
 
 // 全局兜底：任何未捕获异常/未处理的 Promise rejection 都不应直接杀死进程。
 // （历史崩溃：audit.log 的 WriteStream 在 fd 失效时抛出未捕获 'error' 事件导致 EBADF 进程退出）
@@ -450,6 +454,8 @@ apiRouter.post('/device/register', async (req, res) => {
     const id = deviceId || generateDeviceId();
     const { device, isNew } = await deviceRegistry.upsertDevice(id, deviceName);
     const newDevice = device || { deviceId: id, deviceName: deviceName || deviceRegistry.fallbackName(id) };
+    // 下发/补发设备密钥：客户端持久化后用于 WS/API 强身份校验（防冒充）。
+    const deviceSecret = await deviceRegistry.getOrCreateSecret(id);
 
     console.log(`${isNew ? '新设备注册' : '设备已存在'}: ${newDevice.deviceId}`);
 
@@ -464,7 +470,8 @@ apiRouter.post('/device/register', async (req, res) => {
         success: true,
         message: isNew ? '设备注册成功' : '设备已存在',
         device: newDevice,
-        isNew
+        isNew,
+        deviceSecret
     });
 });
 
@@ -778,10 +785,70 @@ apiRouter.post('/remote/subscription', (req, res) => {
 
 app.use('/api', apiRouter);
 
+// ===================== MediaMTX 反向代理（方案 A） =====================
+// 客户端 WHIP/WHEP 请求打 /mtx/*（HTTPS + TOFU 信任），本服务转发到内部 MediaMTX（明文，仅本机/内网可达）。
+// 媒体（RTP/DTLS-SRTP）不经此处、直连 MediaMTX，本来已加密；此处只把「承载解密指纹的信令」也加密。
+// 关键：改写 MediaMTX 返回的 Location 头（/starclick 前缀换成 /mtx），否则客户端停流 DELETE 会打到 127.0.0.1 而失败。
+const mtxTarget = (() => {
+    try {
+        const u = new URL((process.env.MEDIAMTX_BASE || 'http://127.0.0.1:8889/starclick').replace(/\/+$/, ''));
+        return { hostname: u.hostname, port: u.port ? parseInt(u.port, 10) : 8889, pathPrefix: u.pathname || '/starclick' };
+    } catch (e) {
+        return { hostname: '127.0.0.1', port: 8889, pathPrefix: '/starclick' };
+    }
+})();
+function proxyToMtx(req, res) {
+    // /mtx/foo -> <pathPrefix>/foo（保留 query）
+    const targetPath = req.url.replace(/^\/mtx(\/|$)/, (m, g) => mtxTarget.pathPrefix + (g || ''));
+    const options = {
+        hostname: mtxTarget.hostname,
+        port: mtxTarget.port,
+        path: targetPath,
+        method: req.method,
+        headers: Object.assign({}, req.headers, { host: `${mtxTarget.hostname}:${mtxTarget.port}` }),
+    };
+    const proxyReq = http.request(options, (proxyRes) => {
+        res.statusCode = proxyRes.statusCode;
+        for (const [k, v] of Object.entries(proxyRes.headers)) {
+            const lk = k.toLowerCase();
+            if (lk === 'location') {
+                try {
+                    const u = new URL(v, `http://${mtxTarget.hostname}:${mtxTarget.port}`);
+                    if (u.pathname.startsWith(mtxTarget.pathPrefix)) {
+                        const re = new RegExp('^' + mtxTarget.pathPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+                        res.setHeader('location', u.pathname.replace(re, '/mtx') + u.search);
+                        continue;
+                    }
+                } catch (e) {}
+            }
+            if (!/^(transfer-encoding|connection|keep-alive)$/i.test(lk)) {
+                res.setHeader(k, v);
+            }
+        }
+        proxyRes.pipe(res);
+    });
+    proxyReq.on('error', (e) => {
+        console.error('[mtx-proxy] 转发失败:', e.message);
+        if (!res.headersSent) { res.statusCode = 502; res.setHeader('content-type', 'text/plain'); }
+        res.end('Bad Gateway');
+    });
+    // 上游超时保护：MediaMTX 无响应时避免长时间挂死占用连接。
+    proxyReq.setTimeout(10000, () => {
+        console.error('[mtx-proxy] 上游超时');
+        if (!res.headersSent) { res.statusCode = 504; res.setHeader('content-type', 'text/plain'); }
+        res.end('Gateway Timeout');
+        proxyReq.destroy();
+    });
+    req.pipe(proxyReq);
+}
+app.all(/^\/mtx\//, proxyToMtx);
+
 // ---- 远程快照：图片静态托管 + 上传接口 ----
 // 静态托管：/snapshots/<deviceId>/<file> 可直接访问
 app.use('/snapshots', (req, res, next) => {
     console.log(`[snapshot.get] ${req.method} ${req.originalUrl}`);
+    // 阻止直接访问持久化标记文件（.meta），避免泄露「是否已持久化」并防止被篡改
+    if (req.path.endsWith('.meta')) { res.status(404).end(); return; }
     next();
 });
 app.use('/snapshots', express.static(SNAPSHOT_DIR, {
@@ -822,6 +889,31 @@ app.post('/api/remote/snapshot/upload', (req, res) => {
     } catch (e) {
         console.error('[snapshot] 上传失败:', e);
         res.status(500).json({ ok: false, reason: '服务端保存失败: ' + e.message });
+    }
+});
+
+// 持久化保存：把指定快照标记为「不自动删除」，写入同名 .meta（{persisted:true}）。
+// 标记后 cleanupSnapshots 会跳过它，URL 保持不变（不重命名，避免已有引用 404）。
+// 鉴权：与上传接口一致（设备级，无页面登录）；deviceId/file 均做净化与目录越界校验。
+app.post('/api/remote/snapshot/persist', (req, res) => {
+    try {
+        const { deviceId, file } = req.body || {};
+        if (!deviceId || !file) return res.status(400).json({ ok: false, reason: '缺少 deviceId 或 file' });
+        const safeDevice = String(deviceId).replace(/[^a-zA-Z0-9_-]/g, '_');
+        // 仅允许纯文件名（basename），杜绝路径穿越
+        const base = path.basename(String(file));
+        if (base !== String(file)) return res.status(400).json({ ok: false, reason: '非法文件名' });
+        const root = path.resolve(SNAPSHOT_DIR);
+        const dir = path.resolve(SNAPSHOT_DIR, safeDevice);
+        const src = path.join(dir, base);
+        if (dir !== root && !dir.startsWith(root + path.sep)) return res.status(400).json({ ok: false, reason: '非法设备目录' });
+        if (!fs.existsSync(src) || !fs.statSync(src).isFile()) return res.status(404).json({ ok: false, reason: '快照不存在' });
+        fs.writeFileSync(src + '.meta', JSON.stringify({ persisted: true, persistedAt: Date.now() }));
+        console.log(`[snapshot] 持久化保存 device=${safeDevice} file=${base}`);
+        res.json({ ok: true, url: `/snapshots/${safeDevice}/${base}` });
+    } catch (e) {
+        console.error('[snapshot] 持久化失败:', e);
+        res.status(500).json({ ok: false, reason: '持久化失败: ' + e.message });
     }
 });
 
@@ -1026,10 +1118,12 @@ function chatTtlDaysToMs(envVal, defDays) {
 }
 const CHAT_IMAGE_TTL_MS = chatTtlDaysToMs(process.env.CHAT_IMAGE_TTL_DAYS, 0);
 const CHAT_IMAGE_RECYCLE_TTL_MS = chatTtlDaysToMs(process.env.CHAT_IMAGE_RECYCLE_TTL_DAYS, 90);
-if (CHAT_IMAGE_TTL_MS > 0 || CHAT_IMAGE_RECYCLE_TTL_MS > 0) {
-    console.log(`[chat.image] 自动清理已开启：聊天图 ${CHAT_IMAGE_TTL_MS / 86400000} 天 / 回收站 ${CHAT_IMAGE_RECYCLE_TTL_MS / 86400000} 天`);
+// 远程快照（截图/拍照）默认 1 天自动清理；被「持久化保存」(.meta 标记) 的快照跳过清理
+const SNAPSHOT_TTL_MS = chatTtlDaysToMs(process.env.SNAPSHOT_TTL_DAYS, 1);
+if (CHAT_IMAGE_TTL_MS > 0 || CHAT_IMAGE_RECYCLE_TTL_MS > 0 || SNAPSHOT_TTL_MS > 0) {
+    console.log(`[cleanup] 自动清理已开启：聊天图 ${CHAT_IMAGE_TTL_MS / 86400000} 天 / 回收站 ${CHAT_IMAGE_RECYCLE_TTL_MS / 86400000} 天 / 快照 ${SNAPSHOT_TTL_MS / 86400000} 天`);
 } else {
-    console.log('[chat.image] 自动清理已关闭（图片永久保留；如需清理用后台资产管理页手动删除）');
+    console.log('[cleanup] 自动清理已关闭（图片永久保留；如需清理用后台资产管理页手动删除）');
 }
 function cleanupOldFiles(dir, ttlMs) {
     if (ttlMs <= 0) return;          // 关闭时直接返回，避免每 6 小时无谓的同步磁盘遍历
@@ -1049,14 +1143,46 @@ function cleanupOldFiles(dir, ttlMs) {
     };
     walk(dir);
 }
-const chatImageCleanupTimer = setInterval(() => {
+
+// 快照自动清理：默认 1 天；被「持久化保存」(同名 .meta 文件 persisted:true) 标记的快照跳过，永不过期。
+function cleanupSnapshots() {
+    if (SNAPSHOT_TTL_MS <= 0) return;
+    if (!fs.existsSync(SNAPSHOT_DIR)) return;
+    const now = Date.now();
+    const walk = (d) => {
+        let entries = [];
+        try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+        for (const ent of entries) {
+            const p = path.join(d, ent.name);
+            if (ent.isDirectory()) { walk(p); continue; }
+            if (ent.name.endsWith('.meta')) continue; // 持久化标记文件本身不删
+            // 已持久化保存的快照跳过自动清理
+            try {
+                const metaRaw = fs.readFileSync(p + '.meta', 'utf8');
+                const meta = JSON.parse(metaRaw);
+                if (meta && meta.persisted === true) continue;
+            } catch (e) { /* 无 meta = 未持久化，继续走 TTL 判断 */ }
+            try {
+                const st = fs.statSync(p);
+                if (now - st.mtimeMs > SNAPSHOT_TTL_MS) {
+                    fs.unlinkSync(p);
+                    console.log(`[snapshot] 自动清理过期快照: ${p}`);
+                }
+            } catch (e) { /* 忽略单个文件清理失败 */ }
+        }
+    };
+    walk(SNAPSHOT_DIR);
+}
+const cleanupTimer = setInterval(() => {
     cleanupOldFiles(CHAT_IMAGE_DIR, CHAT_IMAGE_TTL_MS);
     cleanupOldFiles(CHAT_IMAGE_RECYCLE_DIR, CHAT_IMAGE_RECYCLE_TTL_MS);
+    cleanupSnapshots();
 }, 6 * 3600 * 1000);
-if (chatImageCleanupTimer.unref) chatImageCleanupTimer.unref();
+if (cleanupTimer.unref) cleanupTimer.unref();
 setTimeout(() => {
     cleanupOldFiles(CHAT_IMAGE_DIR, CHAT_IMAGE_TTL_MS);
     cleanupOldFiles(CHAT_IMAGE_RECYCLE_DIR, CHAT_IMAGE_RECYCLE_TTL_MS);
+    cleanupSnapshots();
 }, 30 * 1000);
 
 // 静态托管：/clipboards/<deviceId>/<file> 可直接访问（远程协助-获取实时剪切板内容）
@@ -1145,6 +1271,7 @@ function listAssetItems() {
             let st; try { st = fs.statSync(devDir); } catch (_) { continue; }
             if (!st.isDirectory()) continue;
             for (const f of fs.readdirSync(devDir)) {
+                if (f.endsWith('.meta')) continue; // 持久化标记文件不进资产清单
                 let st2; try { st2 = fs.statSync(path.join(devDir, f)); } catch (_) { continue; }
                 if (!st2.isFile()) continue;
                 items.push({
@@ -1167,6 +1294,7 @@ function listAssetItems() {
                 // 缩略图（*_thumb.jpg）是原图的派生文件：不进资产清单，避免清单翻倍、占用统计虚高；
                 // 清理/删除原图时由 recycle/删除逻辑一并处理，不单独暴露给用户操作
                 if (f.endsWith('_thumb.jpg')) continue;
+                if (f.endsWith('.meta')) continue; // 快照持久化标记文件不进资产清单
                 let st2; try { st2 = fs.statSync(path.join(devDir, f)); } catch (_) { continue; }
                 if (!st2.isFile()) continue;
                 items.push({
@@ -1208,6 +1336,7 @@ app.post('/api/admin/assets/delete', requirePageAuthJson, (req, res) => {
             if (!abs || !fs.existsSync(abs)) { failed.push(String(it.relPath || '?')); continue; }
             try { fs.unlinkSync(abs); deleted++; }
             catch (e) { failed.push(String(it.relPath || '?')); }
+            try { fs.unlinkSync(abs + '.meta'); } catch (_) { /* 无标记文件则忽略 */ }
         }
         console.log(`[assets] 删除 ${deleted} 个资产文件（失败 ${failed.length}）`);
         res.json({ success: true, deleted, failed });
@@ -1312,19 +1441,6 @@ app.get('/api/ice-config', (req, res) => {
     res.json(remoteAssist.getIceConfig());
 });
 
-// 临时诊断接口：用于确认服务端是否正确读到了 TURN 环境变量（部署排查用，上线后可删除）
-app.get('/api/ice-debug', (req, res) => {
-    const turnUrl = process.env.TURN_URL;
-    const hasUser = !!process.env.TURN_USERNAME;
-    const hasCred = !!process.env.TURN_CREDENTIAL;
-    res.json({
-        turnUrlConfigured: !!turnUrl,
-        turnUrlValue: turnUrl ? turnUrl.replace(/:(.*)@/, ':***@') : null, // 脱敏：隐藏可能内嵌的凭证
-        turnUsernameConfigured: hasUser,
-        turnCredentialConfigured: hasCred,
-        allThreeOk: !!(turnUrl && hasUser && hasCred),
-    });
-});
 
 function generateDeviceId() {
     const timestamp = Date.now().toString(36);
@@ -2008,7 +2124,7 @@ app.put('/api/device/:deviceId/avatar', upload.single('avatar'), async (req, res
  * 解析成功以解析值为准（覆盖手填，防止手填错），失败则使用手填值。
  * 落盘：覆盖根目录 starclick.apk（已被静态托管），并写 updates/latest.json。
  */
-app.post('/api/app/publish', upload.single('apk'), (req, res) => {
+app.post('/api/app/publish', requirePageAuthJson, upload.single('apk'), (req, res) => {
     try {
         if (!req.file) {
             return res.json({ success: false, message: '未收到 APK 文件' });
@@ -2229,12 +2345,68 @@ app.get('/versions', requirePageAuth, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'history.html'));
 });
 
-const server = app.listen(PORT, HOST, () => {
+// ===================== 自签名证书自动生成（免费、无需域名、随启动） =====================
+// 服务端启动时若 data/certs 下无证书，用纯 JS 库 selfsigned 生成一张自签名证书（有效期 10 年）。
+// 证书仅含 CN（无需 IP SAN）：Android 客户端采用「首次信任学习(TOFU)式公钥锁定」+ 自定义主机名
+// 校验，不依赖证书里的主机名/IP。MediaMTX 可复用同一张证书实现 HTTPS（见 MEDIAMTX_BASE）。
+const CERT_DIR = path.join(__dirname, 'data', 'certs');
+const CERT_KEY = path.join(CERT_DIR, 'starclick.key');
+const CERT_CRT = path.join(CERT_DIR, 'starclick.crt');
+function ensureTls() {
+    if (fs.existsSync(CERT_KEY) && fs.existsSync(CERT_CRT)) {
+        try { return { key: fs.readFileSync(CERT_KEY), cert: fs.readFileSync(CERT_CRT) }; }
+        catch (e) { console.error('[tls] 读取已有证书失败:', e.message); }
+    }
+    try {
+        fs.mkdirSync(CERT_DIR, { recursive: true });
+        // 生成自签名证书：CN 即可，无需 IP SAN（客户端按公钥 pin 信任 + 跳过主机名校验）。
+        const attrs = [{ name: 'commonName', value: 'StarClick-SelfSigned' }];
+        const pems = selfsigned.generate(attrs, { days: 3650, keySize: 2048 });
+        fs.writeFileSync(CERT_KEY, pems.private);
+        fs.writeFileSync(CERT_CRT, pems.cert);
+        console.log('[tls] 已自动生成自签名证书(有效期10年，无需域名，纯JS库 selfsigned):', CERT_CRT);
+        return { key: pems.private, cert: pems.cert };
+    } catch (e) {
+        console.error('[tls] 自动生成自签名证书失败（请确认已执行 npm install 安装 selfsigned 依赖）:', e.message);
+        return null;
+    }
+}
+
+const tlsOpts = ensureTls();
+let server;
+if (tlsOpts) {
+    server = https.createServer(tlsOpts, app);
+    console.log('[tls] HTTPS 已启用（自签名证书）');
+} else {
+    console.warn('[tls] 未启用 HTTPS，回退明文 HTTP（不安全！请确认已 npm install 安装 selfsigned 依赖后重启）');
+    server = http.createServer(app);
+}
+
+// 真实设备身份校验：基于每台设备注册时下发/持久化的 deviceSecret（共享密钥）。
+// - 设备已有 secret：必须 token===secret，否则拒绝连接（杜绝冒充设备）。
+// - 老设备（历史无 secret）：向后兼容放行（仅告警），待其重装/重注册后自动补发 secret。
+remoteAssist.registerVerify((deviceId, token) => {
+    if (!deviceId) return false;
+    const secret = deviceRegistry.getDeviceSecretSync(deviceId);
+    if (!secret) {
+        console.warn('[auth] 老设备无 secret，向后兼容放行:', deviceId && deviceId.slice(-8));
+        return true;
+    }
+    // 客户端未携带密钥（老客户端/重装/尚未持久化 secret）：向后兼容放行，
+    // 待其重注册或客户端补发 secret 后（token 非空且匹配）自动转为强校验。
+    if (!token) {
+        console.warn('[auth] 设备已有 secret 但客户端未携带 token，向后兼容放行:', deviceId && deviceId.slice(-8));
+        return true;
+    }
+    return token === secret;
+});
+
+server.listen(PORT, HOST, () => {
     console.log('=================================');
     console.log('  StarClick Web Server v2.0');
     console.log('  应用使用记录云端存储');
     console.log('=================================');
-    console.log(`服务运行在: http://${HOST}:${PORT}`);
+    console.log(`服务运行在: ${(tlsOpts ? 'https' : 'http')}://${HOST}:${PORT}`);
     console.log(`环境: ${process.env.NODE_ENV || 'development'}`);
     console.log(`启动时间: ${new Date().toLocaleString('zh-CN')}`);
     console.log('=================================');
@@ -2252,7 +2424,7 @@ const server = app.listen(PORT, HOST, () => {
     console.log('=================================');
 });
 
-// 挂载远程协助 WebSocket 信令通道（复用同一 HTTP 服务，不另起端口）
+// 挂载远程协助 WebSocket 信令通道（复用同一 HTTP/HTTPS 服务，不另起端口）
 remoteAssist.attach(server);
 remoteAssist.startTimeoutWatchdog();
 console.log('[remote] 远程协助信令模块已挂载: /ws/remote');

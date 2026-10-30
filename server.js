@@ -408,25 +408,10 @@ async function withFileLock(filePath, operation) {
     }
 }
 
+// 默认首页：不再暴露任何接口清单（避免泄露后端 API 列表），直接跳转管理后台登录页。
+// /login 已自带「已登录则跳转 /admin」逻辑，复用即可。
 app.get('/', (req, res) => {
-    res.json({
-        success: true,
-        message: 'StarClick Web Server - 应用使用记录云端存储',
-        version: '2.0.0',
-        timestamp: getChinaTime(),
-        endpoints: {
-            'GET /': '服务器信息',
-            'GET /api/health': '健康检查',
-            'POST /api/device/register': '注册设备',
-            'GET /api/devices': '获取所有设备列表',
-            'POST /api/usage/sync': '增量同步使用记录',
-            'GET /api/usage/:deviceId/:date': '获取指定设备日期数据',
-            'GET /api/usage/:deviceId/range': '获取日期范围数据',
-            'PUT /api/device/:deviceId/name': '更新设备名称',
-            'WS  /ws/remote': '远程协助信令通道 (?deviceId=&token=)',
-            'POST /api/remote/subscription': '设置/查询远程协助订阅套餐'
-        }
-    });
+    return res.redirect('/login');
 });
 
 const apiRouter = express.Router();
@@ -741,7 +726,7 @@ apiRouter.get('/usage/:deviceId/range', (req, res) => {
     const files = fs.readdirSync(deviceUsageDir);
     
     files.forEach(file => {
-        if (file.endsWith('.json')) {
+        if (file.endsWith('.json') && !file.startsWith('_')) {
             const fileDate = file.replace('.json', '');
             if (fileDate >= startDate && fileDate <= endDate) {
                 const filePath = path.join(deviceUsageDir, file);
@@ -760,6 +745,21 @@ apiRouter.get('/usage/:deviceId/range', (req, res) => {
         deviceId: deviceId,
         data: allData,
         total: allData.length
+    });
+});
+
+// 使用记录汇总查询：返回设备级轻量累计（每个 APP 累计打开次数/累计使用时长）。
+// 汇总由清理任务在删除过期每日明细前生成并长期留存，删除明细后仍可查看粗略统计。
+apiRouter.get('/usage/:deviceId/summary', (req, res) => {
+    const { deviceId } = req.params;
+    const devDir = path.join(USAGE_DIR, deviceId);
+    const summary = loadUsageSummary(devDir);
+    const list = Object.values(summary.apps || {})
+        .sort((a, b) => (b.totalDurationMs || 0) - (a.totalDurationMs || 0));
+    res.json({
+        success: true,
+        deviceId,
+        summary: { apps: list, lastCompactedAt: summary.lastCompactedAt }
     });
 });
 
@@ -1120,8 +1120,10 @@ const CHAT_IMAGE_TTL_MS = chatTtlDaysToMs(process.env.CHAT_IMAGE_TTL_DAYS, 0);
 const CHAT_IMAGE_RECYCLE_TTL_MS = chatTtlDaysToMs(process.env.CHAT_IMAGE_RECYCLE_TTL_DAYS, 90);
 // 远程快照（截图/拍照）默认 1 天自动清理；被「持久化保存」(.meta 标记) 的快照跳过清理
 const SNAPSHOT_TTL_MS = chatTtlDaysToMs(process.env.SNAPSHOT_TTL_DAYS, 1);
-if (CHAT_IMAGE_TTL_MS > 0 || CHAT_IMAGE_RECYCLE_TTL_MS > 0 || SNAPSHOT_TTL_MS > 0) {
-    console.log(`[cleanup] 自动清理已开启：聊天图 ${CHAT_IMAGE_TTL_MS / 86400000} 天 / 回收站 ${CHAT_IMAGE_RECYCLE_TTL_MS / 86400000} 天 / 快照 ${SNAPSHOT_TTL_MS / 86400000} 天`);
+// 使用记录（usage）默认保留 14 天；超过 TTL 的每日明细在删除前汇总进设备级 _summary.json。
+const USAGE_TTL_MS = chatTtlDaysToMs(process.env.USAGE_TTL_DAYS, 14);
+if (CHAT_IMAGE_TTL_MS > 0 || CHAT_IMAGE_RECYCLE_TTL_MS > 0 || SNAPSHOT_TTL_MS > 0 || USAGE_TTL_MS > 0) {
+    console.log(`[cleanup] 自动清理已开启：聊天图 ${CHAT_IMAGE_TTL_MS / 86400000} 天 / 回收站 ${CHAT_IMAGE_RECYCLE_TTL_MS / 86400000} 天 / 快照 ${SNAPSHOT_TTL_MS / 86400000} 天 / 使用记录 ${USAGE_TTL_MS / 86400000} 天`);
 } else {
     console.log('[cleanup] 自动清理已关闭（图片永久保留；如需清理用后台资产管理页手动删除）');
 }
@@ -1173,16 +1175,105 @@ function cleanupSnapshots() {
     };
     walk(SNAPSHOT_DIR);
 }
+
+// ===== 使用记录（usage）自动清理 + 轻量汇总 =====
+// 默认保留 14 天；超过 TTL 的每日明细在删除前，把 APP_USAGE 记录汇总进设备级
+// _summary.json（累计每个 APP 打开次数/使用时长），使删除后仍可查看粗略累计统计。
+// 注意：判断过期用文件名日期而非 mtime——sync 会刷新日文件 mtime，用 mtime 会漏删。
+const USAGE_SUMMARY_FILE = '_summary.json';
+
+function loadUsageSummary(devDir) {
+    const fp = path.join(devDir, USAGE_SUMMARY_FILE);
+    const data = safeReadJSON(fp, null);
+    if (data && data.apps && typeof data.apps === 'object') return data;
+    return { apps: {}, lastCompactedAt: null };
+}
+
+function saveUsageSummary(devDir, summary) {
+    const fp = path.join(devDir, USAGE_SUMMARY_FILE);
+    const tmp = fp + '.tmp';
+    try {
+        fs.writeFileSync(tmp, JSON.stringify(summary));
+        fs.renameSync(tmp, fp); // 原子写，避免半写损坏汇总
+    } catch (e) {
+        try { fs.unlinkSync(tmp); } catch (_) {}
+        console.error('[usage] 写入汇总失败:', e);
+    }
+}
+
+function accumulateDailyToSummary(dailyData, summary) {
+    const records = (dailyData && dailyData.records) || [];
+    for (const rec of records) {
+        if (rec.recordType !== 'APP_USAGE') continue;
+        const key = rec.packageName || rec.appName;
+        if (!key) continue;
+        const dur = Number(rec.durationMs) || 0;
+        let s = summary.apps[key];
+        if (!s) {
+            s = { packageName: key, appName: rec.appName || key, totalDurationMs: 0, openCount: 0 };
+            summary.apps[key] = s;
+        } else if (rec.appName && rec.appName !== key) {
+            s.appName = rec.appName; // 应用名可能变更，取最新一次
+        }
+        s.totalDurationMs += dur;
+        s.openCount += 1;
+    }
+    summary.lastCompactedAt = getChinaTime();
+    return summary;
+}
+
+function dateStrToTs(s) {
+    const digits = String(s).replace(/\D/g, '');
+    if (digits.length !== 8) return null;
+    const y = +digits.slice(0, 4), m = +digits.slice(4, 6), d = +digits.slice(6, 8);
+    if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+    return new Date(y, m - 1, d).getTime();
+}
+
+function cleanupUsage() {
+    if (USAGE_TTL_MS <= 0) return;
+    if (!fs.existsSync(USAGE_DIR)) return;
+    const cutoff = Date.now() - USAGE_TTL_MS;
+    let devDirs = [];
+    try { devDirs = fs.readdirSync(USAGE_DIR, { withFileTypes: true }); } catch (e) { return; }
+    for (const devEnt of devDirs) {
+        if (!devEnt.isDirectory()) continue;
+        const devDir = path.join(USAGE_DIR, devEnt.name);
+        const summary = loadUsageSummary(devDir);
+        let changed = false;
+        let files = [];
+        try { files = fs.readdirSync(devDir); } catch (e) { continue; }
+        for (const f of files) {
+            if (!f.endsWith('.json') || f.startsWith('_')) continue; // 跳过汇总/元文件
+            const fileDate = f.replace('.json', '');
+            const ts = dateStrToTs(fileDate);
+            if (ts === null || ts >= cutoff) continue; // 仍在保留期内
+            const fp = path.join(devDir, f);
+            try {
+                const data = safeReadJSON(fp, null);
+                if (data) { accumulateDailyToSummary(data, summary); changed = true; }
+                fs.unlinkSync(fp);
+                console.log(`[usage] 已归档并删除过期日明细: ${fp}`);
+            } catch (e) {
+                console.error('[usage] 清理单文件失败:', e);
+            }
+        }
+        if (changed) saveUsageSummary(devDir, summary);
+    }
+}
+
 const cleanupTimer = setInterval(() => {
     cleanupOldFiles(CHAT_IMAGE_DIR, CHAT_IMAGE_TTL_MS);
     cleanupOldFiles(CHAT_IMAGE_RECYCLE_DIR, CHAT_IMAGE_RECYCLE_TTL_MS);
     cleanupSnapshots();
+    cleanupUsage();
 }, 6 * 3600 * 1000);
 if (cleanupTimer.unref) cleanupTimer.unref();
 setTimeout(() => {
     cleanupOldFiles(CHAT_IMAGE_DIR, CHAT_IMAGE_TTL_MS);
     cleanupOldFiles(CHAT_IMAGE_RECYCLE_DIR, CHAT_IMAGE_RECYCLE_TTL_MS);
     cleanupSnapshots();
+    cleanupUsage();
 }, 30 * 1000);
 
 // 静态托管：/clipboards/<deviceId>/<file> 可直接访问（远程协助-获取实时剪切板内容）

@@ -217,6 +217,14 @@
   }
   .pts-btn:hover { background: #e0e3ff; }
 
+  /* ---------- 删除设备 ---------- */
+  .del-btn {
+    font: 600 13px/1 var(--font); color: #dc2626;
+    background: #fef2f2; border: 1px solid transparent; border-radius: var(--radius-sm);
+    padding: 8px 14px; cursor: pointer; transition: all 0.15s ease; white-space: nowrap;
+  }
+  .del-btn:hover { background: #fee2e2; }
+
   /* ---------- 积分弹窗 ---------- */
   .modal-mask {
     position: fixed; inset: 0; background: rgba(15,17,23,0.45);
@@ -478,6 +486,7 @@
               <span class="slider"></span>
             </label>
           </label>
+          <button class="del-btn" data-id="${d.deviceId}" data-name="${escapeHtml(d.deviceName || '')}">删除</button>
         </div>
       `;
       listEl.appendChild(card);
@@ -663,9 +672,44 @@
   // 设备卡片「积分」按钮（事件委托）
   listEl.addEventListener('click', (e) => {
     const btn = e.target.closest('.pts-btn');
-    if (!btn) return;
-    openPoints(btn.getAttribute('data-id'), btn.getAttribute('data-name'));
+    if (btn) { openPoints(btn.getAttribute('data-id'), btn.getAttribute('data-name')); return; }
+    const del = e.target.closest('.del-btn');
+    if (del) onDeleteDevice(del);
   });
+
+  // 删除设备：清除该设备全部相关数据（档案/使用记录/信任绑定/积分/头像/快照/剪贴板/聊天图片等）
+  async function onDeleteDevice(btn) {
+    const id = btn.getAttribute('data-id');
+    const name = btn.getAttribute('data-name');
+    const label = name || tail8(id);
+    const ok = confirm(
+      '确定删除设备「' + label + '」？\n\n' +
+      '将同时清除（不可恢复）：\n' +
+      '· 设备档案与密钥、应用使用记录\n' +
+      '· 信任设备绑定（双向）、管理标记与自切换开关\n' +
+      '· 积分与套餐、头像、截图快照、剪贴板、聊天图片\n\n' +
+      '注意：在线设备会被强制下线；若该设备上的 App 仍在运行，会自动重新注册回列表。'
+    );
+    if (!ok) return;
+    btn.disabled = true;
+    try {
+      const r = await fetch('/api/admin/device/delete', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, headers()),
+        body: JSON.stringify({ deviceId: id }),
+      });
+      const j = await r.json();
+      if (r.ok && j.success) {
+        toast('设备「' + label + '」及其全部数据已删除', true);
+        loadDevices();
+      } else {
+        toast('删除失败：' + (j.error || r.status), false);
+      }
+    } catch (e) {
+      toast('请求失败：' + e.message, false);
+    }
+    btn.disabled = false;
+  }
 
   loadDevices();
 </script>

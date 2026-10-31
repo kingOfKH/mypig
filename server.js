@@ -195,6 +195,8 @@ function ensureDirectories() {
     });
 }
 ensureDirectories();
+// 头像 v1 锚点归档（幂等）：把功能上线前已存在的头像补写为 v<1>.jpg，历史消息钉在第一版头像
+bootstrapAvatarV1Archive();
 
 function safeReadJSON(filePath, defaultValue = null) {
     try {
@@ -516,6 +518,66 @@ apiRouter.post('/admin/device/self-switch', requireAdminToken, requirePageAuthJs
     if (!deviceId) return res.status(400).json({ success: false, error: '缺少 deviceId' });
     remoteAssist.setSelfSwitchAllowed(deviceId, allow === true || allow === 'true');
     res.json({ success: true, deviceId, allowSelfSwitch: remoteAssist.isSelfSwitchAllowed(deviceId) });
+});
+
+// 管理页：删除设备（换新手机后清理旧设备的全部数据），需后台页面登录
+// 清除范围：设备档案（名称/密钥/头像版本）、应用使用记录、信任绑定（双向）、管理标记/自切换、
+//           积分、套餐、被控码登记、头像文件、截图快照、剪贴板、聊天图片、闪照回收站、历史会话与审计留痕
+// 顺序：先清远程协助体系（终止会话→踢下线→各持久化数据，切断写入源），再删文件类数据，最后删设备档案。
+// 全程幂等：任何一步失败都会返回错误与已删清单，直接重试即可。
+apiRouter.post('/admin/device/delete', requireAdminToken, requirePageAuthJson, async (req, res) => {
+    const { deviceId } = req.body || {};
+    if (!deviceId || typeof deviceId !== 'string') {
+        return res.status(400).json({ success: false, error: '缺少 deviceId' });
+    }
+    const id = deviceId.trim();
+    if (!id || id.length > 128) {
+        return res.status(400).json({ success: false, error: 'deviceId 非法' });
+    }
+
+    // 与上传落盘一致的目录名 sanitize（防路径穿越）；resolve 后必须仍在数据根目录内
+    const safe = id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const resolvedIn = (root, name) => {
+        const rootAbs = path.resolve(root);
+        const p = path.resolve(rootAbs, name);
+        return (p !== rootAbs && p.startsWith(rootAbs + path.sep)) ? p : null;
+    };
+    const removed = {};
+    const rmDir = (key, root, name) => {
+        const p = resolvedIn(root, name);
+        if (!p) { removed[key] = 'skipped_invalid_path'; return; }
+        try {
+            if (fs.existsSync(p)) { fs.rmSync(p, { recursive: true, force: true }); removed[key] = 'deleted'; }
+            else removed[key] = 'not_found';
+        } catch (e) { removed[key] = 'error: ' + (e && e.message); }
+    };
+    const rmFile = (key, p) => {
+        const pAbs = resolvedIn(path.dirname(p), path.basename(p));
+        if (!pAbs) { removed[key] = 'skipped_invalid_path'; return; }
+        try {
+            if (fs.existsSync(pAbs)) { fs.unlinkSync(pAbs); removed[key] = 'deleted'; }
+            else removed[key] = 'not_found';
+        } catch (e) { removed[key] = 'error: ' + (e && e.message); }
+    };
+
+    // ① 远程协助体系：终止会话 → 踢下线 → 信任/管理/积分/订阅/控制码/历史留痕
+    try { removed.remote = await remoteAssist.purgeDevice(id); }
+    catch (e) { removed.remote = 'error: ' + (e && e.message); }
+
+    // ② 文件类数据（目录名规则与各自上传接口落盘时完全一致）
+    rmDir('usage', USAGE_DIR, id);                                  // 应用使用记录（按日 JSON）
+    rmFile('avatar', path.join(AVATAR_DIR, `${id}.jpg`));           // 设备头像
+    rmDir('snapshots', SNAPSHOT_DIR, safe);                         // 截图快照 + 拍照照片（含 .meta）
+    rmDir('clipboards', CLIPBOARD_DIR, safe);                       // 剪贴板
+    rmDir('chatImages', CHAT_IMAGE_DIR, id);                        // 聊天图片
+    rmDir('chatImagesRecycle', CHAT_IMAGE_RECYCLE_DIR, id);         // 闪照回收站（隐私边界：一并清除）
+
+    // ③ 设备档案（最后删：中途的读路径对无档案均有兜底，不影响其他设备）
+    try { removed.registry = await deviceRegistry.removeDevice(id) ? 'deleted' : 'not_found'; }
+    catch (e) { removed.registry = 'error: ' + (e && e.message); }
+
+    console.log(`[admin] 设备已删除 id=...${id.slice(-8)} removed=${JSON.stringify(removed)}`);
+    res.json({ success: true, deviceId: id, removed });
 });
 
 // 管理页：查询指定设备的积分余额与变动明细（含后台调整备注），需后台页面登录
@@ -1290,6 +1352,17 @@ app.use('/clipboards', express.static(CLIPBOARD_DIR, {
 
 // 静态托管：/avatars/<deviceId>.jpg 可直接访问（远程协助-设备头像）
 app.use('/avatars', express.static(AVATAR_DIR, {
+    setHeaders: (res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'no-cache');
+    }
+}));
+
+// 静态托管：/skins/<skinId>.jpg 气泡皮肤纹理（积分商城图片质感款，2026-10-31）
+// 长缓存可设强缓存（素材内容不可变，文件名即版本），但保持与 /avatars 同款简单策略
+const SKINS_DIR = path.join(DATA_DIR, 'skins');
+fs.mkdirSync(SKINS_DIR, { recursive: true });
+app.use('/skins', express.static(SKINS_DIR, {
     setHeaders: (res) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Cache-Control', 'no-cache');
@@ -2189,7 +2262,44 @@ function sanitizeImageBuffer(buf) {
 
 // ==================== 设备头像：上传（服务端压缩优化后存储） ====================
 // 上传：multer 收内存 → jimp 压缩为 256×256 JPEG（quality 82，体积降 95%+）→ 落盘 data/avatars/<id>.jpg
-// 成功后 deviceRegistry.bumpAvatar 版本号 +1，并通知信任对端重新拉取（未变更则对端用本地缓存，不重复下载）。
+// 版本化归档（2026-10-31）：同时写 data/avatars/<id>/v<版本号>.jpg —— 聊天消息携带发送时的头像版本号，
+// 历史消息按版本渲染当时的头像（趣味性：头像演变史）。express.static('/avatars') 自动服务子目录，路由零改动。
+// 每设备保留最近 100 个版本，超出删最旧（256×256 JPEG 每张约 10-20KB，100 版本 ~2MB/设备封顶）。
+const AVATAR_VERSION_KEEP = 100;
+async function archiveAvatarVersion(deviceId, version, img) {
+    try {
+        const dir = path.join(AVATAR_DIR, deviceId);
+        fs.mkdirSync(dir, { recursive: true });
+        await img.writeAsync(path.join(dir, `v${version}.jpg`));
+        // 修剪：vN.jpg 按版本号排序，超出保留上限删最旧（不碰 <id>.jpg 当前文件与 v1 锚点）
+        const versions = fs.readdirSync(dir)
+            .map(f => { const m = /^v(\d+)\.jpg$/.exec(f); return m ? { f, n: Number(m[1]) } : null; })
+            .filter(Boolean).sort((a, b) => a.n - b.n);
+        for (const v of versions.slice(0, Math.max(0, versions.length - AVATAR_VERSION_KEEP))) {
+            try { fs.unlinkSync(path.join(dir, v.f)); } catch (_) { /* ignore */ }
+        }
+    } catch (e) { console.warn('[avatar] 版本归档失败:', e && e.message); }
+}
+
+// 启动引导（一次性、幂等）：把功能上线前已存在的头像归档为 v1 —— 「第一版头像」锚点。
+// 语义：历史消息（未携带版本号）一律按 v1 渲染，即钉在功能上线时的头像，不随后续换头像漂移。
+// 之后每次上传版本号照常从 registry 的 avatarVersion 递增（v1 只在缺失时补写，与首次上传的 v1 不冲突）。
+function bootstrapAvatarV1Archive() {
+    try {
+        if (!fs.existsSync(AVATAR_DIR)) return;
+        for (const ent of fs.readdirSync(AVATAR_DIR, { withFileTypes: true })) {
+            if (!ent.isFile() || !ent.name.endsWith('.jpg')) continue;
+            const id = ent.name.replace(/\.jpg$/, '');
+            const dir = path.join(AVATAR_DIR, id);
+            const v1 = path.join(dir, 'v1.jpg');
+            if (fs.existsSync(v1)) continue; // 幂等：已有 v1（bootstrap 已跑过或首次上传已产生）
+            fs.mkdirSync(dir, { recursive: true });
+            fs.copyFileSync(path.join(AVATAR_DIR, ent.name), v1);
+            console.log(`[avatar] v1 锚点归档: ${id.slice(-8)}`);
+        }
+    } catch (e) { console.warn('[avatar] v1 归档引导失败:', e && e.message); }
+}
+
 app.put('/api/device/:deviceId/avatar', upload.single('avatar'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ success: false, error: '未收到图片' });
@@ -2200,6 +2310,8 @@ app.put('/api/device/:deviceId/avatar', upload.single('avatar'), async (req, res
         fs.mkdirSync(AVATAR_DIR, { recursive: true });
         await img.writeAsync(path.join(AVATAR_DIR, `${deviceId}.jpg`));
         const avatarVersion = await deviceRegistry.bumpAvatar(deviceId);
+        // 版本化归档：聊天历史消息按发送时版本渲染头像
+        await archiveAvatarVersion(deviceId, avatarVersion, img);
         try {
             if (typeof remoteAssist.notifyAvatarChanged === 'function') remoteAssist.notifyAvatarChanged(deviceId, avatarVersion);
         } catch (e) { console.warn('[avatar] notifyAvatarChanged 失败:', e && e.message); }

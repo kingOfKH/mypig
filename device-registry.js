@@ -217,6 +217,22 @@ async function touch(deviceId) {
     });
 }
 
+/**
+ * 删除设备档案（管理页「删除设备」用）：移除条目（含名称/密钥/头像版本）并刷新名称索引。
+ * 幂等：档案不存在返回 false。调用方负责先清理各业务数据再调本函数。
+ */
+async function removeDevice(deviceId) {
+    if (!deviceId) return false;
+    return withLock(REGISTRY_FILE, async () => {
+        const list = readAll();
+        const next = list.filter(d => d.deviceId !== deviceId);
+        if (next.length === list.length) return false;
+        writeAll(next);
+        refreshIndex(next);
+        return true;
+    });
+}
+
 /** 列出全部设备档案（/api/devices、管理页使用） */
 function listAll() {
     return readAll().map(d => ({
@@ -272,6 +288,7 @@ module.exports = {
     upsertDevice,
     setName,
     touch,
+    removeDevice,
     listAll,
     fallbackName,
     getChinaTime,

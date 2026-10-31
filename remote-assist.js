@@ -198,7 +198,11 @@ function getPoints(deviceId) {
         // 首次访问即落盘（保证分片文件存在；默认值也写，迁就旧逻辑）
         savePoints(deviceId);
     }
-    return pointsCache[key];
+    // 皮肤字段兜底（积分商城 2026-10-31）：旧分片文件无此字段时补默认（JSON 只增不删）
+    const p = pointsCache[key];
+    if (!Array.isArray(p.ownedSkins)) p.ownedSkins = [];
+    if (typeof p.equippedSkin !== 'string' || !p.equippedSkin) p.equippedSkin = 'default';
+    return p;
 }
 // 向设备推送最新积分状态（服务端 → 客户端，增量更新镜像）。
 // 明细分页：保留最近 50 条；第 1 页发最近 20 条，第 2 页发较早的 30 条（合计 50）；
@@ -225,20 +229,23 @@ function pushPoints(deviceId, page) {
         hasMore = false;
     }
     relayTo(deviceId, {
-        op: 'points.update',
-        payload: {
-            balance: p.balance,
-            signinDate: p.signinDate,
-            canSignin,
-            signinReward: prev.reward,
-            signinStreak: p.signinStreak || 0,
-            signinCycleDay: prev.cycleDay,
-            history: slice,
-            pointsPage: pg,
-            pointsHasMore: hasMore,
-            pointsMax: POINTS_HISTORY_MAX
-        }
-    });
+            op: 'points.update',
+            payload: {
+                balance: p.balance,
+                signinDate: p.signinDate,
+                canSignin,
+                signinReward: prev.reward,
+                signinStreak: p.signinStreak || 0,
+                signinCycleDay: prev.cycleDay,
+                history: slice,
+                pointsPage: pg,
+                pointsHasMore: hasMore,
+                pointsMax: POINTS_HISTORY_MAX,
+                // 积分商城（气泡皮肤）：拥有列表与当前装备
+                ownedSkins: Array.isArray(p.ownedSkins) ? p.ownedSkins : [],
+                equippedSkin: p.equippedSkin || 'default'
+            }
+        });
 }
 // 记录一条积分变动（签到/扣费/后台调整），仅保留最近 50 条，用于客户端明细展示
 function addHistory(deviceId, type, delta, balanceAfter, note) {
@@ -251,6 +258,23 @@ function addHistory(deviceId, type, delta, balanceAfter, note) {
 // 积分变动即时通知（扣费/签到成功时推送控制端，用于 Toast 提示）
 function pushNotice(deviceId, type, delta) {
     relayTo(deviceId, { op: 'points.notice', payload: { type, delta } });
+}
+
+// ── 积分商城（气泡皮肤，2026-10-31）──
+// 价格表：与客户端 BubbleSkins 严格同名同价（改动必须双端同步）。全部 5 积分（一期纯代码款）。
+const SKIN_CATALOG = {
+    peach: 5, mint: 5, matcha: 5, sunset: 5,
+    milk: 5, galaxy: 5, rose: 5, blackgold: 5,
+    // 图片质感款（data/skins/<id>.jpg，AI 生成纹理，2026-10-31）
+    sakura: 15, cloud: 15, honey: 15, starry: 20, neon: 20, marble: 25,
+};
+
+/** 装备皮肤变更 → 广播给该设备的全部信任对端（对端缓存后渲染「对方发出的气泡」用） */
+function broadcastSkin(deviceId, skinId) {
+    const peers = getTrustList(deviceId);
+    for (const peer of peers) {
+        relayTo(peer.deviceId, { op: 'skin.updated', payload: { deviceId, skinId } });
+    }
 }
 // 扣费（控制端付费），余额下限 0；扣完主动推送最新状态
 function deduct(deviceId, amount, reason) {
@@ -747,6 +771,126 @@ async function forceTerminate(sid, reason) {
     sessions.delete(sid);
 
     if (pendingDisconnects.has(sid)) { clearTimeout(pendingDisconnects.get(sid)); pendingDisconnects.delete(sid); }
+}
+
+// ---- 删除设备（管理页「删除设备」用） ----
+/**
+ * 清除某设备在远程协助体系内的全部数据与内存态（幂等，失败可重试）。
+ * 顺序刻意安排：先终止会话并踢下线（切断写入源），再清理各持久化数据。
+ * 注意 pointsCache 必须与分片文件同删——否则任何一次积分变动会把内存对象重新写回磁盘。
+ * 返回清理摘要供管理页展示。
+ */
+async function purgeDevice(deviceId) {
+    const summary = { kicked: false, sessionsEnded: 0, trustEdgesRemoved: 0 };
+    if (!deviceId) return summary;
+
+    // ① 终止该设备参与的进行中会话（会话终止会自行落盘并通知对端）
+    const involvedSids = [];
+    for (const [sid, s] of sessions) {
+        if (s.controller === deviceId || s.host === deviceId) involvedSids.push(sid);
+    }
+    for (const sid of involvedSids) {
+        try { await forceTerminate(sid, 'device_deleted'); summary.sessionsEnded++; }
+        catch (e) { logWarn('[purge] 终止会话失败', sid && sid.slice(-8), e && e.message); }
+    }
+
+    // ② 踢下线：关闭该设备全部 WS 连接（客户端 App 若仍在运行，会在下次注册时重建档案——管理页已有提示）
+    const conns = online.get(deviceId);
+    if (conns) {
+        for (const ws of conns) {
+            if (ws && ws.readyState === ws.OPEN) {
+                try { ws.send(JSON.stringify({ op: 'kicked', payload: { reason: 'device_deleted' } })); } catch (e) { /* ignore */ }
+                try { ws.close(1000, 'device_deleted'); } catch (e) { try { ws.terminate(); } catch (_) { /* ignore */ } }
+                summary.kicked = true;
+            }
+        }
+        online.delete(deviceId);
+    }
+
+    // ③ 被控码登记：过滤该 host 的条目
+    try {
+        await withFileLock(CONTROL_CODE_FILE, async () => {
+            const list = readJson(CONTROL_CODE_FILE, []);
+            const next = list.filter(c => c.hostId !== deviceId);
+            if (next.length !== list.length) writeJson(CONTROL_CODE_FILE, next);
+        });
+    } catch (e) { logWarn('[purge] 清理控制码失败', e && e.message); }
+
+    // ④ 信任绑定：删本端条目 + 所有对端指向该设备的边（双向，避免对端出现幽灵设备）
+    //    先收集受影响对端，删除后逐个推送 trust.removed + 最新 trust.list（客户端已有该事件处理：
+    //   会立即移除本地条目并刷新列表，对端远程设备页不残留幽灵设备）
+    const trustPeers = new Set(Object.keys(trustCache[deviceId] || {}));
+    if (trustCache[deviceId]) {
+        delete trustCache[deviceId];
+        saveTrustCache();
+    }
+    let edges = 0;
+    for (const me of Object.keys(trustCache)) {
+        if (trustCache[me] && trustCache[me][deviceId]) {
+            delete trustCache[me][deviceId];
+            edges++;
+            trustPeers.add(me);
+        }
+    }
+    if (edges > 0) {
+        summary.trustEdgesRemoved += edges;
+        saveTrustCache();
+    }
+    for (const peer of trustPeers) {
+        if (peer === deviceId) continue;
+        try {
+            relayTo(peer, { op: 'trust.removed', payload: { peer: deviceId } });
+            relayTo(peer, { op: 'trust.list', payload: { list: getTrustList(peer) } });
+        } catch (e) { /* 忽略单对端推送失败 */ }
+    }
+
+    // ⑤ 管理标记 / 自切换
+    if (adminCache[deviceId]) {
+        delete adminCache[deviceId];
+        saveAdminCache();
+    }
+
+    // ⑥ 积分：内存缓存与分片文件同删
+    delete pointsCache[hashKeyOf(deviceId)];
+    try {
+        const pf = pointsFilePath(deviceId);
+        if (fs.existsSync(pf)) fs.unlinkSync(pf);
+    } catch (e) { logWarn('[purge] 删除积分分片失败', e && e.message); }
+
+    // ⑦ 套餐订阅
+    if (subscriptionCache && subscriptionCache[deviceId] !== undefined) {
+        delete subscriptionCache[deviceId];
+        fs.writeFile(SUBSCRIPTION_FILE, JSON.stringify(subscriptionCache, null, 2), (e) => {
+            if (e) logError('[purge] 订阅刷盘失败', e);
+        });
+    }
+
+    // ⑧ 内存暂存态（离线互动消息 / 待命状态 / 待确认信任绑定）
+    pendingInteractMsgs.delete(deviceId);
+    standbyMap.delete(deviceId);
+    for (const [key, pend] of pendingTrust) {
+        if (pend && (pend.from === deviceId || pend.to === deviceId)) pendingTrust.delete(key);
+    }
+
+    // ⑨ 历史留痕：sessions.json 过滤涉及条目；audit.log 重写过滤含该设备/相关会话的行
+    //    （audit 行内通常只有 sessionId，故同时按本次终止的会话 id 过滤）
+    try {
+        await withFileLock(SESSION_FILE, async () => {
+            const list = readJson(SESSION_FILE, []);
+            const next = list.filter(s => s.controller !== deviceId && s.host !== deviceId);
+            if (next.length !== list.length) writeJson(SESSION_FILE, next);
+        });
+    } catch (e) { logWarn('[purge] 清理历史会话失败', e && e.message); }
+    try {
+        if (fs.existsSync(AUDIT_LOG_FILE)) {
+            const raw = fs.readFileSync(AUDIT_LOG_FILE, 'utf8');
+            const keywords = [deviceId, ...involvedSids].filter(Boolean);
+            const kept = raw.split('\n').filter(l => l && !keywords.some(k => l.includes(k)));
+            fs.writeFileSync(AUDIT_LOG_FILE, kept.length ? kept.join('\n') + '\n' : '');
+        }
+    } catch (e) { logWarn('[purge] 清理审计日志失败', e && e.message); }
+
+    return summary;
 }
 
 // ---- 转发辅助 ----
@@ -1499,6 +1643,66 @@ async function handleMessage(ws, m) {
             break;
         }
 
+        // ── 积分商城（气泡皮肤，2026-10-31）──
+        // 价格表与客户端 BubbleSkins 严格同名同价（改动必须双端同步）。
+        // 购买：校验价格/余额 → 扣费记账 → 追加 ownedSkins → 自动装备 equippedSkin
+        //       → pushPoints 刷新本机 → skin.updated 广播信任对端（对端渲染你的气泡用）。
+        // 装备：仅限已拥有（default 恒可），切换同样广播对端。全程幂等可重试。
+        case 'points.skin.purchase': {
+            const skinId = (m.payload && m.payload.skinId) || '';
+            const price = SKIN_CATALOG[skinId];
+            if (!price) {
+                relayTo(deviceId, { op: 'skin.result', payload: { ok: false, skinId, reason: '未知皮肤' } });
+                break;
+            }
+            const p = getPoints(deviceId);
+            p.ownedSkins = Array.isArray(p.ownedSkins) ? p.ownedSkins : [];
+            if (p.ownedSkins.includes(skinId)) {
+                // 已拥有：不重复扣费，直接装备
+                p.equippedSkin = skinId;
+                savePoints(deviceId);
+                pushPoints(deviceId);
+                broadcastSkin(deviceId, skinId);
+                relayTo(deviceId, { op: 'skin.result', payload: { ok: true, skinId, alreadyOwned: true } });
+                break;
+            }
+            if (p.balance < price) {
+                relayTo(deviceId, { op: 'skin.result', payload: { ok: false, skinId, reason: '积分不足' } });
+                break;
+            }
+            p.balance = Math.round((p.balance - price) * 10) / 10;
+            p.totalSpent = (p.totalSpent || 0) + price;
+            p.ownedSkins.push(skinId);
+            p.equippedSkin = skinId;
+            savePoints(deviceId);
+            logInfo(`[POINTS] 购买皮肤 device=${deviceId.slice(-8)} skin=${skinId} -${price} 余额=${p.balance}`);
+            addHistory(deviceId, 'skin_purchase', -price, p.balance, `购买气泡皮肤「${skinId}」`);
+            pushPoints(deviceId);
+            pushNotice(deviceId, 'skin_purchase', -price);
+            broadcastSkin(deviceId, skinId);
+            relayTo(deviceId, { op: 'skin.result', payload: { ok: true, skinId } });
+            break;
+        }
+        case 'points.skin.equip': {
+            const skinId = (m.payload && m.payload.skinId) || 'default';
+            if (skinId !== 'default' && !SKIN_CATALOG[skinId]) {
+                relayTo(deviceId, { op: 'skin.result', payload: { ok: false, skinId, reason: '未知皮肤' } });
+                break;
+            }
+            const p = getPoints(deviceId);
+            p.ownedSkins = Array.isArray(p.ownedSkins) ? p.ownedSkins : [];
+            if (skinId !== 'default' && !p.ownedSkins.includes(skinId)) {
+                relayTo(deviceId, { op: 'skin.result', payload: { ok: false, skinId, reason: '尚未拥有该皮肤' } });
+                break;
+            }
+            p.equippedSkin = skinId;
+            savePoints(deviceId);
+            pushPoints(deviceId);
+            broadcastSkin(deviceId, skinId);
+            relayTo(deviceId, { op: 'skin.result', payload: { ok: true, skinId } });
+            break;
+        }
+
         // 控制端查询自身是否为管理设备（仅查询，admin 标记实际由控制端在指令内携带）
         case 'admin.query': {
             ws.send(JSON.stringify({ op: 'admin.status', payload: { isAdmin: isAdmin(deviceId), allowSelfSwitch: isSelfSwitchAllowed(deviceId) } }));
@@ -1660,5 +1864,7 @@ module.exports = {
     setSelfSwitchAllowed,
     getPoints,
     adjustPoints,
+    // 管理页「删除设备」：清空远程协助体系内该设备的全部数据与内存态
+    purgeDevice,
     _internal: { online, sessions, consumeControlCode, lookupControlCode, createControlCode },
 };

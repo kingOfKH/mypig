@@ -7,6 +7,11 @@ data/*
 # （如 trust.json / sessions.json / points 等分片等机器私有状态）。
 !data/emoji/
 !data/emoji/*.json
+# 气泡皮肤造型图：仅入库现行使用的 bubble_*.png 静态素材（/skins 路由即读即发）；
+# 目录内其余内容（AI 底稿 jpg / 废弃立绘 deco_*.png）为已废弃方案的工作稿，不入库
+!data/skins/
+data/skins/*
+!data/skins/bubble_*.png
 node_modules/
 .git/
 .env

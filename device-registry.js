@@ -138,6 +138,30 @@ async function bumpAvatar(deviceId) {
 }
 
 /**
+ * 直接设定头像版本号（**不新增版本**）。
+ * 用户「选用历史头像」时用：只把"当前头像"指向一个已存在的归档版本，
+ * 版本号因此可以是变小的（例如 7 → 3），所以任何"版本号单调递增"的假设都不成立。
+ */
+async function setAvatarVersion(deviceId, version) {
+    if (!deviceId) return 0;
+    const v = Number(version) || 0;
+    return withLock(REGISTRY_FILE, async () => {
+        const list = readAll();
+        let dev = list.find(d => d.deviceId === deviceId);
+        const ts = getChinaTime();
+        if (!dev) {
+            dev = { deviceId, deviceName: fallbackName(deviceId), createdAt: ts, updatedAt: ts, lastActiveAt: ts };
+            list.push(dev);
+        }
+        dev.avatarVersion = v;
+        dev.lastActiveAt = ts;
+        writeAll(list);
+        refreshIndex(list);
+        return dev.avatarVersion;
+    });
+}
+
+/**
  * 注册设备（幂等）。语义与旧接口一致：
  * - 新设备：以传入名称（或兜底名）建档
  * - 已存在：仅刷新 lastActiveAt，**不覆盖已有名称**（避免启动/心跳用本地值把服务端更新的名字改回去）
@@ -285,6 +309,7 @@ module.exports = {
     getDisplayName,
     getAvatarVersion,
     bumpAvatar,
+    setAvatarVersion,
     upsertDevice,
     setName,
     touch,

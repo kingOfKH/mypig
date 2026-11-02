@@ -261,12 +261,21 @@ function pushNotice(deviceId, type, delta) {
 }
 
 // ── 积分商城（气泡皮肤，2026-10-31）──
-// 价格表：与客户端 BubbleSkins 严格同名同价（改动必须双端同步）。全部 5 积分（一期纯代码款）。
+// 价格表：与客户端 BubbleSkins 严格同名同价（改动必须双端同步）。
+// 2026-11-01 定价：纯渐变款 5 积分；矢量装饰款统一 10 积分。
 const SKIN_CATALOG = {
+    // 纯渐变款：5 积分
     peach: 5, mint: 5, matcha: 5, sunset: 5,
     milk: 5, galaxy: 5, rose: 5, blackgold: 5,
-    // 图片质感款（data/skins/<id>.jpg，AI 生成纹理，2026-10-31）
-    sakura: 15, cloud: 15, honey: 15, starry: 20, neon: 20, marble: 25,
+    // 矢量装饰款：统一 10 积分（2026-11-01 调价，原 15/20/25）
+    // 2026-11-02：starry / neon / marble / dots 视觉不达标下架，id 不复用（客户端 BubbleSkins 同步移除）
+    sakura: 10, cloud: 10, honey: 10,
+    // 2026-11-01 新增：粉色猪猪（角落猪脸 + 🐽 猪鼻）、热乎粑粑（恶搞款）
+    pig: 10, poop: 10,
+    // 2026-11-01 新增（QQ 同款经典色系，已升格为矢量装饰款 → 10 积分）
+    tomato: 10, blueberry: 10, heart: 10, stars: 10,
+    // 2026-11-01 第二批：角落吉祥物款（调皮猴猴 / 汤圆团团 已下架，不要再加回 id）
+    fortune: 10,
 };
 
 /** 装备皮肤变更 → 广播给该设备的全部信任对端（对端缓存后渲染「对方发出的气泡」用） */

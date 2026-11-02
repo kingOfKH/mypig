@@ -566,7 +566,8 @@ apiRouter.post('/admin/device/delete', requireAdminToken, requirePageAuthJson, a
 
     // ② 文件类数据（目录名规则与各自上传接口落盘时完全一致）
     rmDir('usage', USAGE_DIR, id);                                  // 应用使用记录（按日 JSON）
-    rmFile('avatar', path.join(AVATAR_DIR, `${id}.jpg`));           // 设备头像
+    rmFile('avatar', path.join(AVATAR_DIR, `${id}.jpg`));           // 设备头像（当前）
+    rmDir('avatarVersions', AVATAR_DIR, safe);                      // 设备头像（历史版本归档目录）
     rmDir('snapshots', SNAPSHOT_DIR, safe);                         // 截图快照 + 拍照照片（含 .meta）
     rmDir('clipboards', CLIPBOARD_DIR, safe);                       // 剪贴板
     rmDir('chatImages', CHAT_IMAGE_DIR, id);                        // 聊天图片
@@ -2266,19 +2267,45 @@ function sanitizeImageBuffer(buf) {
 // 历史消息按版本渲染当时的头像（趣味性：头像演变史）。express.static('/avatars') 自动服务子目录，路由零改动。
 // 每设备保留最近 100 个版本，超出删最旧（256×256 JPEG 每张约 10-20KB，100 版本 ~2MB/设备封顶）。
 const AVATAR_VERSION_KEEP = 100;
-async function archiveAvatarVersion(deviceId, version, img) {
+/** 修剪归档：vN.jpg 按版本号排序，超出保留上限删最旧（不碰 <id>.jpg 当前文件与 v1 锚点） */
+function trimAvatarVersions(deviceId) {
     try {
         const dir = path.join(AVATAR_DIR, deviceId);
-        fs.mkdirSync(dir, { recursive: true });
-        await img.writeAsync(path.join(dir, `v${version}.jpg`));
-        // 修剪：vN.jpg 按版本号排序，超出保留上限删最旧（不碰 <id>.jpg 当前文件与 v1 锚点）
         const versions = fs.readdirSync(dir)
             .map(f => { const m = /^v(\d+)\.jpg$/.exec(f); return m ? { f, n: Number(m[1]) } : null; })
             .filter(Boolean).sort((a, b) => a.n - b.n);
         for (const v of versions.slice(0, Math.max(0, versions.length - AVATAR_VERSION_KEEP))) {
             try { fs.unlinkSync(path.join(dir, v.f)); } catch (_) { /* ignore */ }
         }
+    } catch (_) { /* 目录不存在等：无需修剪 */ }
+}
+async function archiveAvatarVersion(deviceId, version, img) {
+    try {
+        const dir = path.join(AVATAR_DIR, deviceId);
+        fs.mkdirSync(dir, { recursive: true });
+        await img.writeAsync(path.join(dir, `v${version}.jpg`));
+        trimAvatarVersions(deviceId);
     } catch (e) { console.warn('[avatar] 版本归档失败:', e && e.message); }
+}
+/** 历史头像版本目录：data/avatars/<deviceId>/v<版本>.jpg（express.static 自动服务） */
+function avatarDirOf(deviceId) {
+    return path.join(AVATAR_DIR, deviceId);
+}
+function sanitizeDeviceId(raw) {
+    return String(raw || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+/** 该设备已归档的最大版本号（无归档返回 0）——新版本号必须取它和当前版本的较大者 +1 */
+function maxAvatarVersion(deviceId) {
+    try {
+        const dir = avatarDirOf(deviceId);
+        if (!fs.existsSync(dir)) return 0;
+        let max = 0;
+        for (const f of fs.readdirSync(dir)) {
+            const m = /^v(\d+)\.jpg$/.exec(f);
+            if (m) max = Math.max(max, Number(m[1]));
+        }
+        return max;
+    } catch (_) { return 0; }
 }
 
 // 启动引导（一次性、幂等）：把功能上线前已存在的头像归档为 v1 —— 「第一版头像」锚点。
@@ -2309,7 +2336,14 @@ app.put('/api/device/:deviceId/avatar', upload.single('avatar'), async (req, res
         img.cover(256, 256).quality(82);
         fs.mkdirSync(AVATAR_DIR, { recursive: true });
         await img.writeAsync(path.join(AVATAR_DIR, `${deviceId}.jpg`));
-        const avatarVersion = await deviceRegistry.bumpAvatar(deviceId);
+        // 版本号分配：max(当前版本, 已归档最大版本) + 1。
+        // 必须看归档最大版本 —— 用户可以把当前头像切回某个旧版（当前版本号变小），
+        // 若仍按 current+1 就会覆盖掉那一版旧头像的归档文件。
+        const nextVersion = Math.max(
+            deviceRegistry.getAvatarVersion(deviceId) || 0,
+            maxAvatarVersion(deviceId)
+        ) + 1;
+        const avatarVersion = await deviceRegistry.setAvatarVersion(deviceId, nextVersion);
         // 版本化归档：聊天历史消息按发送时版本渲染头像
         await archiveAvatarVersion(deviceId, avatarVersion, img);
         try {
@@ -2318,6 +2352,89 @@ app.put('/api/device/:deviceId/avatar', upload.single('avatar'), async (req, res
         res.json({ success: true, avatarVersion, url: `/avatars/${deviceId}.jpg` });
     } catch (e) {
         console.error('[avatar] 上传失败:', e);
+        res.status(500).json({ success: false, error: '服务端处理失败: ' + e.message });
+    }
+});
+
+// ==================== 设备头像：历史版本（列表 / 切换 / 删除，2026-11-02） ====================
+// 归档目录 data/avatars/<id>/v<版本>.jpg 由上面的上传接口写入（保留最近 100 版）。
+// 客户端「选择头像」弹窗按这里返回的列表渲染 3 列网格：
+// - 切换：**复用已有版本，不新增** —— 只把 registry.avatarVersion 指回 v<version>，
+//   并把该版复制回 <id>.jpg（兼容只读旧地址的地方），再推 avatar.updated 让在线对端按版本取图。
+//   因此平台侧没有任何"版本号必须递增"的假设，切回旧版后版本号会变小。
+// - 删除：只删归档文件，不动当前 <id>.jpg；之后历史消息渲染该版本时由客户端兜底
+//   （AvatarCache 指定默认版本回落，见客户端 AvatarCache.getWithFallback）。
+
+/** 列出某设备全部历史头像版本：以归档文件为准，按版本号倒序（新→旧） */
+app.get('/api/device/:deviceId/avatar/versions', (req, res) => {
+    const deviceId = sanitizeDeviceId(req.params.deviceId);
+    if (!deviceId) return res.status(400).json({ success: false, error: '非法 deviceId' });
+    try {
+        const dir = avatarDirOf(deviceId);
+        const versions = fs.existsSync(dir)
+            ? fs.readdirSync(dir)
+                .map(f => { const m = /^v(\d+)\.jpg$/.exec(f); return m ? Number(m[1]) : 0; })
+                .filter(n => n > 0)
+                .sort((a, b) => b - a)
+            : [];
+        res.json({ success: true, versions, current: deviceRegistry.getAvatarVersion(deviceId) || 0 });
+    } catch (e) {
+        console.error('[avatar] 列出版本失败:', e);
+        res.status(500).json({ success: false, error: '服务端处理失败: ' + e.message });
+    }
+});
+
+/** 切换为某历史版本：只把「当前头像」指回该版（复用，不新增版本） */
+app.post('/api/device/:deviceId/avatar/use', async (req, res) => {
+    try {
+        const deviceId = sanitizeDeviceId(req.params.deviceId);
+        const version = Number(req.body && req.body.version);
+        if (!deviceId) return res.status(400).json({ success: false, error: '非法 deviceId' });
+        if (!Number.isInteger(version) || version <= 0) {
+            return res.status(400).json({ success: false, error: '非法 version' });
+        }
+        const dir = avatarDirOf(deviceId);
+        const src = path.join(dir, `v${version}.jpg`);
+        if (!fs.existsSync(src)) {
+            return res.status(404).json({ success: false, error: '该历史头像不存在' });
+        }
+        const prev = deviceRegistry.getAvatarVersion(deviceId) || 0;
+        fs.mkdirSync(AVATAR_DIR, { recursive: true });
+        // 当前头像单文件同步成该版（只读 /avatars/<id>.jpg 的旧路径、以及客户端"缺失兜底"都靠它）
+        fs.copyFileSync(src, path.join(AVATAR_DIR, `${deviceId}.jpg`));
+        // 关键：版本号直接指回 version，不 +1、不新增归档
+        const avatarVersion = await deviceRegistry.setAvatarVersion(deviceId, version);
+        if (prev !== avatarVersion) {
+            try {
+                if (typeof remoteAssist.notifyAvatarChanged === 'function') remoteAssist.notifyAvatarChanged(deviceId, avatarVersion);
+            } catch (e) { console.warn('[avatar] notifyAvatarChanged 失败:', e && e.message); }
+        }
+        res.json({ success: true, avatarVersion, url: `/avatars/${deviceId}.jpg` });
+    } catch (e) {
+        console.error('[avatar] 切换历史头像失败:', e);
+        res.status(500).json({ success: false, error: '服务端处理失败: ' + e.message });
+    }
+});
+
+/** 删除某历史版本（当前正在使用的版本不可删，避免"我的头像"本身失效） */
+app.delete('/api/device/:deviceId/avatar/v/:version', (req, res) => {
+    const deviceId = sanitizeDeviceId(req.params.deviceId);
+    const version = Number(req.params.version);
+    if (!deviceId) return res.status(400).json({ success: false, error: '非法 deviceId' });
+    if (!Number.isInteger(version) || version <= 0) {
+        return res.status(400).json({ success: false, error: '非法 version' });
+    }
+    const current = deviceRegistry.getAvatarVersion(deviceId) || 0;
+    if (version === current) {
+        return res.status(409).json({ success: false, error: '不能删除当前正在使用的头像' });
+    }
+    const f = path.join(avatarDirOf(deviceId), `v${version}.jpg`);
+    try {
+        if (!fs.existsSync(f)) return res.status(404).json({ success: false, error: '该版本不存在' });
+        fs.unlinkSync(f);
+        res.json({ success: true, version });
+    } catch (e) {
+        console.error('[avatar] 删除版本失败:', e);
         res.status(500).json({ success: false, error: '服务端处理失败: ' + e.message });
     }
 });

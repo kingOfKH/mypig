@@ -204,6 +204,12 @@ function getPoints(deviceId) {
     if (typeof p.equippedSkin !== 'string' || !p.equippedSkin) p.equippedSkin = 'default';
     return p;
 }
+/** 只读地取某设备当前装备皮肤：命中缓存或分片文件，避免 getPoints() 「首次访问即落盘」的副作用 */
+function getEquippedSkin(deviceId) {
+    const key = hashKeyOf(deviceId);
+    const p = pointsCache[key] || readJson(pointsFilePath(deviceId), null);
+    return (p && typeof p.equippedSkin === 'string' && p.equippedSkin) ? p.equippedSkin : 'default';
+}
 // 向设备推送最新积分状态（服务端 → 客户端，增量更新镜像）。
 // 明细分页：保留最近 50 条；第 1 页发最近 20 条，第 2 页发较早的 30 条（合计 50）；
 // 客户端点「查看更多」时带 page=1 拉取；50 条拉完 hasMore=false，客户端提示「只支持查看最近 50 条」。
@@ -264,12 +270,16 @@ function pushNotice(deviceId, type, delta) {
 // 价格表：与客户端 BubbleSkins 严格同名同价（改动必须双端同步）。
 // 2026-11-01 定价：纯渐变款 5 积分；矢量装饰款统一 10 积分。
 const SKIN_CATALOG = {
-    // 纯渐变款：5 积分
-    peach: 5, mint: 5, matcha: 5, sunset: 5,
-    milk: 5, galaxy: 5, rose: 5, blackgold: 5,
+    // 5 积分档（2026-11-05：sunset / milk 已调至 10 积分档，见下方）
+    peach: 5, mint: 5, matcha: 5,
+    rose: 5, blackgold: 5,
     // 矢量装饰款：统一 10 积分（2026-11-01 调价，原 15/20/25）
+    // 2026-11-05：落日公路 sunset / 乌龙奶盖 milk 由 5 统一调整为 10（与客户端 BubbleSkins.all 同步）
+    sunset: 10, milk: 10,
     // 2026-11-02：starry / neon / marble / dots 视觉不达标下架，id 不复用（客户端 BubbleSkins 同步移除）
-    sakura: 10, cloud: 10, honey: 10,
+    // 2026-11-03：galaxy（星河夜航）视觉不达标下架，id 不复用（客户端 BubbleSkins 同步移除）
+    // 2026-11-06：sakura（樱花信笺 / 盛夏樱花）视觉不达标，用户明确下架删除，id 不复用（客户端 BubbleSkins 同步移除）
+    cloud: 10, honey: 10,
     // 2026-11-01 新增：粉色猪猪（角落猪脸 + 🐽 猪鼻）、热乎粑粑（恶搞款）
     pig: 10, poop: 10,
     // 2026-11-01 新增（QQ 同款经典色系，已升格为矢量装饰款 → 10 积分）
@@ -282,7 +292,14 @@ const SKIN_CATALOG = {
 function broadcastSkin(deviceId, skinId) {
     const peers = getTrustList(deviceId);
     for (const peer of peers) {
-        relayTo(peer.deviceId, { op: 'skin.updated', payload: { deviceId, skinId } });
+        // 用带应用层确认的转发：对端若是「僵尸在线」(半开 TCP)，6s 收不到确认就会被
+        // terminate → 触发它重连 → 连接建立时会重放一遍对端皮肤，补上这次丢掉的广播。
+        // 上线重放是权威兜底，故这里确认超时无需再入队（皮肤是幂等状态而非消息）。
+        relayWithDelivery(
+            peer.deviceId,
+            { op: 'skin.updated', payload: { deviceId, skinId } },
+            () => { console.log(`[skin] ${String(peer.deviceId).slice(-8)} 未确认皮肤更新，等待其上线重放`); }
+        );
     }
 }
 // 扣费（控制端付费），余额下限 0；扣完主动推送最新状态
@@ -382,6 +399,26 @@ const pendingDisconnects = new Map();
 const standbyMap = new Map();
 // 离线互动消息暂存：peerId -> [{ from, action, ts }]  对方离线时存此，上线后批量推送
 const pendingInteractMsgs = new Map();
+// 离线回执暂存：controllerId -> [{ payload, ts }]
+// trust.cmd_ack 原本在控制端不在线时直接丢弃 → 发送方锁屏/断网期间对方解锁补展示的回执永久丢失，
+// 消息永远停在「未读」。客户端的打勾按 msgId 幂等，故这里可以安全补投（重复投递无副作用）。
+const pendingTrustAcks = new Map();
+const PENDING_ACK_MAX = 200;        // 单设备最多暂存 200 条，防止长期离线打爆内存
+const PENDING_ACK_TTL_MS = 24 * 3600 * 1000;
+
+// ── 应用层投递确认 ──
+// 背景：online Map 里「有 ws 对象」不等于「对方还能收到帧」。TCP 半开 / 客户端锁屏断网时，
+// ws.send() 依然成功，但帧石沉大海；协议层 ping/pong 要 30~60s 才发现，这段窗口内：
+//   · 下发的 interact.* 消息既没送到、也没进 pendingInteractMsgs，发送方收不到 offline_stored → 消息永久丢失
+//   · 对端回的 trust.cmd_ack 同样被吞掉 → 发送方消息永远停在空心圆圈
+// 方案：对支持能力(dv=1)的连接，下发关键帧时附带 did，客户端应用层回 trust.cmd_delivered；
+// 6s 内没等到确认就按「离线」兜底：主动 terminate 僵尸连接 + 暂存待补投 + 通知发送方。
+const pendingDelivery = new Map();  // did -> rec { wsList, dids, done, timer, onTimeout }
+const DELIVERY_TIMEOUT_MS = 6000;
+let deliverySeq = 0;
+function newDeliveryId() {
+    return 'd' + Date.now().toString(36) + '_' + (++deliverySeq).toString(36);
+}
 // 设备名统一由 device-registry 提供（持久化、跨体系唯一）；此处不再维护内存副本。
 // deviceId -> 信任对象集合  { "对方deviceId": { addedAt } }  持久化于 TRUST_FILE
 // 注意：信任边只存「关系」，不再冗余存对方名称——冗余副本正是历史"改名串号"bug 的温床。
@@ -694,6 +731,9 @@ function getTrustList(deviceId) {
             deviceName: canonical || '',
             // 头像版本：客户端据此判断是否需重新拉取（命中本地缓存则零联网）
             avatarVersion: deviceRegistry.getAvatarVersion(peerId),
+            // 当前装备的气泡皮肤：服务端 points 分片是权威。随信任列表下发，
+            // 让「对端离线期间我换了皮肤」在对方上线拉列表时就能纠正，不只依赖 skin.updated 广播。
+            skinId: getEquippedSkin(peerId),
             // 在线且处于待命状态才视为"可一键连接"
             online: online.has(peerId) && online.get(peerId).size > 0,
             standby: !!(standbyMap.get(peerId) && standbyMap.get(peerId).standby),
@@ -876,6 +916,7 @@ async function purgeDevice(deviceId) {
 
     // ⑧ 内存暂存态（离线互动消息 / 待命状态 / 待确认信任绑定）
     pendingInteractMsgs.delete(deviceId);
+    pendingTrustAcks.delete(deviceId);
     standbyMap.delete(deviceId);
     for (const [key, pend] of pendingTrust) {
         if (pend && (pend.from === deviceId || pend.to === deviceId)) pendingTrust.delete(key);
@@ -911,6 +952,47 @@ function relayTo(deviceId, obj) {
         if (ws && ws.readyState === ws.OPEN) {
             try { ws.send(JSON.stringify(obj)); sent = true; } catch (e) { /* 忽略单连接失败，继续其余连接 */ }
         }
+    }
+    return sent;
+}
+
+/**
+ * 需要应用层确认的转发。只有支持 dv=1 的连接会带 did 并被跟踪；
+ * 老版本连接保持裸转发（不跟踪、不超时），保证渐进升级期间不误判。
+ * 任一被跟踪连接回了 trust.cmd_delivered 即视为送达；全部超时才执行 onTimeout 兜底。
+ */
+function relayWithDelivery(deviceId, frame, onTimeout) {
+    const set = online.get(deviceId);
+    if (!set || set.size === 0) return false;
+    const rec = { wsList: [], dids: [], done: false, timer: null, onTimeout };
+    let sent = false;
+    for (const ws of set) {
+        if (!ws || ws.readyState !== ws.OPEN) continue;
+        try {
+            let out = frame;
+            if (ws.deliveryCapable) {
+                const did = newDeliveryId();
+                rec.dids.push(did);
+                rec.wsList.push(ws);
+                pendingDelivery.set(did, rec);
+                out = { ...frame, payload: { ...(frame.payload || {}), did } };
+            }
+            ws.send(JSON.stringify(out));
+            sent = true;
+        } catch (e) { /* 单连接失败不影响其余连接 */ }
+    }
+    if (rec.dids.length) {
+        rec.timer = setTimeout(() => {
+            if (rec.done) return;
+            rec.done = true;
+            for (const d of rec.dids) pendingDelivery.delete(d);
+            // 主动踢掉僵尸连接：让 online 立刻清空，后续帧直接走离线分支（不再静默吞帧）
+            for (const ws of rec.wsList) {
+                try { ws.terminate(); } catch (e) {}
+            }
+            console.log(`[delivery] 未收到应用层确认，按离线兜底 device=${String(deviceId).slice(-8)} op=${frame.op}`);
+            try { rec.onTimeout(); } catch (e) { console.error('[delivery] 兜底执行失败', e); }
+        }, DELIVERY_TIMEOUT_MS);
     }
     return sent;
 }
@@ -979,6 +1061,8 @@ function attach(httpServer) {
         const deviceId = url.searchParams.get('deviceId');
         const token = url.searchParams.get('token');
         const dname = (url.searchParams.get('dname') || '').trim();
+        // dv=1：客户端支持「下发帧应用层确认」（收到带 did 的帧会回 trust.cmd_delivered）
+        const deliveryCapable = url.searchParams.get('dv') === '1';
 
         if (!deviceId || !verifyToken(deviceId, token)) {
             logWarn(`连接被拒 unauthorized device=${deviceId && deviceId.slice(-8)} token=${token ? '***' : '(空)'}`);
@@ -1001,6 +1085,7 @@ function attach(httpServer) {
         ws.deviceId = deviceId;
         ws.serverHost = extractServerHost(req);
         ws.isAlive = true;
+        ws.deliveryCapable = deliveryCapable;
         // 同一设备可有多个连接（常驻信令 + 远控页），全部计入在线集合
         if (!online.has(deviceId)) online.set(deviceId, new Set());
         online.get(deviceId).add(ws);
@@ -1014,12 +1099,49 @@ function attach(httpServer) {
         // 通知信任对端：该设备已上线，控制端列表实时点亮
         notifyTrustPeers(deviceId);
 
+        // 上线皮肤对账：把该设备所有信任对端「当前装备」的皮肤重放一遍。
+        // skin.updated 是一次性广播（relayTo 对离线/半开连接直接丢帧），B 断网期间 A 换皮肤
+        // 后，这一帧永久丢失且 B 无从感知；但服务端 points 分片里一直保存着 A 的新皮肤。
+        // 逐条复用已有 op，老客户端不用改也能被纠正。
+        try {
+            for (const peer of getTrustList(deviceId)) {
+                const equipped = getEquippedSkin(peer.deviceId);
+                ws.send(JSON.stringify({ op: 'skin.updated', payload: { deviceId: peer.deviceId, skinId: equipped } }));
+            }
+        } catch (e) { logError('[skin] 上线皮肤重放失败', e); }
+
         // 表情 catalog 引导同步：设备连接建立（含服务端重启后的自动重连）即单发一次通知，
         // 客户端收到后调用 EmojiCatalog.preload() 做 hash 增量同步（无变更时仅一次 catalog 拉取，零文件下载）。
         // 背景：管理页保存会走 broadcastEmojiCatalogUpdate 全量广播，但「直接改表情文件+重启服务端」
         // 没有这条路径，客户端只能等冷启动 preload；重启瞬间客户端尚未重连，启动时广播会落空，
         // 故改为连接建立时逐连接单发（客户端侧有 mutex 合并与 5s 节流，多连接重复通知无害）。
         try { ws.send(JSON.stringify({ op: 'emoji.catalog.update', payload: { ts: Date.now() } })); } catch (e) {}
+
+        // 离线回执补投：该设备（控制端）离线期间对端回的 trust.cmd_ack，现在批量转发。
+        // 客户端按 msgId + status=UNREAD 幂等落地，重复补投只会把对应那条打勾，不会串到别的消息。
+        if (pendingTrustAcks.has(deviceId)) {
+            const acks = pendingTrustAcks.get(deviceId) || [];
+            pendingTrustAcks.delete(deviceId);
+            const now = Date.now();
+            const fresh = acks.filter(a => now - a.ts < PENDING_ACK_TTL_MS);
+            if (fresh.length) {
+                logInfo(`[trust.cmd_ack] 控制端 ${deviceId.slice(-8)} 上线，补投 ${fresh.length} 条离线回执`);
+                for (const a of fresh) {
+                    // 补投同样等应用层确认：连接刚建立可能又瞬间掉线，确认不到就重新入队，
+                    // 否则「取出即删」会让这批回执彻底消失。
+                    relayWithDelivery(
+                        deviceId,
+                        { op: 'trust.cmd_ack', payload: a.payload },
+                        () => {
+                            if (!pendingTrustAcks.has(deviceId)) pendingTrustAcks.set(deviceId, []);
+                            const q = pendingTrustAcks.get(deviceId);
+                            if (q.length < PENDING_ACK_MAX) q.push(a);
+                            console.log(`[delivery] 补投回执仍未确认，重新入队 -> ${deviceId}`);
+                        }
+                    );
+                }
+            }
+        }
 
         // 离线互动消息补投：该设备离线期间暂存的 interact.* 消息，现在批量推送
         if (pendingInteractMsgs.has(deviceId)) {
@@ -1035,9 +1157,22 @@ function attach(httpServer) {
                     pAdmin = !!(actObj && actObj.admin);
                     pType = t || '';
                 } catch (e) {}
-                relayTo(deviceId, { op: 'trust.cmd', payload: { peer: msg.from, action: msg.action } });
-                if (pCost > 0 && !pAdmin) {
+                // 投递确认超时未收到时重新入队，下次上线再补投（避免「取出即删」丢消息）。
+                relayWithDelivery(
+                    deviceId,
+                    { op: 'trust.cmd', payload: { peer: msg.from, action: msg.action } },
+                    () => {
+                        msg.charged = true;      // 计费只做一次，重新入队不重复扣
+                        if (!pendingInteractMsgs.has(deviceId)) pendingInteractMsgs.set(deviceId, []);
+                        pendingInteractMsgs.get(deviceId).push(msg);
+                        console.log(`[delivery] 补投互动消息仍未确认，重新入队 -> ${deviceId}`);
+                    }
+                );
+                // 离线暂存的消息在首次下发时未走到 forward 的扣费分支，这里补扣一次；
+                // 因确认超时才转暂存的消息已扣过（charged=true），不能重复扣。
+                if (!msg.charged && pCost > 0 && !pAdmin) {
                     deduct(msg.from, pCost, 'trust.cmd:' + pType);
+                    msg.charged = true;
                 }
             }
         }
@@ -1467,6 +1602,29 @@ async function handleMessage(ws, m) {
         // 信任设备间指令：控制端向"在线"的受控端（未必处于活动会话中）下发指令（如锁屏）。
         // 受控端处理完后通过 trust.cmd_ack 回执，服务器再转发回控制端。
         // 约定：peer 一律放在 payload 内，便于客户端统一用 payload.peer 读取。
+        // 应用层投递确认：客户端收到带 did 的下发帧后回这一帧（见 relayWithDelivery）
+        case 'trust.cmd_delivered': {
+            const did = (m.payload && m.payload.did) || '';
+            const rec = pendingDelivery.get(did);
+            if (rec && !rec.done) {
+                rec.done = true;
+                if (rec.timer) clearTimeout(rec.timer);
+                for (const d of rec.dids) pendingDelivery.delete(d);
+            }
+            break;
+        }
+
+        // 上线已读对账：控制端把自己「仍未打勾」的发出消息 id 交给对端核实，
+        // 对端对确实已展示的逐条回带 msgId 的 ack，弥补任何时期丢失的回执。
+        // 纯转发、不计费；对端不在线就静默丢弃，控制端下次上线/进会话会再问一次。
+        case 'chat.read_sync': {
+            const p = m.payload || {};
+            if (p.peer && online.has(p.peer)) {
+                relayTo(p.peer, { op: 'chat.read_sync', payload: { ...p, peer: deviceId } });
+            }
+            break;
+        }
+
         case 'trust.cmd': {
             const payload = m.payload || {};
             const peerId = payload.peer;
@@ -1512,7 +1670,24 @@ async function handleMessage(ws, m) {
             // 透传给受控端（relayTo 按 deviceId 遍历其所有在线连接发送），
             // 携来源 deviceId（控制端，写入 payload.peer）以便其回执；action 为编码后的 ActionJson 字符串
             console.log(`[trust.cmd] 转发 -> 被控端 ${peerId} action=${(payload.action || '').slice(0, 80)}`);
-            relayTo(peerId, { op: 'trust.cmd', payload: { peer: deviceId, action: payload.action } });
+            // 转发后等对方应用层确认；没等到（半开连接 / 瞬间断网）就按离线暂存，
+            // 并给发送方补一条 offline_stored，避免「消息既没送到、也没有离线提示」的静默丢失。
+            relayWithDelivery(
+                peerId,
+                { op: 'trust.cmd', payload: { peer: deviceId, action: payload.action } },
+                () => {
+                    if (!cmdType.startsWith('interact.')) return;
+                    if (!pendingInteractMsgs.has(peerId)) pendingInteractMsgs.set(peerId, []);
+                    const q = pendingInteractMsgs.get(peerId);
+                    // 按 action 去重：若对端其实收到了、只是确认帧丢了，上线补投时不会重复入队
+                    if (!q.some(x => x.action === payload.action)) {
+                        // charged=true：这条在 forward 分支已扣过费，补投时不能再扣
+                        q.push({ from: deviceId, action: payload.action, ts: Date.now(), charged: true });
+                    }
+                    console.log(`[delivery] 互动消息转入离线暂存 -> ${peerId} type=${cmdType} pending=${q.length}`);
+                    relayTo(deviceId, { op: 'trust.cmd_ack', payload: { peer: peerId, ok: true, type: cmdType, reason: 'offline_stored' } });
+                }
+            );
             // 转发即送达：立即扣费（回执分支不再扣，避免重复计费）
 
             if (cmdCost > 0 && !cmdAdmin) {
@@ -1571,9 +1746,34 @@ async function handleMessage(ws, m) {
             if (targetSet && targetSet.size > 0) {
                 // 透传完整 payload（含 ok/reason/url 等快照字段），仅覆盖 peer 为回执来源设备（被控端）
                 console.log(`[trust.cmd_ack] 转发 -> 控制端 ${controllerId}`);
-                relayTo(controllerId, { op: 'trust.cmd_ack', payload: { ...payload, peer: deviceId } });
-            } else {
-                console.log(`[trust.cmd_ack] 控制端 ${controllerId} 不在线，丢弃回执`);
+                const forwarded = { ...payload, peer: deviceId };
+                // 同样要等控制端应用层确认：否则「服务端以为在线」的僵尸连接会吞掉回执，
+                // 发送方那条消息就永远停在空心圆圈（本轮修复的核心现象）。
+                relayWithDelivery(
+                    controllerId,
+                    { op: 'trust.cmd_ack', payload: forwarded },
+                    () => {
+                        if (!controllerId) return;
+                        if (!pendingTrustAcks.has(controllerId)) pendingTrustAcks.set(controllerId, []);
+                        const q = pendingTrustAcks.get(controllerId);
+                        if (q.length < PENDING_ACK_MAX) {
+                            q.push({ payload: forwarded, ts: Date.now() });
+                            console.log(`[delivery] 回执未确认，转入离线暂存 -> ${controllerId} type=${payload.type || ''}`);
+                        }
+                    }
+                );
+            } else if (controllerId) {
+                // 控制端（原消息发送方）此刻离线/锁屏断链：暂存回执，等它上线后补投。
+                // peer 在这里就固定为回执发起方 deviceId，与在线转发时的 payload 完全一致。
+                const forwarded = { ...payload, peer: deviceId };
+                if (!pendingTrustAcks.has(controllerId)) pendingTrustAcks.set(controllerId, []);
+                const q = pendingTrustAcks.get(controllerId);
+                if (q.length < PENDING_ACK_MAX) {
+                    q.push({ payload: forwarded, ts: Date.now() });
+                    console.log(`[trust.cmd_ack] 控制端 ${controllerId} 不在线，暂存回执(${q.length})待补投 type=${payload.type || ''}`);
+                } else {
+                    console.log(`[trust.cmd_ack] 控制端 ${controllerId} 待补投回执已达上限，丢弃 type=${payload.type || ''}`);
+                }
             }
             break;
         }

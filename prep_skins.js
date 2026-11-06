@@ -7,7 +7,7 @@ const SRC = 'D:/AndroidApp/starClick-a/.skins/tmp';
 const DST = path.join(__dirname, 'data', 'skins');
 fs.mkdirSync(DST, { recursive: true });
 
-const ids = ['sakura', 'starry', 'marble', 'honey', 'cloud', 'neon'];
+const ids = ['starry', 'marble', 'honey', 'cloud', 'neon'];
 
 (async () => {
     for (const id of ids) {

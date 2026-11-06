@@ -13,7 +13,6 @@ fs.mkdirSync(DST, { recursive: true });
 const files = [
     ['bubble_goldframe.jpg', 'bubble_marble.png', 246],
     ['bubble_cat.jpg',        'bubble_honey.png',  246],
-    ['bubble_sakura.jpg',     'bubble_sakura.png', 246],
     ['bubble_starry.jpg',     'bubble_starry.png', 246],
     ['bubble_cloud.jpg',      'bubble_cloud.png',  252],
     ['bubble_neon.jpg',       'bubble_neon.png',   246],

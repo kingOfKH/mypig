@@ -7,7 +7,7 @@ const SRC = 'D:/AndroidApp/starClick-a/.skins/tmp';
 const DST = path.join(__dirname, 'data', 'skins');
 fs.mkdirSync(DST, { recursive: true });
 
-const ids = ['sakura', 'cloud', 'honey', 'starry', 'neon', 'marble'];
+const ids = ['cloud', 'honey', 'starry', 'neon', 'marble'];
 const THRESHOLD = 244; // r/g/b 全部 ≥ 该值视为背景白
 
 (async () => {

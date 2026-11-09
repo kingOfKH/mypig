@@ -66,9 +66,16 @@ let probeTimer = null;
 
 // ---------------------------------------------------------------- OS 层
 function readOsMemory() {
-    const out = { platform: process.platform, rssIsWorkingSet: true, commitBytes: null };
-    // 任务管理器 / process.memoryUsage().rss 是「工作集」，会被 OS trim；
-    // Linux 上额外读 VmSize(提交) / RssAnon，避免把被换出的页误判成「内存已释放」。
+    const out = {
+        platform: process.platform,
+        rssIsWorkingSet: true,
+        virtualBytes: null,   // VmSize：虚拟地址空间，不是物理内存占用
+        vmRssBytes: null,
+        rssAnonBytes: null,
+        rssFileBytes: null,
+        swapBytes: null,
+        pages: {}             // /proc/self/smaps_rollup 的物理页归因（字节）
+    };
     if (process.platform !== 'linux') return out;
     try {
         const txt = fs.readFileSync('/proc/self/status', 'utf8');
@@ -77,11 +84,22 @@ function readOsMemory() {
             return m ? Number(m[1]) * 1024 : null;
         };
         out.vmRssBytes = pick('VmRSS');
-        out.commitBytes = pick('VmSize');
+        out.virtualBytes = pick('VmSize');
         out.rssAnonBytes = pick('RssAnon');
         out.rssFileBytes = pick('RssFile');
         out.swapBytes = pick('VmSwap');
     } catch (e) { /* 容器里可能无权限，忽略 */ }
+    // smaps_rollup 的 Pss 是「比例集」：私有页全算、共享页按共享进程数摊分。
+    // 用它把 rss - heapTotal - external 的未归因段拆成「本进程独占」与「共享库/文件页」。
+    try {
+        const rollup = fs.readFileSync('/proc/self/smaps_rollup', 'utf8');
+        const keys = ['Rss', 'Pss', 'Pss_Anon', 'Pss_File', 'Pss_Shmem',
+            'Shared_Clean', 'Shared_Dirty', 'Private_Clean', 'Private_Dirty', 'Anonymous'];
+        for (const k of keys) {
+            const m = rollup.match(new RegExp('^' + k + ':\\s+(\\d+)\\s+kB', 'm'));
+            if (m) out.pages[k] = Number(m[1]) * 1024;
+        }
+    } catch (e) { /* 老内核或容器未暴露该文件 */ }
     return out;
 }
 
@@ -205,6 +223,18 @@ function buildReport(gcInfo) {
     const trimmed = rss < (heapTotal + external) * 0.6;
     const native = Math.max(0, round2(rss - heapTotal - external));
     const pct = (x) => (rss > 0 ? Math.round((x / rss) * 1000) / 10 : 0);
+    const virtualMB = base.osInfo.virtualBytes != null ? toMB(base.osInfo.virtualBytes) : null;
+    const pg = base.osInfo.pages || {};
+    const pgAvailable = Object.keys(pg).length > 0;
+    const physical = {
+        available: pgAvailable,
+        rssMB: pg.Rss != null ? toMB(pg.Rss) : null,
+        pssMB: pg.Pss != null ? toMB(pg.Pss) : null,
+        pssAnonMB: pg.Pss_Anon != null ? toMB(pg.Pss_Anon) : null,
+        pssFileMB: pg.Pss_File != null ? toMB(pg.Pss_File) : null,
+        privateMB: pgAvailable ? toMB((pg.Private_Clean || 0) + (pg.Private_Dirty || 0)) : null,
+        sharedMB: pgAvailable ? toMB((pg.Shared_Clean || 0) + (pg.Shared_Dirty || 0)) : null
+    };
 
     // 用本次读数刷新峰值，避免响应采样被节流后出现「当前 rss > 峰值 rss」的矛盾。
     const cur = { rss, heapTotal, heapUsed, external };
@@ -220,7 +250,7 @@ function buildReport(gcInfo) {
     const breakdown = [
         { key: 'v8Heap', label: 'V8 堆预留', mb: heapTotal, pct: pct(heapTotal), note: 'used ' + heapUsed + 'MB / free ' + round2(heapTotal - heapUsed) + 'MB' },
         { key: 'external', label: 'external (Buffer/WASM/native绑定)', mb: external, pct: pct(external), note: 'arrayBuffers ' + arrayBuffers + 'MB / other ' + otherExternal + 'MB' },
-        { key: 'native', label: '其它 / native (未归因)', mb: native, pct: pct(native), note: trimmed ? 'rss 已被 OS trim，此项不可靠，请看 commit' : 'JIT/libuv/线程栈/malloc 保留页 + V8 未计入项' }
+        { key: 'native', label: '其它 / 运行时基线', mb: native, pct: pct(native), note: trimmed ? 'rss 已被 OS trim，此项不可靠，请看 Pss' : '共享库页/libuv/线程栈/malloc 保留 + V8 未计入项' }
     ];
 
     const largeObjectMB = base.spaces.large_object_space ? base.spaces.large_object_space.usedMB : 0;
@@ -229,7 +259,10 @@ function buildReport(gcInfo) {
 
     const diagnosis = [];
     if (trimmed) {
-        diagnosis.push('rss 明显低于 heapTotal+external，说明工作集被 OS trim 了；请以 commit(private committed) 为准，不要按任务管理器的工作集判断。');
+        diagnosis.push('rss 明显低于 heapTotal+external，说明工作集被 OS trim 了；请以 Pss / vmRss 为准，不要按任务管理器的工作集判断。');
+    }
+    if (virtualMB != null && virtualMB > rss * 4) {
+        diagnosis.push('虚拟地址空间 ' + virtualMB + 'MB 远大于 rss，是 V8 / 线程栈 / malloc 预留的虚拟地址，不消耗物理内存；容器 OOM 判定不看此项。');
     }
     if (heapTotal - heapUsed > 30) {
         diagnosis.push('V8 堆预留 ' + heapTotal + 'MB 但实际使用仅 ' + heapUsed + 'MB，差值 ' +
@@ -243,8 +276,17 @@ function buildReport(gcInfo) {
         diagnosis.push('large_object_space 已用 ' + largeObjectMB + 'MB，存在大 Buffer / 大字符串常驻。');
     }
     if (!trimmed && native > 40) {
+        let tail = '需结合 gc=1 与业务高峰时 external / arrayBuffers 的变化判断。';
+        if (physical.available && physical.pssMB != null) {
+            const gap = round2(rss - physical.pssMB);
+            tail = gap > 15
+                ? 'Pss 仅 ' + physical.pssMB + 'MB（比 rss 少 ' + gap +
+                  'MB），差额主要是共享库 / 文件映射页，可与其它进程共享，本进程实际独占远小于 rss。'
+                : 'Pss=' + physical.pssMB +
+                  'MB 与 rss 接近，基本都是本进程独占的匿名页，建议用 heap snapshot 或 smaps 继续下钻。';
+        }
         diagnosis.push('rss 中无法归入 V8 堆 / external 的部分为 ' + native +
-            'MB（JIT 代码、libuv 缓冲、线程栈、malloc 保留页及 V8 未计入 heapTotal 的预留页）；这段偏高多为历史峰值固化，需结合 commit 与 gc=1 判断。');
+            'MB（Node/V8 运行时 C++ 对象、共享库代码页、libuv/线程栈、malloc 保留页）。' + tail);
     }
     for (const s of sources.items) {
         if (s.deltaMB > 1 || s.deltaCount > 100) {
@@ -264,7 +306,6 @@ function buildReport(gcInfo) {
     }
     if (diagnosis.length === 0) diagnosis.push('各项指标均在正常区间，未发现明显异常。');
 
-    const commitMB = base.osInfo.commitBytes != null ? toMB(base.osInfo.commitBytes) : null;
     return {
         ok: true,
         meta: {
@@ -277,11 +318,14 @@ function buildReport(gcInfo) {
             sampling: '响应结束时采样，节流 ' + SAMPLE_THROTTLE_MS + 'ms',
             gcAvailable: typeof global.gc === 'function',
             snapshotEnabled: SNAPSHOT_ENABLED,
-            trackPath: TRACK_PATH
+            trackPath: TRACK_PATH,
+            notes: ['commitMB 为兼容旧版的别名，与 virtualMB 同值，取自 VmSize（虚拟地址空间），不是物理内存占用']
         },
         total: {
             rssMB: rss,
-            commitMB: commitMB,
+            virtualMB: virtualMB,
+            commitMB: virtualMB,
+            physicalPages: physical,
             vmRssMB: base.osInfo.vmRssBytes != null ? toMB(base.osInfo.vmRssBytes) : null,
             rssAnonMB: base.osInfo.rssAnonBytes != null ? toMB(base.osInfo.rssAnonBytes) : null,
             peakRssMB: peak.rss,
@@ -316,7 +360,7 @@ function renderText(r) {
     L.push('[MEM] ' + r.meta.now + '  uptime=' + Math.round(r.meta.uptimeSec / 60) + 'min  pid=' + r.meta.pid +
         '  ' + r.meta.platform + '  ' + r.meta.node);
     L.push('TOTAL  rss=' + r.total.rssMB + 'MB' +
-        (r.total.commitMB != null ? '  commit=' + r.total.commitMB + 'MB' : '') +
+        (r.total.virtualMB != null ? '  virtual=' + r.total.virtualMB + 'MB(虚拟地址空间,非占用)' : '') +
         '   peak rss=' + r.total.peakRssMB + 'MB @ ' + (r.total.peakRssAt || '-') +
         (r.total.peakRssPath ? ' (' + r.total.peakRssPath + ')' : ''));
     L.push('');
@@ -325,6 +369,13 @@ function renderText(r) {
         L.push('  ' + b.label.padEnd(38) + String(b.mb).padStart(8) + 'MB ' + String(b.pct).padStart(5) + '%   ' + b.note);
     }
     L.push('');
+    const pp = r.total.physicalPages;
+    const fmt = (v) => (v == null ? '-' : v + 'MB');
+    L.push('[进程物理页 / smaps_rollup]  ' + (pp && pp.available
+        ? 'Rss=' + fmt(pp.rssMB) + '  Pss=' + fmt(pp.pssMB) + '(实际独占口径)' +
+          '  私有页=' + fmt(pp.privateMB) + '  共享页=' + fmt(pp.sharedMB) +
+          '  匿名Pss=' + fmt(pp.pssAnonMB) + '  文件Pss=' + fmt(pp.pssFileMB)
+        : '不可用（非 Linux 或容器未暴露 /proc/self/smaps_rollup）'));
     const sp = Object.keys(r.v8.spaces).map((k) => k + '=' + r.v8.spaces[k].usedMB + 'MB').join(' | ');
     L.push('[V8 堆空间]  ' + (sp || '不可用'));
     const rs = Object.keys(r.resources).map((k) => k + ' ' + r.resources[k]).join(' | ');

@@ -2834,6 +2834,9 @@ remoteAssist.attach(server);
 remoteAssist.startTimeoutWatchdog();
 console.log('[remote] 远程协助信令模块已挂载: /ws/remote');
 
+// 只读内存探针：独立模块，MEMORY_PROBE=0 可一键关闭；必须注册在 404 兜底之前。
+require('./memory-probe').attach(app, server, { authorize: requirePageAuthJson });
+
 // 404 兜底与错误处理中间件必须放在所有路由之后，否则会拦截后续注册的路由
 app.use((req, res) => {
     console.log('[404] 未匹配路由:', req.method, req.originalUrl || req.url, 'path=', req.path);

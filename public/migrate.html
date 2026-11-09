@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#f6f7f9">
+<title>StarClick · 数据迁移</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-hover: #f8f9fb;
+    --border: rgba(0,0,0,0.06);
+    --border-strong: rgba(0,0,0,0.1);
+    --text: #0f1115;
+    --text-secondary: #525866;
+    --text-muted: #8b909a;
+    --accent: #5b5bf6;
+    --accent-hover: #4848e0;
+    --accent-soft: #eef0ff;
+    --success: #16a34a;
+    --success-soft: #f0fdf4;
+    --danger: #dc2626;
+    --danger-soft: #fef2f2;
+    --warn: #b45309;
+    --warn-soft: #fffbeb;
+    --radius-xl: 20px;
+    --radius-lg: 16px;
+    --radius-md: 12px;
+    --radius-sm: 8px;
+    --shadow-card: 0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.03);
+    --shadow-btn: 0 2px 8px rgba(91,91,246,0.25);
+    --font: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body {
+    font-family: var(--font); min-height: 100vh; color: var(--text); line-height: 1.5;
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+    background: var(--bg); padding: 0 24px calc(56px + env(safe-area-inset-bottom));
+  }
+  .topbar {
+    position: sticky; top: 0; z-index: 40; margin: 0 -24px 40px;
+    padding: calc(14px + env(safe-area-inset-top)) 24px 14px;
+    background: rgba(246,247,249,0.92); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar-inner { max-width: 960px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+  .brand { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
+  .logo { width: 36px; height: 36px; border-radius: 10px; background: var(--text); display: flex; align-items: center; justify-content: center; font: 800 13px/1 var(--font); color: #fff; }
+  .brand-text .t { font: 700 15px/1.3 var(--font); }
+  .brand-text .s { font-size: 12px; color: var(--text-muted); margin-top: 1px; }
+  .nav-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .nav-btn { font: 600 13px/1 var(--font); color: var(--text-secondary); text-decoration: none; padding: 8px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface); transition: all .15s ease; }
+  .nav-btn:hover { background: var(--surface-hover); border-color: var(--border-strong); }
+  .nav-btn.current { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
+  .wrap { width: 100%; max-width: 960px; margin: 0 auto; }
+  .hero { margin-bottom: 24px; }
+  .hero h1 { font: 800 28px/1.2 var(--font); letter-spacing: -0.03em; }
+  .hero p { margin-top: 8px; font-size: 14px; color: var(--text-secondary); max-width: 680px; }
+
+  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 24px; }
+  .step { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 14px 16px; box-shadow: var(--shadow-card); }
+  .step .n { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 7px; background: var(--accent-soft); color: var(--accent); font: 700 12px/1 var(--font); margin-bottom: 8px; }
+  .step .t { font: 650 13px/1.3 var(--font); }
+  .step .d { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 26px; box-shadow: var(--shadow-card); }
+  .card-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+  .card-icon { width: 40px; height: 40px; border-radius: var(--radius-md); display: flex; align-items: center; justify-content: center; font-size: 20px; background: var(--accent-soft); color: var(--accent); }
+  .card-icon.danger { background: var(--danger-soft); color: var(--danger); }
+  .card h2 { font: 700 18px/1.3 var(--font); letter-spacing: -0.01em; }
+  .card .sub { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .card .desc { font-size: 13px; color: var(--text-secondary); margin-top: 14px; }
+
+  .list { list-style: none; display: flex; flex-direction: column; gap: 9px; margin: 18px 0 20px; }
+  .list li { display: flex; align-items: flex-start; gap: 9px; font-size: 12.5px; color: var(--text-secondary); }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-top: 7px; flex: 0 0 auto; }
+  .dot.muted { background: var(--text-muted); }
+  .list code { font: 600 12px var(--font); background: var(--surface-hover); border: 1px solid var(--border); padding: 1px 5px; border-radius: 5px; color: var(--text); }
+
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; width: 100%; min-height: 44px; padding: 10px 18px; border: none; border-radius: var(--radius-sm); font: 650 14px/1 var(--font); cursor: pointer; transition: all .15s ease; }
+  .btn.primary { background: var(--accent); color: #fff; box-shadow: var(--shadow-btn); }
+  .btn.primary:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn.danger { background: var(--danger); color: #fff; box-shadow: 0 2px 8px rgba(220,38,38,.22); }
+  .btn.danger:hover:not(:disabled) { background: #b91c1c; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; box-shadow: none; }
+
+  .warn { border: 1px solid #fde68a; background: var(--warn-soft); color: var(--warn); border-radius: var(--radius-md); padding: 12px 14px; font-size: 12.5px; margin: 4px 0 16px; }
+  .warn b { font-weight: 700; }
+
+  .file-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  input[type=file] { flex: 1; min-width: 0; font: 500 12.5px var(--font); color: var(--text-secondary); }
+  input[type=file]::file-selector-button { font: 600 12px var(--font); color: var(--text); background: var(--surface-hover); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 8px 12px; margin-right: 10px; cursor: pointer; }
+  .check { display: flex; align-items: flex-start; gap: 9px; font-size: 12.5px; color: var(--text-secondary); margin-bottom: 18px; cursor: pointer; }
+  .check input { margin-top: 2px; width: 16px; height: 16px; accent-color: var(--danger); flex: 0 0 auto; }
+
+  .busy { display: none; margin-top: 22px; padding: 14px 18px; border-radius: var(--radius-md); background: var(--accent-soft); color: var(--accent); font-size: 13px; font-weight: 600; }
+  .busy.show { display: block; }
+  .result { display: none; margin-top: 22px; border-radius: var(--radius-xl); padding: 22px 24px; border: 1px solid var(--border); background: var(--surface); box-shadow: var(--shadow-card); }
+  .result.show { display: block; }
+  .result.ok { border-left: 4px solid var(--success); }
+  .result.err { border-left: 4px solid var(--danger); }
+  .result h3 { font: 700 16px/1.3 var(--font); }
+  .result .msg { font-size: 13px; color: var(--text-secondary); margin-top: 6px; }
+  .dl { display: grid; grid-template-columns: 128px 1fr; gap: 9px 16px; margin-top: 18px; font-size: 12.5px; }
+  .dl dt { color: var(--text-muted); }
+  .dl dd { color: var(--text); font-weight: 550; word-break: break-all; }
+  .restart { margin-top: 18px; background: var(--success-soft); border: 1px solid #bbf7d0; color: #15803d; border-radius: var(--radius-md); padding: 12px 14px; font-size: 12.5px; }
+  .restart.errbox { background: var(--warn-soft); border-color: #fde68a; color: var(--warn); }
+  .foot { margin-top: 26px; font-size: 12px; color: var(--text-muted); line-height: 1.8; }
+
+  @media (max-width: 860px) {
+    .grid, .steps { grid-template-columns: 1fr; }
+    .topbar-inner { flex-wrap: wrap; }
+  }
+  /* ---------- 服务端留存包 ---------- */
+  .backups { margin-top: 24px; }
+  .backups-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+  .backups-head h2 { font: 700 18px/1.3 var(--font); letter-spacing: -0.01em; }
+  .backups-head .sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+  .tools { display: flex; gap: 8px; flex: 0 0 auto; }
+  .btn.mini { width: auto; min-height: 34px; padding: 7px 13px; font-size: 12px; background: var(--surface); color: var(--text-secondary); border: 1px solid var(--border-strong); box-shadow: none; }
+  .btn.mini:hover:not(:disabled) { background: var(--surface-hover); }
+  .btn.mini.danger-text { color: var(--danger); border-color: #fecaca; background: var(--danger-soft); }
+  .btn.mini.danger-text:hover:not(:disabled) { background: #fee2e2; }
+  table { width: 100%; border-collapse: collapse; margin-top: 18px; font-size: 12.5px; }
+  th { text-align: left; color: var(--text-muted); font-weight: 600; padding: 10px 8px; border-bottom: 1px solid var(--border-strong); white-space: nowrap; }
+  td { padding: 11px 8px; border-bottom: 1px solid var(--border); color: var(--text-secondary); }
+  td.name { color: var(--text); font-weight: 550; word-break: break-all; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+  .tag.upload { background: var(--warn-soft); color: var(--warn); }
+  .row-actions { display: flex; gap: 4px; justify-content: flex-end; }
+  .link-btn { border: none; background: none; color: var(--accent); font: 600 12px var(--font); cursor: pointer; padding: 4px 6px; border-radius: 5px; }
+  .link-btn:hover { background: var(--accent-soft); }
+  .link-btn.del { color: var(--danger); }
+  .link-btn.del:hover { background: var(--danger-soft); }
+  .empty { text-align: center; color: var(--text-muted); font-size: 13px; padding: 26px 0 8px; }
+  .note { font-size: 12px; color: var(--text-muted); margin-top: 14px; }
+  @media (max-width: 620px) {
+    table th:nth-child(3), table td:nth-child(3) { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <div class="logo">SC</div>
+      <div class="brand-text">
+        <div class="t">数据迁移</div>
+        <div class="s">StarClick Web Server</div>
+      </div>
+    </div>
+    <nav class="nav-group">
+      <a class="nav-btn" href="/admin">管理设备</a>
+      <a class="nav-btn" href="/emoji-admin">表情管理</a>
+      <a class="nav-btn" href="/assets-admin">资产管理</a>
+      <a class="nav-btn current" href="/migrate">数据迁移</a>
+      <a class="nav-btn" href="/publish">发布页</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <h1>数据迁移</h1>
+    <p>换服务器时不再需要手工搬运整个目录：老服务器一键导出全部运行时数据，新服务器只需 <code>git clone</code> 项目代码，再在这里上传迁移包即可完整接管。</p>
+  </section>
+
+  <section class="steps">
+    <div class="step">
+      <div class="n">1</div>
+      <div class="t">老服务器 · 导出</div>
+      <div class="d">建议在夜间低峰操作，导出期间避免写入</div>
+    </div>
+    <div class="step">
+      <div class="n">2</div>
+      <div class="t">新服务器 · 拉取源码</div>
+      <div class="d">git clone 后 npm install，代码与静态资源随仓库同步</div>
+    </div>
+    <div class="step">
+      <div class="n">3</div>
+      <div class="t">新服务器 · 导入</div>
+      <div class="d">上传 zip，自动备份后整包覆盖，重启服务生效</div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-icon">↓</div>
+        <div>
+          <h2>导出数据</h2>
+          <div class="sub">打包全部运行时数据为 zip</div>
+        </div>
+      </div>
+      <p class="desc">导出包含服务运行所需的全部数据，<b>不含源码</b>，新服务器只需拉取仓库代码；<b>导出包只下载到本机，服务端不留存副本</b>：</p>
+      <ul class="list">
+        <li><span class="dot"></span><span><code>data/</code> 设备档案、信任关系、积分、聊天/快照/头像/剪贴板、表情配置、TLS 证书与后台登录密钥</span></li>
+        <li><span class="dot"></span><span><code>updates/</code> 已发布的 APK 与版本元数据</span></li>
+        <li><span class="dot"></span><span><code>public/emoji/custom/</code> 用户上传的自定义表情图片</span></li>
+        <li><span class="dot"></span><span><code>.env*</code> 环境变量与后台账号配置</span></li>
+        <li><span class="dot muted"></span><span>不含 <code>*.js</code>、<code>*.html</code>、<code>node_modules/</code>、<code>.git/</code>、<code>backups/</code></span></li>
+      </ul>
+      <button class="btn primary" id="btnExport">一键打包下载</button>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div class="card-icon danger">↑</div>
+        <div>
+          <h2>迁入数据</h2>
+          <div class="sub">上传迁移包并覆盖本机数据</div>
+        </div>
+      </div>
+      <div class="warn">
+        <b>覆盖导入：</b>本机现有的 <code>data/</code>、<code>updates/</code>、自定义表情与 <code>.env*</code> 会先被清空，完全以老服务器的包为准。导入前会自动把本机现状备份到 <code>backups/</code>。
+      </div>
+      <form id="importForm">
+        <div class="file-row">
+          <input type="file" id="fileInput" accept=".zip,application/zip" required>
+        </div>
+        <label class="check">
+          <input type="checkbox" id="confirmCheck">
+          <span>我已确认：本机现有数据不需要保留，同意按迁移包整体覆盖</span>
+        </label>
+        <button class="btn danger" id="btnImport" type="submit" disabled>上传并迁入</button>
+      </form>
+    </div>
+  </section>
+
+  <section class="card backups">
+    <div class="backups-head">
+      <div>
+        <h2>服务端留存包</h2>
+        <div class="sub">导出包不落盘，无需清理；这里只列出「导入前自动备份」（每次迁入自动替换上一份，只保留最新）与异常残留的上传临时文件</div>
+      </div>
+      <div class="tools">
+        <button class="btn mini" id="btnReloadBackups" type="button">刷新</button>
+      </div>
+    </div>
+    <div id="backupsBody"><div class="empty">正在加载…</div></div>
+    <p class="note">备份包含全部密钥与证书，建议定期下载归档；导入前备份由服务端自动轮转，页面只提供查看与下载。</p>
+  </section>
+
+  <div class="busy" id="busy">正在处理，请勿关闭页面…</div>
+  <div class="result" id="result">
+    <h3 id="resultTitle"></h3>
+    <div class="msg" id="resultMsg"></div>
+    <dl class="dl" id="resultDetails"></dl>
+    <div class="restart" id="resultTip"></div>
+  </div>
+
+  <p class="foot">
+    迁移包内含密钥与证书，请妥善保管、勿通过公开渠道传输。导入后建议重启服务端进程，以刷新 dotenv、TLS 证书、后台登录签名密钥等启动时读取的状态；重启后请使用<b>老服务器</b>的后台账号密码重新登录。<br>
+    若导出或导入因数据量过大失败（单包上限 2GB），可先到「资产管理」清理历史快照/聊天图片，或手工搬运目录。
+  </p>
+</main>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var btnExport = $('btnExport');
+  var btnImport = $('btnImport');
+  var fileInput = $('fileInput');
+  var confirmCheck = $('confirmCheck');
+  var busy = $('busy');
+  var result = $('result');
+
+  function fmtSize(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+    return (n / 1073741824).toFixed(2) + ' GB';
+  }
+
+  function setBusy(text) {
+    busy.textContent = text;
+    busy.classList.add('show');
+  }
+  function hideBusy() { busy.classList.remove('show'); }
+
+  function showResult(kind, title, msg, details, tip, tipWarn) {
+    result.className = 'result show ' + kind;
+    $('resultTitle').textContent = title;
+    $('resultMsg').textContent = msg;
+    var dl = $('resultDetails');
+    dl.innerHTML = '';
+    (details || []).forEach(function (it) {
+      var dt = document.createElement('dt'); dt.textContent = it[0];
+      var dd = document.createElement('dd'); dd.textContent = it[1];
+      dl.appendChild(dt); dl.appendChild(dd);
+    });
+    var tipEl = $('resultTip');
+    tipEl.textContent = tip || '';
+    tipEl.className = 'restart' + (tipWarn ? ' errbox' : '');
+    tipEl.style.display = tip ? 'block' : 'none';
+  }
+
+  function readError(res) {
+    return res.json().then(function (j) { return (j && j.error) || ('HTTP ' + res.status); },
+      function () { return 'HTTP ' + res.status; });
+  }
+
+  btnExport.addEventListener('click', function () {
+    btnExport.disabled = true;
+    btnExport.textContent = '正在打包…';
+    setBusy('正在读取并打包全部运行时数据，数据量较大时可能需要几十秒，请勿关闭页面…');
+    fetch('/api/migrate/export', { method: 'GET', credentials: 'same-origin' })
+      .then(function (res) {
+        if (!res.ok) return readError(res).then(function (m) { throw new Error(m); });
+        return res.blob().then(function (blob) { return { blob: blob, cd: res.headers.get('Content-Disposition') || '' }; });
+      })
+      .then(function (r) {
+        var m = /filename="([^"]+)"/i.exec(r.cd);
+        var name = m ? m[1] : ('starclick_migrate_' + Date.now() + '.zip');
+        var url = URL.createObjectURL(r.blob);
+        var a = document.createElement('a');
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
+        showResult('ok', '导出完成', '迁移包已开始下载，请妥善保管（内含密钥与证书）。', [
+          ['文件名', name],
+          ['压缩包大小', fmtSize(r.blob.size)],
+          ['下一步', '在新服务器 git clone 项目并打开 /migrate 上传此包']
+        ], '导出建议在夜间低峰进行；导出瞬间的写入可能未被包含。', true);
+      })
+      .catch(function (e) {
+        showResult('err', '导出失败', e.message || String(e), [], '若为登录过期，请重新登录后台后重试。', true);
+      })
+      .then(function () {
+        btnExport.disabled = false;
+        btnExport.textContent = '一键打包下载';
+        hideBusy();
+      });
+  });
+
+  function refreshImportBtn() {
+    btnImport.disabled = !(fileInput.files.length > 0 && confirmCheck.checked);
+  }
+  fileInput.addEventListener('change', refreshImportBtn);
+  confirmCheck.addEventListener('change', refreshImportBtn);
+
+  $('importForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (btnImport.disabled) return;
+    var fd = new FormData();
+    fd.append('file', fileInput.files[0]);
+    btnImport.disabled = true;
+    btnImport.textContent = '正在迁入…';
+    confirmCheck.disabled = true;
+    setBusy('正在校验迁移包、备份本机现状并覆盖写入，请勿关闭页面或重启服务…');
+
+    fetch('/api/migrate/import', { method: 'POST', credentials: 'same-origin', body: fd })
+      .then(function (res) {
+        if (!res.ok) return readError(res).then(function (m) { throw new Error(m); });
+        return res.json();
+      })
+      .then(function (r) {
+        var sec = r.sections || {};
+        var details = [
+          ['包生成时间', r.packageCreatedAt || '—'],
+          ['写入文件数', (r.files || 0) + ' 个 / ' + (r.dirs || 0) + ' 个目录'],
+          ['写入数据量', fmtSize(r.bytes)],
+          ['分区明细', 'data ' + (sec.data || 0) + ' · updates ' + (sec.updates || 0) + ' · 自定义表情 ' + (sec.emojiCustom || 0) + ' · .env ' + (sec.env || 0)],
+          ['导入前备份', r.backup && r.backup.relPath ? r.backup.relPath + '（' + fmtSize(r.backup.bytes) + '）' : '—'],
+          ['耗时', ((r.elapsedMs || 0) / 1000).toFixed(1) + ' 秒']
+        ];
+        if (r.skipped && r.skipped.length) {
+          details.push(['占用跳过', r.skipped.length + ' 项：' + r.skipped.slice(0, 5).join('、') + (r.skipped.length > 5 ? ' …' : '')]);
+        }
+        showResult('ok', '迁入完成', '本机数据已按老服务器迁移包完整覆盖。', details,
+          '请重启服务端进程以刷新全部运行时状态；重启后请使用老服务器的后台账号密码重新登录。' +
+          (r.skipped && r.skipped.length ? ' 有文件被进程占用未能删除，重启后会以新数据为准。' : ''), false);
+        loadBackups();
+      })
+      .catch(function (err) {
+        showResult('err', '迁入失败', err.message || String(err), [],
+          '原有数据未被破坏（导入前已自动备份到 backups/）。若为登录过期，请重新登录后台后重试。', true);
+      })
+      .then(function () {
+        confirmCheck.disabled = false;
+        btnImport.textContent = '上传并迁入';
+        refreshImportBtn();
+        hideBusy();
+      });
+  });
+  // ---------- 服务端留存包：列表 / 下载 / 删除 / 清空 ----------
+  var backupsBody = $('backupsBody');
+
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function renderBackups(items) {
+    if (!items || !items.length) {
+      backupsBody.innerHTML = '<div class="empty">服务端暂无留存包。导出包不会保存在服务器上，只有执行过「迁入」才会生成备份包。</div>';
+      return;
+    }
+    var h = '<table><thead><tr><th>文件名</th><th>类型</th><th>生成时间</th><th>大小</th><th style="text-align:right">操作</th></tr></thead><tbody>';
+    items.forEach(function (it) {
+      var n = esc(it.name);
+      h += '<tr>' +
+        '<td class="name">' + n + '</td>' +
+        '<td><span class="tag' + (it.kind === 'upload' ? ' upload' : '') + '">' + esc(it.kindText) + '</span></td>' +
+        '<td>' + esc(it.mtimeText) + '</td>' +
+        '<td>' + fmtSize(it.size) + '</td>' +
+        '<td><div class="row-actions">' +
+        '<button class="link-btn" data-act="download" data-name="' + n + '" type="button">下载</button>' +
+        '</div></td></tr>';
+    });
+    backupsBody.innerHTML = h + '</tbody></table>';
+  }
+
+  function loadBackups() {
+    return fetch('/api/migrate/backups', { credentials: 'same-origin' })
+      .then(function (res) {
+        if (!res.ok) return readError(res).then(function (m) { throw new Error(m); });
+        return res.json();
+      })
+      .then(function (r) { renderBackups(r.items); })
+      .catch(function (e) {
+        backupsBody.innerHTML = '<div class="empty">加载失败：' + esc(e.message || e) + '</div>';
+      });
+  }
+
+  backupsBody.addEventListener('click', function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest('button[data-act="download"]') : null;
+    if (!btn) return;
+    window.location.href = '/api/migrate/backups/download?name=' + encodeURIComponent(btn.getAttribute('data-name'));
+  });
+
+  $('btnReloadBackups').addEventListener('click', loadBackups);
+
+  loadBackups();
+})();
+</script>
+</body>
+</html>

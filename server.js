@@ -2665,6 +2665,91 @@ app.get('/versions', requirePageAuth, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'history.html'));
 });
 
+// ===================== 数据迁移（老服务器导出 / 新服务器覆盖导入） =====================
+// 入口页面 /migrate；接口 /api/migrate/export、/api/migrate/import 均需后台登录态。
+// 迁移包只含运行时数据（见 migrate.js 顶部说明），不含源码，新服务器 git clone 后即可导入。
+const migrate = require('./migrate');
+const MIGRATE_UPLOAD_TMP = path.join(__dirname, 'backups', '_uploads');
+// 上传先流式落临时盘再处理，避免超大 zip 直接打爆内存（multer.memoryStorage 不适合 GB 级文件）
+const migrateUpload = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => {
+            try { fs.mkdirSync(MIGRATE_UPLOAD_TMP, { recursive: true }); cb(null, MIGRATE_UPLOAD_TMP); }
+            catch (e) { cb(e); }
+        },
+        filename: (req, file, cb) => cb(null, `upload_${Date.now()}_${crypto.randomBytes(6).toString('hex')}.zip`)
+    }),
+    limits: { fileSize: migrate.limits.maxTotalBytes, files: 1 }
+});
+
+app.get('/migrate', requirePageAuth, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'migrate.html'));
+});
+
+app.get('/api/migrate/export', requirePageAuthJson, (req, res) => {
+    try {
+        // 即打即下：导出包全程只在内存中，服务端不落盘、不产生任何副本
+        const { buffer } = migrate.buildExportZip({ rootDir: __dirname, kind: 'export' });
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Disposition', `attachment; filename="starclick_migrate_${migrate.localStamp()}.zip"`);
+        res.setHeader('Cache-Control', 'no-store');
+        res.send(buffer);
+    } catch (e) {
+        console.error('[migrate] 导出失败:', e);
+        res.status(e.status || 500).json({ success: false, error: e.message || '打包失败' });
+    }
+});
+
+app.post('/api/migrate/import', requirePageAuthJson, migrateUpload.single('file'), (req, res) => {
+    const tmp = req.file && req.file.path;
+    try {
+        if (!tmp || !fs.existsSync(tmp)) {
+            return res.status(400).json({ success: false, error: '请选择 .zip 迁移包' });
+        }
+        const result = migrate.importZipBuffer({
+            rootDir: __dirname,
+            buffer: fs.readFileSync(tmp),
+            onApplied: () => {
+                // 覆盖导入后热重载「磁盘派生缓存」，避免旧内存快照被写回新数据。
+                // 连接态（online/sessions）保持不动；dotenv、TLS 证书等启动时读取的状态仍需重启生效。
+                try { remoteAssist.reloadDiskCaches(); } catch (e) { console.warn('[migrate] 重载远程协助缓存失败:', e && e.message); }
+                try { deviceRegistry.reloadFromDisk(); } catch (e) { console.warn('[migrate] 重载设备档案索引失败:', e && e.message); }
+                emojiCatalogCache = null;
+                emojiCatalogCacheAt = 0;
+                try { remoteAssist.broadcastEmojiCatalogUpdate(); } catch (e) { /* 忽略 */ }
+            }
+        });
+        console.log(`[migrate] 导入完成 files=${result.files} bytes=${result.bytes} backup=${result.backup.relPath}`);
+        res.json(result);
+    } catch (e) {
+        console.error('[migrate] 导入失败:', e);
+        res.status(e.status || 500).json({ success: false, error: e.message || '导入失败' });
+    } finally {
+        if (tmp) { try { fs.unlinkSync(tmp); } catch (e) { /* 忽略 */ } }
+    }
+});
+
+// ---- 服务端留存包：列表 / 下载（均需后台登录态；自动滚动只留最新，不提供手动删除） ----
+app.get('/api/migrate/backups', requirePageAuthJson, (req, res) => {
+    try {
+        res.json({ success: true, items: migrate.listBackups(__dirname) });
+    } catch (e) {
+        res.status(e.status || 500).json({ success: false, error: e.message || '读取留存包失败' });
+    }
+});
+
+app.get('/api/migrate/backups/download', requirePageAuthJson, (req, res) => {
+    try {
+        const item = migrate.readBackup(__dirname, req.query.name);
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(item.name)}"`);
+        res.setHeader('Cache-Control', 'no-store');
+        res.send(item.buffer);
+    } catch (e) {
+        res.status(e.status || 500).json({ success: false, error: e.message || '下载失败' });
+    }
+});
+
 // ===================== 自签名证书自动生成（免费、无需域名、随启动） =====================
 // 服务端启动时若 data/certs 下无证书，用纯 JS 库 selfsigned 生成一张自签名证书（有效期 10 年）。
 // 证书仅含 CN（无需 IP SAN）：Android 客户端采用「首次信任学习(TOFU)式公钥锁定」+ 自定义主机名
@@ -2766,7 +2851,10 @@ app.use((err, req, res, next) => {
     let status = err.status || 500;
     let reason = err.message || '未知错误';
     if (err.code === 'LIMIT_FILE_SIZE') {
-        reason = `单个文件过大（上限 ${Math.round(EMOJI_UPLOAD_MAX_BYTES / 1024 / 1024)}MB）`;
+        // 迁移包上传上限（2GB）与表情上传上限（10MB）不同，按请求路径给出正确文案
+        const isMigrate = String(req.originalUrl || '').indexOf('/api/migrate/import') === 0;
+        const limit = isMigrate ? migrate.limits.maxTotalBytes : EMOJI_UPLOAD_MAX_BYTES;
+        reason = `单个文件过大（上限 ${migrate.formatBytes(limit)}）`;
     } else if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
         reason = `单次上传文件数量过多（最多 ${MAX_EMOJI_BATCH} 个）`;
     }

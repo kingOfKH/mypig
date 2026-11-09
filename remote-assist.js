@@ -2041,6 +2041,22 @@ function getIceConfig() {
     }
 }
 
+/**
+ * 数据迁移「覆盖导入」后热重载磁盘派生缓存。
+ * 迁移包会整体替换 data/，进程内这些缓存仍是导入前的旧值；若不重置，
+ * 后续任何一次写操作都会把旧内存快照写回磁盘，造成「导入看似成功、数据却被回滚」。
+ * 连接态（online/sessions/pending*）保持不动，避免打断正在进行的远程会话；
+ * dotenv、TLS 证书、签名密钥等启动时一次性读取的状态仍需重启服务刷新。
+ */
+function reloadDiskCaches() {
+    pointsCache = {};
+    adminCache = readJson(ADMIN_FILE, {});
+    trustCache = readJson(TRUST_FILE, {});
+    subscriptionCache = null;
+    console.log('[remote] 数据迁移导入完成，已重载磁盘派生缓存（points/admins/trust/subscription）');
+    return true;
+}
+
 module.exports = {
     attach,
     registerVerify,
@@ -2075,5 +2091,7 @@ module.exports = {
     adjustPoints,
     // 管理页「删除设备」：清空远程协助体系内该设备的全部数据与内存态
     purgeDevice,
+    // 数据迁移覆盖导入后由 server.js 调用：重载磁盘派生缓存
+    reloadDiskCaches,
     _internal: { online, sessions, consumeControlCode, lookupControlCode, createControlCode },
 };

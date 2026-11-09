@@ -73,6 +73,7 @@
     transition: all 0.15s ease;
   }
   .nav-btn:hover { background: var(--surface-hover); border-color: var(--border-strong); }
+  .nav-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 
   .wrap { width: 100%; max-width: 960px; margin: 0 auto; }
 
@@ -315,9 +316,12 @@
         <div class="s">StarClick</div>
       </div>
     </div>
-    <a class="nav-btn" href="/emoji-admin">表情管理</a>
-    <a class="nav-btn" href="/assets-admin">资产管理</a>
-    <a class="nav-btn" href="/publish">发布页</a>
+    <nav class="nav-group">
+      <a class="nav-btn" href="/emoji-admin">表情管理</a>
+      <a class="nav-btn" href="/assets-admin">资产管理</a>
+      <a class="nav-btn" href="/migrate">数据迁移</a>
+      <a class="nav-btn" href="/publish">发布页</a>
+    </nav>
   </div>
 </header>
 

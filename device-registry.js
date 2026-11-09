@@ -257,6 +257,12 @@ async function removeDevice(deviceId) {
     });
 }
 
+/** 数据迁移覆盖导入后重载名称索引（registry.json 已被整体替换） */
+function reloadFromDisk() {
+    refreshIndex(readAll());
+    return true;
+}
+
 /** 列出全部设备档案（/api/devices、管理页使用） */
 function listAll() {
     return readAll().map(d => ({
@@ -319,4 +325,5 @@ module.exports = {
     getChinaTime,
     getOrCreateSecret,
     getDeviceSecretSync,
+    reloadFromDisk,
 };

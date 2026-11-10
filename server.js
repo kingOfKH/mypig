@@ -736,9 +736,11 @@ apiRouter.post('/usage/sync', async (req, res) => {
     });
 });
 
-apiRouter.get('/usage/:deviceId/:date', (req, res) => {
+apiRouter.get('/usage/:deviceId/:date', (req, res, next) => {
     const { deviceId, date } = req.params;
-    
+    // 「range」「summary」是保留路径：本通配路由注册在前，会先命中并拦截后面两个专用接口。
+    if (date === 'range' || date === 'summary') return next();
+
     const usageFile = path.join(USAGE_DIR, deviceId, `${date}.json`);
     
     if (!fs.existsSync(usageFile)) {
@@ -811,18 +813,35 @@ apiRouter.get('/usage/:deviceId/range', (req, res) => {
     });
 });
 
-// 使用记录汇总查询：返回设备级轻量累计（每个 APP 累计打开次数/累计使用时长）。
-// 汇总由清理任务在删除过期每日明细前生成并长期留存，删除明细后仍可查看粗略统计。
+// 使用记录汇总查询：明细被清理后仍长期保留的关键统计留痕。
+// apps 与 lastCompactedAt 沿用旧字段名，新增 device / events / compactedDates / retentionDays。
 apiRouter.get('/usage/:deviceId/summary', (req, res) => {
     const { deviceId } = req.params;
     const devDir = path.join(USAGE_DIR, deviceId);
-    const summary = loadUsageSummary(devDir);
-    const list = Object.values(summary.apps || {})
-        .sort((a, b) => (b.totalDurationMs || 0) - (a.totalDurationMs || 0));
+    const s = loadUsageSummary(devDir);
+    const list = Object.values(s.apps || {})
+        .sort((a, b) => (Number(b.totalDurationMs) || 0) - (Number(a.totalDurationMs) || 0));
+    // 活跃天数 = 已归档日期 ∪ 现存日明细；旧版汇总没有 compactedDates，这里补算避免显示 0
+    const activeDates = new Set(s.compactedDates || []);
+    try {
+        for (const f of fs.readdirSync(devDir)) {
+            if (f.endsWith('.json') && !f.startsWith('_')) activeDates.add(f.replace(/\.json$/, ''));
+        }
+    } catch (e) { /* 目录不存在时保持已有值 */ }
+    s.device.activeDays = activeDates.size;
     res.json({
         success: true,
         deviceId,
-        summary: { apps: list, lastCompactedAt: summary.lastCompactedAt }
+        summary: {
+            version: s.version,
+            apps: list,
+            device: s.device || {},
+            events: s.events || {},
+            compactedDates: s.compactedDates || [],
+            lastCompactedAt: s.lastCompactedAt || null,
+            retentionDays: USAGE_TTL_MS / 86400000,
+            note: 'apps[].daily 为按日压缩留痕，可用于趋势/周月聚合；超过 retentionDays 的明细已删除'
+        }
     });
 });
 
@@ -1183,7 +1202,7 @@ const CHAT_IMAGE_TTL_MS = chatTtlDaysToMs(process.env.CHAT_IMAGE_TTL_DAYS, 0);
 const CHAT_IMAGE_RECYCLE_TTL_MS = chatTtlDaysToMs(process.env.CHAT_IMAGE_RECYCLE_TTL_DAYS, 90);
 // 远程快照（截图/拍照）默认 1 天自动清理；被「持久化保存」(.meta 标记) 的快照跳过清理
 const SNAPSHOT_TTL_MS = chatTtlDaysToMs(process.env.SNAPSHOT_TTL_DAYS, 1);
-// 使用记录（usage）默认保留 14 天；超过 TTL 的每日明细在删除前汇总进设备级 _summary.json。
+// 使用记录（usage）默认保留 14 天；超过 TTL 的每日明细在删除前压缩归档进设备级 _summary.json（关键统计长期留痕）。
 const USAGE_TTL_MS = chatTtlDaysToMs(process.env.USAGE_TTL_DAYS, 14);
 if (CHAT_IMAGE_TTL_MS > 0 || CHAT_IMAGE_RECYCLE_TTL_MS > 0 || SNAPSHOT_TTL_MS > 0 || USAGE_TTL_MS > 0) {
     console.log(`[cleanup] 自动清理已开启：聊天图 ${CHAT_IMAGE_TTL_MS / 86400000} 天 / 回收站 ${CHAT_IMAGE_RECYCLE_TTL_MS / 86400000} 天 / 快照 ${SNAPSHOT_TTL_MS / 86400000} 天 / 使用记录 ${USAGE_TTL_MS / 86400000} 天`);
@@ -1239,50 +1258,118 @@ function cleanupSnapshots() {
     walk(SNAPSHOT_DIR);
 }
 
-// ===== 使用记录（usage）自动清理 + 轻量汇总 =====
-// 默认保留 14 天；超过 TTL 的每日明细在删除前，把 APP_USAGE 记录汇总进设备级
-// _summary.json（累计每个 APP 打开次数/使用时长），使删除后仍可查看粗略累计统计。
+// ===== 使用记录（usage）自动清理 + 明细压缩归档 =====
+// 默认保留 14 天；超过 TTL 的每日明细在删除前，压缩归档进设备级 _summary.json。
+// 归档目标：明细可删，但后续统计所需的关键信息必须长期保留：
+//   每个 APP 累计时长/次数/首次与上次使用时间/按日汇总；设备级总量/活跃天数/首末记录时间；
+//   以及 SCREEN_ON / SCREEN_OFF 等所有 recordType 的事件计数（零丢弃）。
+// 结构带 version + compactedDates，旧版 _summary.json（只有 apps）会自动补齐，且归档幂等。
 // 注意：判断过期用文件名日期而非 mtime——sync 会刷新日文件 mtime，用 mtime 会漏删。
 const USAGE_SUMMARY_FILE = '_summary.json';
+const USAGE_SUMMARY_VERSION = 2;
+
+function normalizeSummary(data) {
+    const s = (data && typeof data === 'object') ? data : {};
+    if (!s.apps || typeof s.apps !== 'object') s.apps = {};
+    if (!s.device || typeof s.device !== 'object') s.device = {};
+    if (!s.events || typeof s.events !== 'object') s.events = {};
+    if (!Array.isArray(s.compactedDates)) s.compactedDates = [];
+    // 旧版 v1 只有 apps：设备级总量从 apps 反推，避免升级后看起来是 0
+    if (!Number.isFinite(s.device.totalDurationMs) || !Number.isFinite(s.device.totalOpenCount)) {
+        let td = 0, tc = 0;
+        for (const a of Object.values(s.apps)) {
+            td += Number(a && a.totalDurationMs) || 0;
+            tc += Number(a && a.openCount) || 0;
+        }
+        if (!Number.isFinite(s.device.totalDurationMs)) s.device.totalDurationMs = td;
+        if (!Number.isFinite(s.device.totalOpenCount)) s.device.totalOpenCount = tc;
+    }
+    if (s.device.activeDays == null) s.device.activeDays = s.compactedDates.length;
+    for (const a of Object.values(s.apps)) {
+        if (!a || typeof a !== 'object') continue;
+        if (!a.daily || typeof a.daily !== 'object') a.daily = {};
+    }
+    s.version = USAGE_SUMMARY_VERSION;
+    return s;
+}
 
 function loadUsageSummary(devDir) {
     const fp = path.join(devDir, USAGE_SUMMARY_FILE);
-    const data = safeReadJSON(fp, null);
-    if (data && data.apps && typeof data.apps === 'object') return data;
-    return { apps: {}, lastCompactedAt: null };
+    return normalizeSummary(safeReadJSON(fp, null));
 }
 
+/** 返回是否写入成功；调用方必须成功后才能删除明细文件，保证「留痕优先于清理」。 */
 function saveUsageSummary(devDir, summary) {
     const fp = path.join(devDir, USAGE_SUMMARY_FILE);
     const tmp = fp + '.tmp';
     try {
         fs.writeFileSync(tmp, JSON.stringify(summary));
         fs.renameSync(tmp, fp); // 原子写，避免半写损坏汇总
+        return true;
     } catch (e) {
         try { fs.unlinkSync(tmp); } catch (_) {}
-        console.error('[usage] 写入汇总失败:', e);
+        console.error('[usage] 写入汇总失败（明细文件已保留，下轮重试）:', e);
+        return false;
     }
 }
 
-function accumulateDailyToSummary(dailyData, summary) {
-    const records = (dailyData && dailyData.records) || [];
+function numOrZero(v) {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** 把一个日文件压缩进 summary；dateKey 为 YYYY-MM-DD（或无法解析的原文件名）。 */
+function accumulateDailyToSummary(dailyData, summary, dateKey) {
+    const records = (dailyData && Array.isArray(dailyData.records)) ? dailyData.records : [];
+    const s = normalizeSummary(summary);
+    let dayDuration = 0, dayOpenCount = 0, dayFirst = null, dayLast = null;
     for (const rec of records) {
-        if (rec.recordType !== 'APP_USAGE') continue;
+        if (!rec || typeof rec !== 'object') continue;
+        const type = String(rec.recordType || 'UNKNOWN');
+        s.events[type] = (Number(s.events[type]) || 0) + 1;   // 所有记录类型都留计数，零丢弃
+
+        const open = numOrZero(rec.openTime);
+        const close = numOrZero(rec.closeTime);
+        const last = Math.max(open, close);
+        if (open > 0) dayFirst = dayFirst == null ? open : Math.min(dayFirst, open);
+        if (last > 0) dayLast = dayLast == null ? last : Math.max(dayLast, last);
+
+        if (type !== 'APP_USAGE') continue;
         const key = rec.packageName || rec.appName;
         if (!key) continue;
-        const dur = Number(rec.durationMs) || 0;
-        let s = summary.apps[key];
-        if (!s) {
-            s = { packageName: key, appName: rec.appName || key, totalDurationMs: 0, openCount: 0 };
-            summary.apps[key] = s;
-        } else if (rec.appName && rec.appName !== key) {
-            s.appName = rec.appName; // 应用名可能变更，取最新一次
+        const dur = numOrZero(rec.durationMs);
+        let a = s.apps[key];
+        if (!a) {
+            a = {
+                packageName: key, appName: rec.appName || key,
+                totalDurationMs: 0, openCount: 0,
+                firstUsedAt: null, lastUsedAt: null, lastDurationMs: 0, daily: {}
+            };
+            s.apps[key] = a;
         }
-        s.totalDurationMs += dur;
-        s.openCount += 1;
+        if (!a.daily || typeof a.daily !== 'object') a.daily = {};
+        if (rec.appName) a.appName = rec.appName;             // 应用名可能变更，取最新一次
+        a.totalDurationMs = (Number(a.totalDurationMs) || 0) + dur;
+        a.openCount = (Number(a.openCount) || 0) + 1;
+        a.lastDurationMs = dur;
+        if (open > 0 && (a.firstUsedAt == null || open < a.firstUsedAt)) a.firstUsedAt = open;
+        if (last > 0 && (a.lastUsedAt == null || last > a.lastUsedAt)) a.lastUsedAt = last;
+        const d = a.daily[dateKey] || { durationMs: 0, openCount: 0 };
+        d.durationMs = (Number(d.durationMs) || 0) + dur;
+        d.openCount = (Number(d.openCount) || 0) + 1;
+        a.daily[dateKey] = d;                                 // 按日留痕，后续可做趋势/周月聚合
+
+        dayDuration += dur;
+        dayOpenCount += 1;
     }
-    summary.lastCompactedAt = getChinaTime();
-    return summary;
+    s.device.totalDurationMs = (Number(s.device.totalDurationMs) || 0) + dayDuration;
+    s.device.totalOpenCount = (Number(s.device.totalOpenCount) || 0) + dayOpenCount;
+    if (dayFirst != null && (s.device.firstRecordAt == null || dayFirst < s.device.firstRecordAt)) s.device.firstRecordAt = dayFirst;
+    if (dayLast != null && (s.device.lastRecordAt == null || dayLast > s.device.lastRecordAt)) s.device.lastRecordAt = dayLast;
+    if (s.compactedDates.indexOf(dateKey) === -1) s.compactedDates.push(dateKey);
+    s.compactedDates.sort();
+    s.lastCompactedAt = getChinaTime();
+    return s;
 }
 
 function dateStrToTs(s) {
@@ -1302,26 +1389,43 @@ function cleanupUsage() {
     for (const devEnt of devDirs) {
         if (!devEnt.isDirectory()) continue;
         const devDir = path.join(USAGE_DIR, devEnt.name);
-        const summary = loadUsageSummary(devDir);
-        let changed = false;
         let files = [];
         try { files = fs.readdirSync(devDir); } catch (e) { continue; }
-        for (const f of files) {
-            if (!f.endsWith('.json') || f.startsWith('_')) continue; // 跳过汇总/元文件
-            const fileDate = f.replace('.json', '');
-            const ts = dateStrToTs(fileDate);
-            if (ts === null || ts >= cutoff) continue; // 仍在保留期内
+        const dailyFiles = files.filter(f => f.endsWith('.json') && !f.startsWith('_'));
+        const pending = [];
+        for (const f of dailyFiles) {
+            const dateKey = f.replace(/\.json$/, '');
+            const ts = dateStrToTs(dateKey);
+            // 文件名无法解析（如历史 NaN-NaN-NaN.json）也归档清理，避免永久残留
+            if (ts !== null && ts >= cutoff) continue;
             const fp = path.join(devDir, f);
+            const data = safeReadJSON(fp, null);
+            if (!data) { console.warn(`[usage] 日文件读取失败，保留待下轮重试: ${fp}`); continue; }
+            pending.push({ fp, dateKey, already: false, data });
+        }
+        if (pending.length === 0) continue;
+
+        let summary = loadUsageSummary(devDir);
+        for (const p of pending) {
+            // 幂等：已归档过的日期只删文件，不再重复累计
+            if (summary.compactedDates.indexOf(p.dateKey) !== -1) { p.already = true; continue; }
+            summary = accumulateDailyToSummary(p.data, summary, p.dateKey);
+        }
+        const allDates = new Set(summary.compactedDates);
+        for (const f of dailyFiles) allDates.add(f.replace(/\.json$/, ''));
+        summary.device.activeDays = allDates.size;
+        summary.lastCompactedAt = getChinaTime();
+
+        // 留痕优先：汇总写盘成功后才删除明细；写失败则整批保留，下轮重试。
+        if (!saveUsageSummary(devDir, summary)) continue;
+        for (const p of pending) {
             try {
-                const data = safeReadJSON(fp, null);
-                if (data) { accumulateDailyToSummary(data, summary); changed = true; }
-                fs.unlinkSync(fp);
-                console.log(`[usage] 已归档并删除过期日明细: ${fp}`);
+                fs.unlinkSync(p.fp);
+                console.log(`[usage] 已归档并删除过期日明细: ${p.fp}${p.already ? ' (此前已归档)' : ''}`);
             } catch (e) {
-                console.error('[usage] 清理单文件失败:', e);
+                console.error('[usage] 删除日明细失败（汇总已留痕，下轮会跳过重复累计）:', e);
             }
         }
-        if (changed) saveUsageSummary(devDir, summary);
     }
 }
 
@@ -1614,7 +1718,10 @@ function generateDeviceId() {
 }
 
 function formatDate(timestamp) {
-    const date = new Date(timestamp);
+    // 无效/缺失 openTime 会产生 NaN-NaN-NaN.json：既不被清理也不被归档，永久残留。
+    // 用当前时间兜底，保证任何记录都落到可解析的日期分片里。
+    const n = Number(timestamp);
+    const date = new Date(Number.isFinite(n) && n > 0 ? n : Date.now());
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');

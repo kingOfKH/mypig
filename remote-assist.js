@@ -24,6 +24,8 @@ const { xorBase64 } = require('./crypto-util');
 // 统一设备档案：设备名的唯一权威来源（与 server.js 的 HTTP 体系共用同一份数据）
 // 本模块不再自持 deviceInfo 内存表——它随进程重启丢失，是"设备名莫名回退/串号"的根源。
 const deviceRegistry = require('./device-registry');
+// 语音通话信令状态机（独立模块：呼叫生命周期 / 扣费 / 双轨端点下发 / 未接补投）
+const { createCallSignaling } = require('./call-signaling');
 
 // ---- 路径与存储 ----
 const DATA_DIR = path.join(__dirname, 'data', 'remote');
@@ -1098,6 +1100,8 @@ function attach(httpServer) {
         logInfo(`设备上线: ${deviceId.slice(-8)}, 在线数: ${online.size}`);
         // 通知信任对端：该设备已上线，控制端列表实时点亮
         notifyTrustPeers(deviceId);
+        // 语音通话：补投离线期间的未接来电（不引入厂商推送，靠上线主动对账）
+        callSignaling.onDeviceOnline(deviceId);
 
         // 上线皮肤对账：把该设备所有信任对端「当前装备」的皮肤重放一遍。
         // skin.updated 是一次性广播（relayTo 对离线/半开连接直接丢帧），B 断网期间 A 换皮肤
@@ -1262,6 +1266,8 @@ function attach(httpServer) {
             logInfo(`连接关闭 device=${deviceId.slice(-8)} 该设备剩余连接=${online.has(deviceId) ? online.get(deviceId).size : 0} 总在线=${online.size}`);
             // 设备已通过其它连接（如常驻信令）保持在线：无需通知离线
             if (online.has(deviceId)) return;
+            // 语音通话：设备真正离线，结束其参与的通话并通知对端
+            callSignaling.onDeviceOffline(deviceId);
             // 通知信任对端：该设备已离线，控制端列表实时置灰
             notifyTrustPeers(deviceId);
             // 若该设备参与了活动 session，启动宽限定时器（而非立即终止）
@@ -1307,10 +1313,32 @@ function attach(httpServer) {
     return wss;
 }
 
+// ---- 语音通话信令状态机 ----
+// 独立模块承载 call.* 的生命周期与计费，依赖由本模块注入，避免把状态散进 2000 行的 switch。
+// 放在此处初始化：此时 online / pointsCache / 各函数均已就绪，attach() 由外部在模块加载完成后调用。
+const callSignaling = createCallSignaling({
+    relayTo,
+    relayWithDelivery,
+    isTrusted,
+    getPoints,
+    deduct,
+    // 管理设备身份由 admins.json 权威判定，绝不信客户端自称 admin
+    isAdmin,
+    isOnline: (id) => online.has(id) && online.get(id).size > 0,
+    mtxBaseFor: getMediamtxBaseForDevice,
+    logInfo,
+    logWarn,
+});
+
 // ---- 消息路由 ----
 async function handleMessage(ws, m) {
     const deviceId = ws.deviceId;
     const sid = m.sid;
+
+    // 语音通话信令走独立状态机（含扣费、超时强断、上线补投），不污染会话类 switch。
+    if (typeof m.op === 'string' && m.op.startsWith('call.')) {
+        return callSignaling.handle(ws, m);
+    }
 
     switch (m.op) {
         case 'code.connect': {
@@ -2089,6 +2117,8 @@ module.exports = {
     setSelfSwitchAllowed,
     getPoints,
     adjustPoints,
+    // 语音通话运行态（振铃/通话中/待补投未接数），供后台诊断
+    getCallStats: () => callSignaling.stats(),
     // 管理页「删除设备」：清空远程协助体系内该设备的全部数据与内存态
     purgeDevice,
     // 数据迁移覆盖导入后由 server.js 调用：重载磁盘派生缓存

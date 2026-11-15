@@ -26,18 +26,18 @@
     "multer": "^2.2.0",
     "rlottie": "0.1.2",
     "selfsigned": "^2.4.1",
-    "sherpa-onnx-node": "1.13.4",
+    "sherpa-onnx-node": "1.10.33",
     "ws": "^8.21.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
   },
   "overrides": {
-    "sherpa-onnx-linux-x64": "1.13.4",
-    "sherpa-onnx-linux-arm64": "1.13.4",
-    "sherpa-onnx-darwin-x64": "1.13.4",
-    "sherpa-onnx-darwin-arm64": "1.13.4",
-    "sherpa-onnx-win-x64": "1.13.4",
-    "sherpa-onnx-win-ia32": "1.13.4"
+    "sherpa-onnx-linux-x64": "1.10.33",
+    "sherpa-onnx-linux-arm64": "1.10.33",
+    "sherpa-onnx-darwin-x64": "1.10.33",
+    "sherpa-onnx-darwin-arm64": "1.10.33",
+    "sherpa-onnx-win-x64": "1.10.33",
+    "sherpa-onnx-win-ia32": "1.10.33"
   }
 }

@@ -88,6 +88,8 @@ function collectDir(absRoot, relPrefix, out, stats) {
     let names;
     try { names = fs.readdirSync(absRoot); } catch (e) { return; }
     for (const name of names) {
+        // ffmpeg 自检下载的静态二进制（约 80MB）不属于运行时数据，且不跨平台，不进迁移包
+        if (name === '.ffmpeg-bin') continue;
         const abs = path.join(absRoot, name);
         let st;
         try { st = fs.lstatSync(abs); } catch (e) { continue; }

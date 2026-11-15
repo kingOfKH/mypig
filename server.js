@@ -3017,6 +3017,8 @@ require('./call-transcript').resumePending();
 // 本地 ASR 模型自检：缺失时自动下载一次；失败只告警，不阻塞通话
 require('./scripts/download-model').ensureModels((msg) => console.log(msg))
     .catch(e => console.warn('[asr-setup] 模型检查失败:', e.message));
+// ffmpeg 自检：缺失时外网优先、国内镜像兜底自动下载一次；后台异步，失败只告警，不阻塞启动
+require('./scripts/ensure-ffmpeg').ensureFfmpeg((msg) => console.log(msg));
 
 // 只读内存探针：独立模块，MEMORY_PROBE=0 可一键关闭；必须注册在 404 兜底之前。
 require('./memory-probe').attach(app, server, { authorize: requirePageAuthJson });

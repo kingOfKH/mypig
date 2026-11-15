@@ -2793,18 +2793,59 @@ app.get('/migrate', requirePageAuth, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'migrate.html'));
 });
 
-app.get('/api/migrate/export', requirePageAuthJson, (req, res) => {
+// 导出改为异步流式任务：发起后立即返回 jobId，页面轮询进度，完成后再流式下载。
+// 旧实现同步 readFileSync + toBuffer 会占死 Node 单线程、内存翻倍，GB 级数据下页面全部无响应。
+app.get('/api/migrate/export/start', requirePageAuthJson, (req, res) => {
     try {
-        // 即打即下：导出包全程只在内存中，服务端不落盘、不产生任何副本
-        const { buffer } = migrate.buildExportZip({ rootDir: __dirname, kind: 'export' });
-        res.setHeader('Content-Type', 'application/zip');
-        res.setHeader('Content-Disposition', `attachment; filename="starclick_migrate_${migrate.localStamp()}.zip"`);
-        res.setHeader('Cache-Control', 'no-store');
-        res.send(buffer);
+        const job = migrate.startExportJob({ rootDir: __dirname, kind: 'export' });
+        res.json({ success: true, jobId: job.id });
     } catch (e) {
-        console.error('[migrate] 导出失败:', e);
-        res.status(e.status || 500).json({ success: false, error: e.message || '打包失败' });
+        console.error('[migrate] 发起导出失败:', e);
+        res.status(e.status || 500).json({ success: false, error: e.message || '发起导出失败' });
     }
+});
+
+app.get('/api/migrate/export/progress', requirePageAuthJson, (req, res) => {
+    try {
+        const job = migrate.getExportJob(req.query.jobId);
+        if (!job) return res.status(404).json({ success: false, error: '导出任务不存在或已过期' });
+        res.json({ success: true, job });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message || '查询进度失败' });
+    }
+});
+
+app.post('/api/migrate/export/cancel', requirePageAuthJson, (req, res) => {
+    try {
+        const ok = migrate.cancelExportJob(req.body && req.body.jobId);
+        res.json({ success: ok });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message || '取消失败' });
+    }
+});
+
+// 完成后的包走流式下载：createReadStream 直接 pipe，不整包入内存
+app.get('/api/migrate/export/download', requirePageAuthJson, (req, res) => {
+    let result;
+    try {
+        result = migrate.readExportResult(req.query.jobId);
+    } catch (e) {
+        return res.status(e.status || 400).json({ success: false, error: e.message || '下载失败' });
+    }
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${result.name}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    // Content-Length 必须是 zip 文件真实大小（含头部/中央目录/manifest），
+    // 不能用 job.bytesTotal（仅原始数据之和），否则浏览器按错误长度截断 → 压缩包损坏。
+    try { res.setHeader('Content-Length', String(fs.statSync(result.path).size)); }
+    catch (e) { /* stat 失败则不设，交给流式传输自行处理 */ }
+    const rs = fs.createReadStream(result.path);
+    rs.on('error', (err) => {
+        console.error('[migrate] 导出下载失败:', err);
+        if (!res.headersSent) res.status(500).json({ success: false, error: '读取导出文件失败' });
+        else res.destroy(err);
+    });
+    rs.pipe(res);
 });
 
 app.post('/api/migrate/import', requirePageAuthJson, migrateUpload.single('file'), (req, res) => {
@@ -2911,6 +2952,33 @@ remoteAssist.registerVerify((deviceId, token) => {
         return true;
     }
     return token === secret;
+});
+
+// 端口占用等致命启动错误的显式处理。
+// 背景：ws 库在 attach() 时把 httpServer 的 'error' 事件转接到了 WebSocketServer
+// （node_modules/ws/lib/websocket-server.js 中 error: this.emit.bind(this,'error')），
+// 于是 listen 失败会被误标成 [WSS-ERROR]；更糟的是因为有监听器，Node 认为错误
+// 已被处理、进程不会崩溃，从而留下「进程活着但根本没监听端口」的僵尸态——重启看似
+// 成功、实际旧进程仍在服务，排查极其困难。这里显式拦截并以非 0 退出，
+// 让 pm2 按 min_uptime/max_restarts 策略干净重启或停机，同时给出可操作的排查命令。
+server.on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE') {
+        console.error('============================================================');
+        console.error(` [启动失败] 端口 ${PORT} 已被占用，服务无法监听 (EADDRINUSE)`);
+        console.error('------------------------------------------------------------');
+        console.error(' 常见原因：上一个服务进程未退出、pm2 重复启动同一应用，或端口被其它程序占用。');
+        console.error(' 生产 pm2 环境排查步骤：');
+        console.error('   1) pm2 list                       查看是否有多份实例/残留进程');
+        console.error('   2) pm2 delete <应用名>             删除旧实例后重新 pm2 start');
+        console.error('   3) lsof -i :' + PORT + '              找出占用端口的进程 PID');
+        console.error('   4) kill -9 <PID>                   结束占用进程后再启动');
+        console.error('============================================================');
+    } else {
+        console.error('[server] 监听失败:', err && err.message, err && err.stack);
+    }
+    // 非 0 退出：node 对未处理 server error 的默认行为本就是崩溃；
+    // ws 意外吞掉了它，这里恢复该行为，避免僵尸进程。
+    process.exit(1);
 });
 
 server.listen(PORT, HOST, () => {

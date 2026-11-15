@@ -30,7 +30,11 @@
  */
 
 const fs = require('fs');
+const fsp = fs.promises;
 const path = require('path');
+const crypto = require('crypto');
+const zlib = require('zlib');
+const { once } = require('events');
 const AdmZip = require('adm-zip');
 
 const FORMAT = 'starclick-migrate';
@@ -96,7 +100,7 @@ function collectDir(absRoot, relPrefix, out, stats) {
             stats.files += 1;
             stats.bytes += st.size;
             checkLimits(stats, st.size, rel);
-            out.files.push({ abs, rel, size: st.size });
+            out.files.push({ abs, rel, size: st.size, mtimeMs: st.mtimeMs });
         }
     }
 }
@@ -114,7 +118,7 @@ function collectEnv(rootDir, out, stats) {
         stats.files += 1;
         stats.bytes += st.size;
         checkLimits(stats, st.size, name);
-        out.files.push({ abs, rel: name, size: st.size });
+        out.files.push({ abs, rel: name, size: st.size, mtimeMs: st.mtimeMs });
     }
 }
 
@@ -155,6 +159,303 @@ function buildExportZip(options) {
     zip.addFile(MANIFEST_NAME, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
     return { buffer: zip.toBuffer(), manifest };
 }
+
+// ==================== 异步流式导出（不阻塞事件循环 / 不整体入内存） ====================
+// 旧实现 buildExportZip 是纯同步的：逐文件 readFileSync + AdmZip.addFile，最后 toBuffer()
+// 把整包塞进一个超大 Buffer。GB 级生产数据下会长时间占死 Node 单线程（页面全部无响应），
+// 且内存峰值约等于「全量数据 + 整包」两份。新的导出改为：
+//   ① 只 stat 扫描；② 用 createReadStream 逐文件流式写入临时 zip（STORE 不压缩）；
+//   ③ CRC32 用 Node 内置 zlib.crc32 边读边算（配合 data descriptor，只读一遍）；
+//   ④ 全程 await 让出事件循环，服务端其余请求照常响应；⑤ 通过任务对象汇报进度。
+// 导出的 zip 仍由 importZipBuffer 用 adm-zip 读取，格式完全兼容（data descriptor + 中央目录 CRC）。
+const EXPORT_JOB_TTL_MS = 30 * 60 * 1000; // 任务/临时包保留 30 分钟
+const EXPORT_MAX_JOBS = 8;
+const exportJobs = new Map(); // jobId -> job（进程内临时状态，重启即失效）
+
+function newJobId() {
+    return Date.now().toString(36) + '-' + crypto.randomBytes(4).toString('hex');
+}
+
+/** DOS 时间/日期（ZIP 头用，本地时区） */
+function dosDateTime(ms) {
+    const d = new Date(ms || Date.now());
+    const year = Math.max(1980, d.getFullYear());
+    const time = ((d.getHours() & 0x1f) << 11) | ((d.getMinutes() & 0x3f) << 5) | (Math.floor(d.getSeconds() / 2) & 0x1f);
+    const date = (((year - 1980) & 0x7f) << 9) | (((d.getMonth() + 1) & 0x0f) << 5) | (d.getDate() & 0x1f);
+    return { time, date };
+}
+
+/** 只 stat 收集待打包条目，不读文件内容 */
+function collectPayload(rootDir) {
+    const stats = { files: 0, bytes: 0, dirs: 0 };
+    const sectionStats = {};
+    const items = []; // {kind:'dir'|'file', zipName, abs, size, mtimeMs}
+    for (const sec of SECTIONS) {
+        const out = { files: [], dirs: [] };
+        if (sec.key === 'env') collectEnv(rootDir, out, stats);
+        else collectDir(path.resolve(rootDir, sec.dest), '', out, stats);
+        stats.dirs += out.dirs.length;
+        sectionStats[sec.key] = { files: out.files.length, bytes: out.files.reduce((s, f) => s + f.size, 0) };
+        for (const rel of out.dirs) items.push({ kind: 'dir', zipName: sec.zipPrefix + rel + '/' });
+        for (const f of out.files) items.push({ kind: 'file', zipName: sec.zipPrefix + f.rel, abs: f.abs, size: f.size, mtimeMs: f.mtimeMs });
+    }
+    return { items, stats, sectionStats };
+}
+
+function writeBuf(ws, buf) {
+    return new Promise((resolve, reject) => {
+        ws.write(buf, (err) => err ? reject(err) : resolve());
+    });
+}
+async function writeChunk(ws, buf) {
+    if (!ws.write(buf)) await once(ws, 'drain');
+}
+async function finishStream(ws) {
+    const done = once(ws, 'finish');
+    ws.end();
+    await done;
+}
+
+function localHeader(nameBuf, dt, flag, crc, compSize, uncompSize) {
+    const b = Buffer.alloc(30);
+    b.writeUInt32LE(0x04034b50, 0); // local file header sig
+    b.writeUInt16LE(20, 4);         // version needed
+    b.writeUInt16LE(flag, 6);       // flags (bit11 UTF-8, bit3 data descriptor)
+    b.writeUInt16LE(0, 8);          // method = STORE
+    b.writeUInt16LE(dt.time, 10);
+    b.writeUInt16LE(dt.date, 12);
+    b.writeUInt32LE(crc >>> 0, 14);
+    b.writeUInt32LE(compSize >>> 0, 18);
+    b.writeUInt32LE(uncompSize >>> 0, 22);
+    b.writeUInt16LE(nameBuf.length, 26);
+    b.writeUInt16LE(0, 28);         // extra len
+    return Buffer.concat([b, nameBuf]);
+}
+function dataDescriptor(crc, size) {
+    const b = Buffer.alloc(16);
+    b.writeUInt32LE(0x08074b50, 0); // descriptor sig
+    b.writeUInt32LE(crc >>> 0, 4);
+    b.writeUInt32LE(size >>> 0, 8);
+    b.writeUInt32LE(size >>> 0, 12);
+    return b;
+}
+function centralRecord(rec) {
+    const nameBuf = rec.nameBuf;
+    const b = Buffer.alloc(46);
+    b.writeUInt32LE(0x02014b50, 0); // central dir sig
+    b.writeUInt16LE(20, 4);         // version made by
+    b.writeUInt16LE(20, 6);         // version needed
+    b.writeUInt16LE(rec.flag, 8);
+    b.writeUInt16LE(0, 10);         // method = STORE
+    b.writeUInt16LE(rec.dt.time, 12);
+    b.writeUInt16LE(rec.dt.date, 14);
+    b.writeUInt32LE(rec.crc >>> 0, 16);
+    b.writeUInt32LE(rec.size >>> 0, 20);
+    b.writeUInt32LE(rec.size >>> 0, 24);
+    b.writeUInt16LE(nameBuf.length, 28);
+    b.writeUInt16LE(0, 30);         // extra
+    b.writeUInt16LE(0, 32);         // comment
+    b.writeUInt16LE(0, 34);         // disk start
+    b.writeUInt16LE(0, 36);         // internal attrs
+    b.writeUInt32LE(0, 38);         // external attrs
+    b.writeUInt32LE(rec.offset >>> 0, 42);
+    return Buffer.concat([b, nameBuf]);
+}
+function eocd(count, cdSize, cdOffset) {
+    const b = Buffer.alloc(22);
+    b.writeUInt32LE(0x06054b50, 0);
+    b.writeUInt16LE(0, 4);
+    b.writeUInt16LE(0, 6);
+    b.writeUInt16LE(count & 0xffff, 8);
+    b.writeUInt16LE(count & 0xffff, 10);
+    b.writeUInt32LE(cdSize >>> 0, 12);
+    b.writeUInt32LE(cdOffset >>> 0, 16);
+    b.writeUInt16LE(0, 20);
+    return b;
+}
+
+/** 清理上次进程崩溃残留的临时导出包 */
+function purgeExportTmp(rootDir) {
+    const dir = path.join(rootDir || __dirname, 'backups', '_exports');
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch (e) { return; }
+    const now = Date.now();
+    for (const name of names) {
+        if (!/^export_[A-Za-z0-9_-]+\.zip$/.test(name)) continue;
+        const abs = path.join(dir, name);
+        try {
+            const st = fs.lstatSync(abs);
+            if (st.isFile() && now - st.mtimeMs > EXPORT_JOB_TTL_MS) fs.unlinkSync(abs);
+        } catch (e) { /* 占用或已消失，跳过 */ }
+    }
+}
+
+/** 发起一个异步导出任务，立即返回 job（调用方轮询进度） */
+function startExportJob(options) {
+    const opts = options || {};
+    const rootDir = path.resolve(opts.rootDir || __dirname);
+    const kind = opts.kind === 'backup' ? 'backup' : 'export';
+    // 淘汰过期 / 过多的历史任务，避免内存与临时包无限增长
+    for (const [id, j] of exportJobs) {
+        const old = Date.now() - j.startTime > EXPORT_JOB_TTL_MS;
+        const over = exportJobs.size > EXPORT_MAX_JOBS && j.status !== 'running';
+        if (old || over) {
+            if (j.tmpPath) fs.unlink(j.tmpPath, () => {});
+            exportJobs.delete(id);
+        }
+    }
+    const job = {
+        id: newJobId(), rootDir, status: 'running', phase: 'scan', phaseText: '正在扫描文件…',
+        filesTotal: 0, filesDone: 0, bytesTotal: 0, doneBytes: 0,
+        current: '', error: null, cancel: false, startTime: Date.now(),
+        manifest: null, tmpPath: null, fileName: '', rootDir
+    };
+    exportJobs.set(job.id, job);
+    runExportJob(job, kind).catch((e) => {
+        job.status = 'error';
+        job.error = (e && e.message) || String(e);
+        job.phaseText = '导出失败';
+        if (job.tmpPath) fs.unlink(job.tmpPath, () => {});
+    });
+    return job;
+}
+
+async function runExportJob(job, kind) {
+    const rootDir = job.rootDir;
+    // 1) 只 stat 扫描（不读内容，很快）
+    const { items, stats, sectionStats } = collectPayload(rootDir);
+    job.filesTotal = items.length;
+    job.bytesTotal = stats.bytes;
+
+    // 2) 临时包放在 backups/_exports（不在导出范围内，避免自我包含）
+    const tmpDir = path.join(rootDir, 'backups', '_exports');
+    await fsp.mkdir(tmpDir, { recursive: true });
+    const tmpPath = path.join(tmpDir, `export_${job.id}.zip`);
+    job.tmpPath = tmpPath;
+    const ws = fs.createWriteStream(tmpPath, { highWaterMark: 256 * 1024 });
+    let pos = 0;
+    const central = [];
+    const now = Date.now();
+
+    try {
+        // 3) 逐条目流式写入
+        job.phase = 'packing';
+        job.phaseText = '正在打包…';
+        for (let i = 0; i < items.length; i++) {
+            if (job.cancel) throw new MigrateError('导出已取消');
+            const item = items[i];
+            job.current = item.zipName;
+            const nameBuf = Buffer.from(item.zipName, 'utf8');
+            const dt = dosDateTime(item.mtimeMs || now);
+            const offset = pos;
+            let flag, crc, size;
+
+            if (item.kind === 'dir') {
+                flag = 0x0800; // UTF-8
+                crc = 0; size = 0;
+                await writeBuf(ws, localHeader(nameBuf, dt, flag, 0, 0, 0));
+                pos += 30 + nameBuf.length;
+            } else {
+                flag = 0x0800 | 0x0008; // UTF-8 + data descriptor
+                await writeBuf(ws, localHeader(nameBuf, dt, flag, 0, 0, 0));
+                pos += 30 + nameBuf.length;
+                crc = 0; size = 0;
+                const rs = fs.createReadStream(item.abs, { highWaterMark: 256 * 1024 });
+                for await (const chunk of rs) {
+                    if (job.cancel) { rs.destroy(); throw new MigrateError('导出已取消'); }
+                    crc = zlib.crc32(chunk, crc);
+                    size += chunk.length;
+                    await writeChunk(ws, chunk);
+                    pos += chunk.length;
+                    job.doneBytes += chunk.length;
+                }
+                await writeBuf(ws, dataDescriptor(crc, size));
+                pos += 16;
+                crc = crc >>> 0;
+            }
+            central.push(centralRecord({ nameBuf, dt, flag, crc, size, offset }));
+            job.filesDone = i + 1;
+        }
+
+        // 4) manifest 走内存（很小），不用 data descriptor
+        const manifest = {
+            format: FORMAT, version: FORMAT_VERSION, kind,
+            createdAt: new Date().toISOString(), createdAtLocal: new Date().toLocaleString('zh-CN'),
+            sections: SECTIONS.map(s => ({ key: s.key, label: s.label, ...sectionStats[s.key] })),
+            files: stats.files, dirs: stats.dirs, bytes: stats.bytes,
+            note: '覆盖导入：目标机器现有 data/、updates/、public/emoji/custom/、.env* 会先被清空，以本包为准。'
+        };
+        job.manifest = manifest;
+        const mBuf = Buffer.from(JSON.stringify(manifest, null, 2), 'utf8');
+        const mName = Buffer.from(MANIFEST_NAME, 'utf8');
+        const mCrc = zlib.crc32(mBuf) >>> 0;
+        const mOffset = pos;
+        const mDt = dosDateTime(Date.now());
+        await writeBuf(ws, localHeader(mName, mDt, 0x0800, mCrc, mBuf.length, mBuf.length));
+        pos += 30 + mName.length;
+        await writeChunk(ws, mBuf);
+        pos += mBuf.length;
+        central.push(centralRecord({ nameBuf: mName, dt: mDt, flag: 0x0800, crc: mCrc, size: mBuf.length, offset: mOffset }));
+
+        // 5) 中央目录 + EOCD
+        job.phase = 'finalizing';
+        job.phaseText = '正在生成索引…';
+        const cdOffset = pos;
+        let cdSize = 0;
+        for (const rec of central) { await writeBuf(ws, rec); cdSize += rec.length; }
+        await writeBuf(ws, eocd(central.length, cdSize, cdOffset));
+        await finishStream(ws);
+
+        job.fileName = `starclick_migrate_${localStamp()}.zip`;
+        job.status = 'done';
+        job.phase = 'done';
+        job.phaseText = '打包完成';
+        job.doneBytes = job.bytesTotal;
+        job.current = '';
+    } catch (e) {
+        try { ws.destroy(); } catch (_) { /* 忽略 */ }
+        throw e;
+    }
+}
+
+/** 供页面轮询的进度快照（纯数据，不含 Buffer/路径等内部字段） */
+function getExportJob(jobId) {
+    const job = exportJobs.get(String(jobId || ''));
+    if (!job) return null;
+    const pct = job.status === 'done'
+        ? 100
+        : (job.bytesTotal > 0 ? Math.min(99, Math.floor(job.doneBytes / job.bytesTotal * 100)) : 0);
+    return {
+        jobId: job.id, status: job.status, phase: job.phase, phaseText: job.phaseText,
+        filesTotal: job.filesTotal, filesDone: job.filesDone,
+        bytesTotal: job.bytesTotal, doneBytes: job.doneBytes, percent: pct,
+        current: job.current, error: job.error, manifest: job.manifest,
+        fileName: job.fileName,
+        startedAt: job.startTime, elapsedMs: Date.now() - job.startTime
+    };
+}
+
+function cancelExportJob(jobId) {
+    const job = exportJobs.get(String(jobId || ''));
+    if (!job) return false;
+    if (job.status === 'running') job.cancel = true;
+    return true;
+}
+
+function readExportResult(jobId) {
+    const job = exportJobs.get(String(jobId || ''));
+    if (!job) throw new MigrateError('导出任务不存在或已过期，请重新发起导出');
+    if (job.status === 'running') throw new MigrateError('导出尚未完成');
+    if (job.status === 'error') throw new MigrateError('导出失败：' + (job.error || '未知错误'));
+    if (!job.tmpPath || !fs.existsSync(job.tmpPath)) throw new MigrateError('导出文件已过期，请重新发起导出');
+    return {
+        path: job.tmpPath,
+        name: job.fileName || `starclick_migrate_${localStamp()}.zip`,
+        bytes: job.bytesTotal
+    };
+}
+
+purgeExportTmp(__dirname);
 
 function readManifest(zip) {
     const entry = zip.getEntry(MANIFEST_NAME);
@@ -450,6 +751,10 @@ module.exports = {
     SECTIONS,
     MigrateError,
     buildExportZip,
+    startExportJob,
+    getExportJob,
+    cancelExportJob,
+    readExportResult,
     importZipBuffer,
     listBackups,
     readBackup,

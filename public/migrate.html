@@ -98,6 +98,20 @@
 
   .busy { display: none; margin-top: 22px; padding: 14px 18px; border-radius: var(--radius-md); background: var(--accent-soft); color: var(--accent); font-size: 13px; font-weight: 600; }
   .busy.show { display: block; }
+
+  /* 导出进度 */
+  .progress { display: none; margin-top: 20px; padding: 18px 20px; border-radius: var(--radius-lg); border: 1px solid var(--border); background: var(--surface); box-shadow: var(--shadow-card); }
+  .progress.show { display: block; }
+  .progress .phead { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  .progress .pphase { font-size: 13px; font-weight: 650; color: var(--text); }
+  .progress .pct { font: 700 18px/1 var(--font); color: var(--accent); font-variant-numeric: tabular-nums; }
+  .progress .ptrack { height: 9px; border-radius: 999px; background: var(--border); overflow: hidden; margin-top: 12px; }
+  .progress .pfill { height: 100%; width: 0%; border-radius: 999px; background: linear-gradient(90deg, #6366f1, #818cf8); transition: width .3s ease; }
+  .progress .pfill.done { background: linear-gradient(90deg, #16a34a, #4ade80); }
+  .progress .pmeta { display: flex; justify-content: space-between; gap: 12px; margin-top: 9px; font-size: 11.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .progress .pcur { margin-top: 8px; font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .progress .pactions { margin-top: 14px; }
+  .progress .hint { margin-top: 10px; font-size: 11.5px; color: var(--text-muted); }
   .result { display: none; margin-top: 22px; border-radius: var(--radius-xl); padding: 22px 24px; border: 1px solid var(--border); background: var(--surface); box-shadow: var(--shadow-card); }
   .result.show { display: block; }
   .result.ok { border-left: 4px solid var(--success); }
@@ -197,7 +211,7 @@
           <div class="sub">打包全部运行时数据为 zip</div>
         </div>
       </div>
-      <p class="desc">导出包含服务运行所需的全部数据，<b>不含源码</b>，新服务器只需拉取仓库代码；<b>导出包只下载到本机，服务端不留存副本</b>：</p>
+      <p class="desc">导出包含服务运行所需的全部数据，<b>不含源码</b>，新服务器只需拉取仓库代码；导出采用<b>后台流式打包</b>，期间其它页面照常访问，完成后自动下载。临时包仅存在服务端 <code>backups/_exports/</code>，30 分钟后自动清理：</p>
       <ul class="list">
         <li><span class="dot"></span><span><code>data/</code> 设备档案、信任关系、积分、聊天/快照/头像/剪贴板、表情配置、TLS 证书与后台登录密钥</span></li>
         <li><span class="dot"></span><span><code>updates/</code> 已发布的 APK 与版本元数据</span></li>
@@ -206,6 +220,20 @@
         <li><span class="dot muted"></span><span>不含 <code>*.js</code>、<code>*.html</code>、<code>node_modules/</code>、<code>.git/</code>、<code>backups/</code></span></li>
       </ul>
       <button class="btn primary" id="btnExport">一键打包下载</button>
+      <div class="progress" id="exportProgress">
+        <div class="phead">
+          <span class="pphase" id="expPhase">正在准备…</span>
+          <span class="pct" id="expPct">0%</span>
+        </div>
+        <div class="ptrack"><div class="pfill" id="expFill"></div></div>
+        <div class="pmeta">
+          <span id="expFiles">文件 0 / 0</span>
+          <span id="expBytes">0 B / 0 B</span>
+        </div>
+        <div class="pcur" id="expCur"></div>
+        <div class="pactions"><button class="btn mini" id="btnCancelExport" type="button">取消打包</button></div>
+        <div class="hint">打包在后台流式进行，服务端其余页面可正常访问；完成后自动开始下载。</div>
+      </div>
     </div>
 
     <div class="card">
@@ -236,7 +264,7 @@
     <div class="backups-head">
       <div>
         <h2>服务端留存包</h2>
-        <div class="sub">导出包不落盘，无需清理；这里只列出「导入前自动备份」（每次迁入自动替换上一份，只保留最新）与异常残留的上传临时文件</div>
+        <div class="sub">导出临时包放在 backups/_exports/（30 分钟自动清理，不在此列出）；这里只列出「导入前自动备份」（每次迁入自动替换上一份，只保留最新）与异常残留的上传临时文件</div>
       </div>
       <div class="tools">
         <button class="btn mini" id="btnReloadBackups" type="button">刷新</button>
@@ -307,37 +335,114 @@
       function () { return 'HTTP ' + res.status; });
   }
 
-  btnExport.addEventListener('click', function () {
-    btnExport.disabled = true;
-    btnExport.textContent = '正在打包…';
-    setBusy('正在读取并打包全部运行时数据，数据量较大时可能需要几十秒，请勿关闭页面…');
-    fetch('/api/migrate/export', { method: 'GET', credentials: 'same-origin' })
+  var progress = $('exportProgress');
+  var expPhase = $('expPhase'), expPct = $('expPct'), expFill = $('expFill');
+  var expFiles = $('expFiles'), expBytes = $('expBytes'), expCur = $('expCur');
+  var btnCancelExport = $('btnCancelExport');
+  var expJobId = null;
+  var expPollTimer = null;
+  var expPolling = false;
+
+  function setExportUI(j) {
+    expPhase.textContent = j.phaseText || '正在打包…';
+    expPct.textContent = (j.percent || 0) + '%';
+    expFill.style.width = (j.percent || 0) + '%';
+    expFill.classList.toggle('done', j.status === 'done');
+    expFiles.textContent = '文件 ' + (j.filesDone || 0) + ' / ' + (j.filesTotal || 0);
+    expBytes.textContent = fmtSize(j.doneBytes) + ' / ' + fmtSize(j.bytesTotal);
+    expCur.textContent = j.current || '';
+  }
+
+  function resetExportUI() {
+    btnExport.disabled = false;
+    btnExport.textContent = '一键打包下载';
+    btnCancelExport.disabled = true;
+  }
+
+  function stopPolling() {
+    if (expPollTimer) { clearTimeout(expPollTimer); expPollTimer = null; }
+    expPolling = false;
+  }
+
+  function pollExport() {
+    if (expPolling || !expJobId) return;
+    expPolling = true;
+    fetch('/api/migrate/export/progress?jobId=' + encodeURIComponent(expJobId), { credentials: 'same-origin' })
       .then(function (res) {
         if (!res.ok) return readError(res).then(function (m) { throw new Error(m); });
-        return res.blob().then(function (blob) { return { blob: blob, cd: res.headers.get('Content-Disposition') || '' }; });
+        return res.json();
       })
       .then(function (r) {
-        var m = /filename="([^"]+)"/i.exec(r.cd);
-        var name = m ? m[1] : ('starclick_migrate_' + Date.now() + '.zip');
-        var url = URL.createObjectURL(r.blob);
-        var a = document.createElement('a');
-        a.href = url; a.download = name;
-        document.body.appendChild(a); a.click(); a.remove();
-        setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
-        showResult('ok', '导出完成', '迁移包已开始下载，请妥善保管（内含密钥与证书）。', [
-          ['文件名', name],
-          ['压缩包大小', fmtSize(r.blob.size)],
-          ['下一步', '在新服务器 git clone 项目并打开 /migrate 上传此包']
-        ], '导出建议在夜间低峰进行；导出瞬间的写入可能未被包含。', true);
+        var j = r.job || {};
+        setExportUI(j);
+        if (j.status === 'done') {
+          stopPolling();
+          // 完成后走流式下载（浏览器直接接收，不再整包进内存）
+          var a = document.createElement('a');
+          a.href = '/api/migrate/export/download?jobId=' + encodeURIComponent(expJobId);
+          document.body.appendChild(a); a.click(); a.remove();
+          var mf = j.manifest || {};
+          showResult('ok', '导出完成', '迁移包已开始下载，请妥善保管（内含密钥与证书）。', [
+            ['文件名', j.fileName || 'starclick_migrate.zip'],
+            ['数据量', fmtSize(mf.bytes) + '（' + (mf.files || 0) + ' 个文件 / ' + (mf.dirs || 0) + ' 个目录）'],
+            ['耗时', ((j.elapsedMs || 0) / 1000).toFixed(1) + ' 秒'],
+            ['下一步', '在新服务器 git clone 项目并打开 /migrate 上传此包']
+          ], '导出在后台流式进行，服务端其他页面始终可访问；导出瞬间的写入可能未被包含。', true);
+          resetExportUI();
+          return;
+        }
+        if (j.status === 'error') {
+          stopPolling();
+          throw new Error(j.error || '导出失败');
+        }
+        expPolling = false;
+        expPollTimer = setTimeout(pollExport, 700);
       })
       .catch(function (e) {
+        stopPolling();
+        progress.classList.remove('show');
         showResult('err', '导出失败', e.message || String(e), [], '若为登录过期，请重新登录后台后重试。', true);
-      })
-      .then(function () {
-        btnExport.disabled = false;
-        btnExport.textContent = '一键打包下载';
-        hideBusy();
+        resetExportUI();
       });
+  }
+
+  btnExport.addEventListener('click', function () {
+    btnExport.disabled = true;
+    btnExport.textContent = '正在准备…';
+    result.className = 'result';
+    progress.classList.add('show');
+    setExportUI({ phaseText: '正在准备…', percent: 0, filesDone: 0, filesTotal: 0, doneBytes: 0, bytesTotal: 0, current: '' });
+    btnCancelExport.disabled = false;
+    expJobId = null;
+    stopPolling();
+    fetch('/api/migrate/export/start', { method: 'GET', credentials: 'same-origin' })
+      .then(function (res) {
+        if (!res.ok) return readError(res).then(function (m) { throw new Error(m); });
+        return res.json();
+      })
+      .then(function (r) {
+        if (!r.success || !r.jobId) throw new Error(r.error || '无法发起导出');
+        expJobId = r.jobId;
+        pollExport();
+      })
+      .catch(function (e) {
+        stopPolling();
+        progress.classList.remove('show');
+        showResult('err', '导出失败', e.message || String(e), [], '若为登录过期，请重新登录后台后重试。', true);
+        resetExportUI();
+      });
+  });
+
+  btnCancelExport.addEventListener('click', function () {
+    if (!expJobId) return;
+    btnCancelExport.disabled = true;
+    fetch('/api/migrate/export/cancel', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobId: expJobId })
+    }).then(function () {
+      // 轮询会在下一轮看到 error/cancel 状态并收尾
+    }).catch(function () {});
   });
 
   function refreshImportBtn() {

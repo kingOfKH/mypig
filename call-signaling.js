@@ -38,6 +38,9 @@ function createCallSignaling(deps) {
         mtxBaseFor,
         logInfo,
         logWarn,
+        // 录音归档钩子（可选）：不注入时信令行为与原来完全一致
+        onCallActive,
+        onCallEnded,
     } = deps;
 
     /** callId -> call */
@@ -86,12 +89,32 @@ function createCallSignaling(deps) {
         c.endReason = reason;
         c.endedAt = now();
         const durationMs = c.answeredAt ? Math.max(0, c.endedAt - c.answeredAt) : 0;
+        // 归档收尾必须先于 call.ended 下发：这样读取令牌能随结束帧一起返回，
+        // 客户端把它写进聊天记录，之后任意时刻都能回看文本记录与回听原声。
+        let readToken = '';
+        if (typeof onCallEnded === 'function') {
+            try {
+                const ret = onCallEnded({
+                    callId: c.callId,
+                    caller: c.caller,
+                    callee: c.callee,
+                    answeredAt: c.answeredAt,
+                    endedAt: c.endedAt,
+                    durationMs,
+                    reason,
+                });
+                if (ret && typeof ret.read === 'string') readToken = ret.read;
+            } catch (e) {
+                warn(`录音归档结束处理失败 callId=${c.callId}: ${e.message}`);
+            }
+        }
         const base = {
             callId: c.callId,
             reason,
             durationMs,
             wasActive,
             missed: reason === 'no_answer' || reason === 'offline',
+            ...(readToken ? { read: readToken } : {}),
             ...(extra || {}),
         };
         send(c.caller, 'call.ended', { ...base, peer: c.callee, role: 'caller' });
@@ -242,12 +265,29 @@ function createCallSignaling(deps) {
         c.state = 'active';
         c.answeredAt = now();
 
+        // 录音上传令牌在该时刻下发：只有真正接听后才可能产生归档
+        let rec = null;
+        if (typeof onCallActive === 'function') {
+            try {
+                rec = onCallActive({
+                    callId: c.callId,
+                    caller: c.caller,
+                    callee: c.callee,
+                    t0: c.answeredAt,
+                    maxDurationMs: MAX_CALL_MS,
+                });
+            } catch (e) {
+                warn(`录音归档初始化失败 callId=${c.callId}: ${e.message}`);
+            }
+        }
+
         // 端点已在 invite 阶段下发、双方振铃期已完成静音预热；
         // 这里只做「接听解锁」，客户端收到后解除静音即可通话，不再重新握手。
         const common = {
             callId: c.callId,
             t0: c.answeredAt,             // 统一时钟基准（客户端录制对齐用）
             maxDurationMs: MAX_CALL_MS,
+            ...(rec ? { rec } : {}),
         };
         send(c.caller, 'call.active', { ...common, ...c.media.callerMedia });
         send(c.callee, 'call.active', { ...common, ...c.media.calleeMedia });

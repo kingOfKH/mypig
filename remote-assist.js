@@ -26,6 +26,7 @@ const { xorBase64 } = require('./crypto-util');
 const deviceRegistry = require('./device-registry');
 // 语音通话信令状态机（独立模块：呼叫生命周期 / 扣费 / 双轨端点下发 / 未接补投）
 const { createCallSignaling } = require('./call-signaling');
+const callRecording = require('./call-recording');
 
 // ---- 路径与存储 ----
 const DATA_DIR = path.join(__dirname, 'data', 'remote');
@@ -1328,6 +1329,9 @@ const callSignaling = createCallSignaling({
     mtxBaseFor: getMediamtxBaseForDevice,
     logInfo,
     logWarn,
+    // 录音归档：接听时发上传令牌，结束时触发终稿转写（均在录音模块内部处理失败）
+    onCallActive: (info) => callRecording.onCallActive(info),
+    onCallEnded: (info) => callRecording.onCallEnded(info),
 });
 
 // ---- 消息路由 ----

@@ -17,6 +17,9 @@ node_modules/
 .env
 .env*
 
+# 本地 ASR 权重（运行时自动下载，单文件 228MB，勿提交）
+models/
+
 # 发布的安装包与每版本元数据（运行时生成，勿提交）
 updates/
 

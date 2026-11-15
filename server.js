@@ -2941,6 +2941,15 @@ remoteAssist.attach(server);
 remoteAssist.startTimeoutWatchdog();
 console.log('[remote] 远程协助信令模块已挂载: /ws/remote');
 
+// 通话录音归档：分块上传 / 终稿转写 / 点句回听切片 / 磁盘占用
+const callRecording = require('./call-recording');
+callRecording.attachRoutes(app);
+// 续跑上次未完成的转写任务（服务重启后仍能从已完成的分段继续）
+require('./call-transcript').resumePending();
+// 本地 ASR 模型自检：缺失时自动下载一次；失败只告警，不阻塞通话
+require('./scripts/download-model').ensureModels((msg) => console.log(msg))
+    .catch(e => console.warn('[asr-setup] 模型检查失败:', e.message));
+
 // 只读内存探针：独立模块，MEMORY_PROBE=0 可一键关闭；必须注册在 404 兜底之前。
 require('./memory-probe').attach(app, server, { authorize: requirePageAuthJson });
 

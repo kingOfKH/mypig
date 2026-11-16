@@ -19,6 +19,8 @@ const https = require('https');
 // 纯 JS 自签名证书库：无需系统 openssl、无原生编译，首次启动自动生成证书（含长期有效、无域名/IP SAN，
 // 因 Android 客户端采用「首次信任学习(TOFU)式公钥锁定」+ 自定义主机名校验，不依赖证书里的主机名/IP）。
 const selfsigned = require('selfsigned');
+const { execFile } = require('child_process');
+const os = require('os');
 
 // 全局兜底：任何未捕获异常/未处理的 Promise rejection 都不应直接杀死进程。
 // （历史崩溃：audit.log 的 WriteStream 在 fd 失效时抛出未捕获 'error' 事件导致 EBADF 进程退出）
@@ -1796,6 +1798,114 @@ function emojiFileHash(buf) {
     return crypto.createHash('md5').update(buf).digest('hex');
 }
 
+// ==================== webp 表情归一化（2026-11-16） ====================
+// Android 客户端只能渲染 PNG / APNG / GIF（EmojiView + ApngDecoder），无法直接解码 webp，
+// 因此在服务端把上传的 webp 转成客户端可播放的格式：
+//   - 静态 webp → PNG（像素无损，8bit 透明通道保留）
+//   - 动态 webp → APNG（帧数、每帧时长、8bit alpha 全部保留）
+// **不转 GIF**：GIF 每帧只有 256 色、1bit 透明、帧延迟仅 10ms 精度，会出色带/硬边/节奏漂移。
+// 转换用的临时 webp 与中间文件在 finally 中一并删除，磁盘上只保留最终表情文件。
+const WEBP_MAX_INPUT_BYTES = 2 * 1024 * 1024;   // 输入上限：再大转码耗时与内存不可控
+const WEBP_MAX_OUTPUT_BYTES = 6 * 1024 * 1024;  // 输出上限：APNG 会被全量预拉取，太大会拖慢每台设备的首启流量
+const WEBP_CONVERT_TIMEOUT_MS = 25 * 1000;
+const WEBP_MAX_FRAMES = 40;                     // 与客户端 ApngDecoder.MAX_FRAMES 对齐，多出的帧客户端也会抽掉
+const WEBP_MAX_EDGE = 320;                      // 长边上限（表情显示 240，留一倍余量）
+
+/** RIFF....WEBP 头嗅探：只读前 12 字节，不解码 */
+function isWebpBuffer(buf) {
+    return Buffer.isBuffer(buf) && buf.length >= 12 &&
+        buf.toString('ascii', 0, 4) === 'RIFF' &&
+        buf.toString('ascii', 8, 12) === 'WEBP';
+}
+
+/**
+ * 判断 webp 是否动态：遍历 RIFF 块，出现 ANIM（动画参数）或 ANMF（帧）即为动图。
+ * 只读块头不解码；长度异常时按静态处理（后续 ffmpeg 转换仍会兜底）。
+ */
+function isAnimatedWebpBuffer(buf) {
+    if (!isWebpBuffer(buf)) return false;
+    let pos = 12;
+    while (pos + 8 <= buf.length) {
+        const type = buf.toString('ascii', pos, pos + 4);
+        const size = buf.readUInt32LE(pos + 4);
+        if (type === 'ANIM' || type === 'ANMF') return true;
+        if (!Number.isFinite(size) || size < 0) break;
+        pos += 8 + size + (size % 2); // RIFF 块按偶数字节对齐
+    }
+    return false;
+}
+
+/** ffmpeg 路径：优先 ensure-ffmpeg 写回的 env，其次 npm 包，最后系统 PATH */
+function ffmpegBin() {
+    if (process.env.FFMPEG_PATH) return process.env.FFMPEG_PATH;
+    try {
+        const p = require('ffmpeg-static');
+        if (p) return p;
+    } catch (e) { /* 包缺失，回退系统命令 */ }
+    return 'ffmpeg';
+}
+
+function runFfmpeg(args, timeoutMs = WEBP_CONVERT_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+        execFile(ffmpegBin(), args, {
+            windowsHide: true,
+            timeout: timeoutMs,
+            maxBuffer: 4 * 1024 * 1024,
+        }, (err, stdout, stderr) => {
+            if (err) {
+                err.message = `${err.message}${stderr ? ` | ${String(stderr).slice(-400)}` : ''}`;
+                reject(err);
+            } else {
+                resolve(stdout);
+            }
+        });
+    });
+}
+
+/**
+ * webp → 客户端可播放的 PNG / APNG。
+ * @param {Buffer} buf 原始 webp 字节
+ * @param {boolean} animated 是否动态
+ * @returns {Promise<{buffer: Buffer, animated: boolean}>}
+ */
+async function convertWebpForEmoji(buf, animated) {
+    const workDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'emoji-webp-'));
+    const srcPath = path.join(workDir, 'in.webp');
+    const outPath = path.join(workDir, 'out.png');
+    try {
+        await fs.promises.writeFile(srcPath, buf);
+        const args = ['-y', '-hide_banner', '-loglevel', 'error', '-i', srcPath, '-an'];
+        if (animated) {
+            // -plays 0 = 无限循环；scale 只缩不放并保持比例；-frames:v 限制总帧数
+            args.push(
+                '-vf', `scale=${WEBP_MAX_EDGE}:${WEBP_MAX_EDGE}:force_original_aspect_ratio=decrease`,
+                '-frames:v', String(WEBP_MAX_FRAMES),
+                '-f', 'apng', '-plays', '0',
+                outPath
+            );
+        } else {
+            args.push('-frames:v', '1', '-f', 'image2', '-c:v', 'png', outPath);
+        }
+        try {
+            await runFfmpeg(args);
+        } catch (e) {
+            if (e && (e.code === 'ENOENT' || /not recognized|ENOENT/i.test(e.message || ''))) {
+                throw new Error('服务端未安装 ffmpeg，暂时无法处理 webp（请改用 PNG/GIF）');
+            }
+            throw e;
+        }
+        const out = await fs.promises.readFile(outPath);
+        if (!out.length) throw new Error('转换结果为空');
+        if (out.length > WEBP_MAX_OUTPUT_BYTES) {
+            throw new Error(`转换后体积过大（${Math.round(out.length / 1024)}KB，上限 ${Math.round(WEBP_MAX_OUTPUT_BYTES / 1024)}KB），请缩小图片尺寸或减少帧数`);
+        }
+        return { buffer: out, animated: isAnimatedImageBuffer(out) };
+    } finally {
+        // 源 webp 与中间产物全部删除：磁盘只保留最终表情，不留原始上传件
+        await fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
+}
+
 // 内存缓存 catalog（自定义上传后失效），避免每次请求都扫盘
 let emojiCatalogCache = null;
 let emojiCatalogCacheAt = 0;
@@ -1944,24 +2054,56 @@ app.post('/api/emoji/custom/upload', emojiUpload.single('emoji'), async (req, re
         if (!mime.startsWith('image/')) return res.status(400).json({ success: false, error: '仅支持图片文件' });
 
         const raw = sanitizeImageBuffer(req.file.buffer);
-        // ⚠️ 只有 **APNG（PNG + acTL）** 与 **GIF（GIF87a/89a）** 能原样保留动画：
-        // - APNG：客户端 ApngDecoder 逐帧播放，本地按 `${id}.png` 落盘；
-        // - GIF：客户端 EmojiView 内置 Movie 解码播放（零依赖），本地按 `${id}.gif` 落盘；
-        // Jimp 只保留首帧，会把动画压成静态图，动图一律绕过 Jimp 原样落盘。体积已由 10MB 上限约束。
+        // ⚠️ 客户端只认 PNG / APNG / GIF：
+        // - APNG：ApngDecoder 逐帧播放，本地按 `${id}.png` 落盘；
+        // - GIF：EmojiView 内置 Movie 解码播放（零依赖），本地按 `${id}.gif` 落盘；
+        // - webp：客户端无法解码，必须先在此归一化（静态→PNG、动态→APNG）。
+        // Jimp 只保留首帧，会把动画压成静态图，动图一律绕过 Jimp 原样落盘。
         const isGif = raw.length >= 3 && raw[0] === 0x47 && raw[1] === 0x49 && raw[2] === 0x46;
-        const animated = isGif || isAnimatedImageBuffer(raw);
+        const isWebp = isWebpBuffer(raw);
         const id = 'c_' + crypto.randomBytes(6).toString('hex');
-        const fileName = isGif ? `${id}.gif` : `${id}.png`;
+        const sourceFormat = isWebp ? 'webp' : (isGif ? 'gif' : 'png');
+
+        let outBuf = raw;
+        let animated = isGif || isAnimatedImageBuffer(raw);
+
+        if (isWebp) {
+            if (raw.length > WEBP_MAX_INPUT_BYTES) {
+                return res.status(400).json({
+                    success: false,
+                    error: `webp 文件过大（上限 ${Math.round(WEBP_MAX_INPUT_BYTES / 1024)}KB）`
+                });
+            }
+            const srcAnimated = isAnimatedWebpBuffer(raw);
+            try {
+                const conv = await convertWebpForEmoji(raw, srcAnimated);
+                outBuf = conv.buffer;
+                animated = conv.animated;
+                if (srcAnimated && !conv.animated) {
+                    console.warn(`[emoji] 动态 webp 未转出动画（ffmpeg 可能不支持动画 webp），已降级为静态首帧 id=${id}`);
+                }
+                console.log(`[emoji] webp 已归一化 id=${id} 动态=${animated} 原始=${raw.length}B 输出=${outBuf.length}B`);
+            } catch (e) {
+                console.error('[emoji] webp 归一化失败:', e.message);
+                return res.status(400).json({
+                    success: false,
+                    error: 'webp 转换失败，请换一张图片或改用 PNG/GIF：' + e.message
+                });
+            }
+        }
+
+        // webp 转换产物一定是 PNG/APNG，扩展名固定 .png（客户端按内容嗅探，不依赖后缀）
+        const fileName = (!isWebp && isGif) ? `${id}.gif` : `${id}.png`;
         const destPath = path.join(EMOJI_CUSTOM_DIR, fileName);
         fs.mkdirSync(EMOJI_CUSTOM_DIR, { recursive: true });
 
         if (animated) {
             // 动图（APNG/GIF）：绝不能走 Jimp——Jimp 只保留首帧，会把动画压成静态图。
             // 原样落盘保留全部帧，客户端据此播放动画。
-            fs.writeFileSync(destPath, raw);
+            fs.writeFileSync(destPath, outBuf);
         } else {
             // 静态图：按原逻辑归一化到 240×240（体积与显示一致）
-            const img = await Jimp.read(raw);
+            const img = await Jimp.read(outBuf);
             img.cover(240, 240);
             await img.writeAsync(destPath);
         }
@@ -1996,6 +2138,8 @@ app.post('/api/emoji/custom/upload', emojiUpload.single('emoji'), async (req, re
                 hash: contentHash,
                 size: fileBuf.length,
                 animated: animated || undefined,
+                // 记录原始格式，便于管理页排查「上传 webp → 落盘 png」的转换结果
+                sourceFormat: isWebp ? sourceFormat : undefined,
                 uploader: uploader || undefined,
                 ts: Date.now()
             };
@@ -2166,15 +2310,33 @@ app.post('/emoji/admin/upload', requirePageAuthJson, emojiUpload.array('emoji', 
                 const raw = sanitizeImageBuffer(file.buffer);
                 const isGif = raw.length >= 3 && raw[0] === 0x47 && raw[1] === 0x49 && raw[2] === 0x46;
                 const isPng = raw.length >= 4 && raw[0] === 0x89 && raw[1] === 0x50 && raw[2] === 0x4E && raw[3] === 0x47;
-                if (!isPng && !isGif) { errors.push({ name: file.originalname, error: '仅支持 PNG/GIF' }); continue; }
+                const isWebp = isWebpBuffer(raw);
+                if (!isPng && !isGif && !isWebp) { errors.push({ name: file.originalname, error: '仅支持 PNG/GIF/WEBP' }); continue; }
+                // webp 归一化：静态 → PNG（随后按普通表情 cover 240），动态 → APNG 原样落盘（客户端可播）
+                let outBuf = raw;
+                let webpAnimated = false;
+                if (isWebp) {
+                    if (raw.length > WEBP_MAX_INPUT_BYTES) {
+                        errors.push({ name: file.originalname, error: `webp 文件过大（上限 ${Math.round(WEBP_MAX_INPUT_BYTES / 1024)}KB）` });
+                        continue;
+                    }
+                    try {
+                        webpAnimated = isAnimatedWebpBuffer(raw);
+                        outBuf = (await convertWebpForEmoji(raw, webpAnimated)).buffer;
+                    } catch (e) {
+                        errors.push({ name: file.originalname, error: 'webp 转换失败: ' + e.message });
+                        continue;
+                    }
+                }
                 maxNum += 1;
                 const id = `s${maxNum}`;
                 const ext = isGif ? '.gif' : '.png';
                 const destPath = path.join(EMOJI_REGULAR_DIR, `${id}${ext}`);
-                if (isGif) {
-                    fs.writeFileSync(destPath, raw);
+                if (isGif || (isWebp && webpAnimated)) {
+                    // GIF / 动态 webp（已转 APNG）：不能过 Jimp，否则动画被压成首帧
+                    fs.writeFileSync(destPath, outBuf);
                 } else {
-                    const img = await Jimp.read(raw);
+                    const img = await Jimp.read(outBuf);
                     img.cover(240, 240);
                     await img.writeAsync(destPath);
                 }
@@ -3014,6 +3176,8 @@ const callRecording = require('./call-recording');
 callRecording.attachRoutes(app);
 // 续跑上次未完成的转写任务（服务重启后仍能从已完成的分段继续）
 require('./call-transcript').resumePending();
+// 服务重启会丢掉 onCallEnded 的兜底定时器：补归档「有分块但没人 finalize」的掉线轨
+callRecording.resumeAutoFinalize();
 // 本地 ASR 模型自检：缺失时自动下载一次；失败只告警，不阻塞通话
 require('./scripts/download-model').ensureModels((msg) => console.log(msg))
     .catch(e => console.warn('[asr-setup] 模型检查失败:', e.message));

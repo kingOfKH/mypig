@@ -255,8 +255,15 @@ function onCallEnded(info) {
         durationMs: info.durationMs || 0,
         reason: info.reason || '',
     });
-    // 给慢网留补传窗口；到点仍未 finalize 的按不完整处理（绝不伪装成完整的终稿）
-    setTimeout(() => maybeStartAsr(callId), 120 * 1000);
+    // 给慢网留补传窗口。到点后：
+    //  ① 先由服务端兜底归档「有分块但没人 finalize」的轨（对方掉线/APP 被杀）——
+    //     否则这些已上传的音频会被整条丢弃，终稿里直接没有对方的声音；
+    //  ② 再触发转写判定。
+    setTimeout(() => {
+        autoFinalizeMissing(callId)
+            .catch((e) => log(`兜底归档异常 ${callId}: ${e.message}`))
+            .finally(() => maybeStartAsr(callId));
+    }, 120 * 1000);
     log(`通话结束 callId=${callId} duration=${info.durationMs}ms`);
     // 长期读取令牌：随 call.ended 下发给客户端并写进聊天记录，之后随时可回看/回听
     return { read: issueToken(callId, 'R', 0) };
@@ -309,28 +316,30 @@ function handleChunk(callId, role, req, res) {
     return res.json({ ok: true, seq, startMs });
 }
 
-async function doFinalize(callId, role, req, res) {
-    const p = req.body || {};
-    if (!verifyToken(p.token, callId, role)) return res.status(403).json({ ok: false, reason: 'bad_token' });
-
+/**
+ * 拼接并归档单轨（内部实现，不做令牌校验）。
+ *
+ * @param {number} declared 客户端声明的分块数；服务端兜底归档时传「已到达的连续块数」
+ * @param {{keepChunks?: boolean}} opts keepChunks=true 时不删暂存分块。
+ *        用于「对方掉线由服务端兜底归档」：保留分块，客户端日后重连补传仍可继续扩展，
+ *        否则提前删块会让后续 finalize 因缺口把整轨降级为空，反而丢失已归档内容。
+ * @returns {Promise<{complete:boolean,durationMs:number,codec:string,sampleRate:number,preSkipMs:number,error:string}>}
+ */
+async function finalizeTrack(callId, role, declared, opts = {}) {
     const seqs = listChunks(callId, role);
-    const declared = Number(p.chunkCount || 0);
 
     // 幂等：客户端重试 finalize 时上一轮已清理分块，不能再用空分块把完整归档降级成 incomplete
     const metaBefore = readMeta(callId) || {};
     const prevTrack = (metaBefore.tracks || {})[role] || {};
     if (seqs.length === 0 && prevTrack.finalized && prevTrack.complete) {
-        return res.json({
-            ok: true,
-            track: {
-                complete: true,
-                durationMs: prevTrack.durationMs || 0,
-                codec: 'opus',
-                sampleRate: SAMPLE_RATE,
-                preSkipMs: prevTrack.preSkipMs || 0,
-                error: '',
-            },
-        });
+        return {
+            complete: true,
+            durationMs: prevTrack.durationMs || 0,
+            codec: 'opus',
+            sampleRate: SAMPLE_RATE,
+            preSkipMs: prevTrack.preSkipMs || 0,
+            error: '',
+        };
     }
 
     // 只拼接从 0 开始连续的前缀：中间缺块时绝不把后面的音频前移（会篡改时间轴）
@@ -389,40 +398,91 @@ async function doFinalize(callId, role, req, res) {
     };
     writeMeta(callId, meta);
 
-    // 完整才清理暂存；不完整保留分块，供客户端补传后重新 finalize
+    // 完整才清理暂存；不完整保留分块，供客户端补传后重新 finalize。
+    // keepChunks=true 保留分块（服务端兜底归档），客户端日后补传仍可继续扩展。
     if (complete) {
-        try { fs.rmSync(path.join(callDir(callId), 'chunks', role), { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
+        if (!opts.keepChunks) {
+            try { fs.rmSync(path.join(callDir(callId), 'chunks', role), { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
+        }
         try { fs.unlinkSync(pcmFile); } catch (e) { /* 忽略 */ }
     }
     usageCache.at = 0;
-    log(`归档 callId=${callId} 轨${role} ${durationMs}ms complete=${complete} preSkip=${preSkipMs}ms`);
+    log(`归档 callId=${callId} 轨${role} ${durationMs}ms complete=${complete} preSkip=${preSkipMs}ms${opts.keepChunks ? ' 兜底(保留分块)' : ''}`);
     if (complete) maybeStartAsr(callId);
-    return res.json({
-        ok: true,
-        track: {
-            complete: complete && !codecError,
-            durationMs,
-            codec: 'opus',
-            sampleRate: SAMPLE_RATE,
-            preSkipMs,
-            error: codecError || (complete ? '' : 'incomplete'),
-        },
-    });
+    return {
+        complete: complete && !codecError,
+        durationMs,
+        codec: 'opus',
+        sampleRate: SAMPLE_RATE,
+        preSkipMs,
+        error: codecError || (complete ? '' : 'incomplete'),
+    };
+}
+
+async function doFinalize(callId, role, req, res) {
+    const p = req.body || {};
+    if (!verifyToken(p.token, callId, role)) return res.status(403).json({ ok: false, reason: 'bad_token' });
+    const track = await finalizeTrack(callId, role, Number(p.chunkCount || 0));
+    return res.json({ ok: true, track });
+}
+
+/**
+ * 服务端兜底归档：通话已结束但某轨仍未 finalize（对方 APP 被杀 / 断网不回来）时，
+ * 用已到达的连续分块自动归档，避免「分块传上来了却因没人 finalize 被整条丢弃」。
+ *
+ * 安全约束：
+ *  - 只拼接从 0 连续的前缀，绝不前移篡改时间轴；
+ *  - 保留暂存分块，客户端日后重连补传仍可继续扩展（不会被这次归档锁死）；
+ *  - complete 仅表示「已到达部分连续」，与通话时长比较后仍会标 short→partial，
+ *    绝不把缺失时段伪装成完整终稿。
+ * @returns {Promise<Array<{role:string, archived:boolean, complete:boolean, durationMs:number}>>}
+ */
+async function autoFinalizeMissing(callId) {
+    const meta = readMeta(callId);
+    if (!meta || !meta.endedAt) return [];
+    const out = [];
+    for (const role of ['A', 'B']) {
+        const t = (meta.tracks || {})[role] || {};
+        if (t.finalized) continue;
+        const seqs = listChunks(callId, role);
+        if (seqs.length === 0) continue;
+        let contiguous = 0;
+        while (contiguous < seqs.length && seqs[contiguous] === contiguous) contiguous++;
+        if (contiguous === 0) continue;
+        try {
+            // 走串行链：避免与客户端同时 finalize 同一轨，并发跑两次 ffmpeg 覆盖同一 ogg
+            const r = await enqueueFinalize(callId, role, contiguous, { keepChunks: true });
+            log(`兜底归档掉线轨 callId=${callId} 轨${role} complete=${r.complete} duration=${r.durationMs}ms`);
+            out.push({ role, archived: true, complete: r.complete, durationMs: r.durationMs });
+        } catch (e) {
+            log(`兜底归档失败 callId=${callId} 轨${role}: ${e.message}`);
+            out.push({ role, archived: false, complete: false, durationMs: 0 });
+        }
+    }
+    return out;
 }
 
 /** 同一轨的 finalize 串行：客户端重试/补传不会并发跑两次 ffmpeg 覆盖同一个 ogg */
 const finalizeChains = new Map();
 
-function handleFinalize(callId, role, req, res) {
+/** 串行执行一次 finalizeTrack（客户端 HTTP 与服务端兜底归档共用，防止并发编码同一轨） */
+function enqueueFinalize(callId, role, declared, opts = {}) {
     const key = `${callId}|${role}`;
     const prev = finalizeChains.get(key) || Promise.resolve();
-    const job = prev.catch(() => {}).then(() => doFinalize(callId, role, req, res));
+    const job = prev.catch(() => {}).then(() => finalizeTrack(callId, role, declared, opts));
     const tail = job.catch(() => {});
     finalizeChains.set(key, tail);
     tail.finally(() => {
         if (finalizeChains.get(key) === tail) finalizeChains.delete(key);
     });
     return job;
+}
+
+function handleFinalize(callId, role, req, res) {
+    const p = req.body || {};
+    if (!verifyToken(p.token, callId, role)) return Promise.resolve(res.status(403).json({ ok: false, reason: 'bad_token' }));
+    return enqueueFinalize(callId, role, Number(p.chunkCount || 0))
+        .then((track) => res.json({ ok: true, track }));
 }
 
 // ---- 回听切片 ----
@@ -738,6 +798,28 @@ function attachRoutes(app) {
     log('录音归档路由已挂载');
 }
 
+// ---- 启动兜底：服务重启会丢掉 onCallEnded 的定时器，这里补做一次自动归档 ----
+function resumeAutoFinalize() {
+    try {
+        if (!fs.existsSync(CALLS_DIR)) return;
+        for (const entry of fs.readdirSync(CALLS_DIR, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue;
+            const meta = readMeta(entry.name);
+            if (!meta || !meta.endedAt) continue;
+            const pending = ['A', 'B'].some((role) => {
+                const t = (meta.tracks || {})[role] || {};
+                return !t.finalized && listChunks(entry.name, role).length > 0;
+            });
+            if (!pending) continue;
+            autoFinalizeMissing(entry.name)
+                .catch((e) => log(`启动兜底归档异常 ${entry.name}: ${e.message}`))
+                .finally(() => maybeStartAsr(entry.name));
+        }
+    } catch (e) {
+        log(`启动兜底扫描失败: ${e.message}`);
+    }
+}
+
 module.exports = {
     CALLS_DIR,
     ensureDirs,
@@ -751,4 +833,6 @@ module.exports = {
     onCallEnded,
     attachRoutes,
     archiveBytes,
+    autoFinalizeMissing,
+    resumeAutoFinalize,
 };

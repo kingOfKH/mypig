@@ -509,7 +509,7 @@ function logThrottled(key, intervalMs, fn) {
 }
 // 高频信令 op（心跳、cmd、rtc.quality 等）白名单：超过一次/秒的不重复打印，
 // 避免这些每秒 1-2 次的信令覆盖真正关键的二进制丢帧/IDR风暴日志。
-const NOISY_OP_RE = /^(heartbeat|rtc\.quality|rtc\.deccap|rtc\.codec|cmd\.ack|notify\.ping)$/;
+const NOISY_OP_RE = /^(heartbeat|rtc\.quality|rtc\.deccap|rtc\.codec|cmd\.ack|notify\.ping|call\.quality|call\.ping|call\.pong)$/;
 
 // ---- 订阅缓存（避免每次 code.connect 都同步读文件阻塞事件循环）----
 let subscriptionCache = null;
@@ -1295,7 +1295,10 @@ function attach(httpServer) {
         ws.on('error', (e) => { logError('ws error', deviceId && deviceId.slice(-8), e.message); });
     });
 
-    // 心跳检测
+    // 心跳检测。
+    // 10s 一轮（原 30s）：设备掉线（尤其通话中直接断网、无 TCP FIN）能被更快判定，
+    // 对端更早收到 peer_disconnected，而不是干等半分钟以上。
+    // ping 帧仅数十字节，10s 一次对带宽/CPU 影响可忽略。
     const heartbeat = setInterval(() => {
         wss.clients.forEach((ws) => {
             if (ws.isAlive === false) {
@@ -1308,7 +1311,7 @@ function attach(httpServer) {
                 ws.ping();
             } catch (e) {}
         });
-    }, 30 * 1000);
+    }, 10 * 1000);
 
     wss.on('close', () => clearInterval(heartbeat));
     return wss;

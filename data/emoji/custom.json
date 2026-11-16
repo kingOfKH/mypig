@@ -14,5 +14,21 @@
     "size": 5536,
     "animated": true,
     "ts": 1789814188618
+  },
+  {
+    "id": "c_03dd4df37c64",
+    "file": "/emoji/custom/c_03dd4df37c64.gif",
+    "hash": "55d70563f2a08484ad78ed1d104f52d1",
+    "size": 63172,
+    "animated": true,
+    "ts": 1790299841740
+  },
+  {
+    "id": "c_5135a665d4a7",
+    "file": "/emoji/custom/c_5135a665d4a7.gif",
+    "hash": "a8bd4e194de249e4ee73ca1f3d2f2c8c",
+    "size": 33418,
+    "animated": true,
+    "ts": 1793259892515
   }
 ]

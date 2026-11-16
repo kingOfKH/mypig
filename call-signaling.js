@@ -347,6 +347,43 @@ function createCallSignaling(deps) {
         }
     }
 
+    /**
+     * 通话质量上报：把本端质量等级转给对端，用于「对方网络质量不佳」实时提示。
+     * 仅在同一通 active 通话内转发，服务端不存储、不落盘；payload 保持轻量。
+     */
+    function onQuality(deviceId, p) {
+        const c = liveCallOf(deviceId);
+        if (!c || c.state !== 'active') return false;
+        const peer = deviceId === c.caller ? c.callee : (deviceId === c.callee ? c.caller : null);
+        if (!peer) return false;
+        const level = p && (p.level === 'poor' || p.level === 'fair') ? p.level : 'good';
+        send(peer, 'call.quality', {
+            callId: c.callId,
+            level,
+            loss: Math.max(0, Math.min(100, Number(p && p.loss) || 0)),
+            jitter: Math.max(0, Math.round(Number(p && p.jitter) || 0)),
+            rtt: Math.max(0, Math.round(Number(p && p.rtt) || 0)),
+        });
+        return true;
+    }
+
+    /**
+     * 通话期应用层保活：秒级探测信令链路是否还活着。
+     * 客户端发 call.ping，服务端立即回 call.pong；收不到 pong 就能在数秒内进入
+     * 「正在重连」提示，而不必等 TCP/WS 心跳超时（那要几十秒）。
+     */
+    function onPing(ws, p) {
+        // 无条件回 pong：收尾瞬间也没有通话状态下，保活仍需正常应答，避免客户端误判「正在重连」
+        const c = liveCallOf(ws.deviceId);
+        try {
+            ws.send(JSON.stringify({
+                op: 'call.pong',
+                payload: { ...(c ? { callId: c.callId } : {}), ts: now() },
+            }));
+        } catch (e) { /* 连接已断，忽略 */ }
+        return true;
+    }
+
     function handle(ws, m) {
         const p = m.payload || {};
         switch (m.op) {
@@ -356,6 +393,8 @@ function createCallSignaling(deps) {
             case 'call.reject':  return onReject(ws.deviceId, p);
             case 'call.cancel':  return onCancel(ws.deviceId, p);
             case 'call.hangup':  return onHangup(ws.deviceId, p);
+            case 'call.quality': return onQuality(ws.deviceId, p);
+            case 'call.ping':    return onPing(ws, p);
             default: return false;
         }
     }

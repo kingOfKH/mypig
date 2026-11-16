@@ -1874,25 +1874,42 @@ async function convertWebpForEmoji(buf, animated) {
     const outPath = path.join(workDir, 'out.png');
     try {
         await fs.promises.writeFile(srcPath, buf);
-        const args = ['-y', '-hide_banner', '-loglevel', 'error', '-i', srcPath, '-an'];
-        if (animated) {
-            // -plays 0 = 无限循环；scale 只缩不放并保持比例；-frames:v 限制总帧数
-            args.push(
+        // 输出参数：apng 无限循环 + 等比缩放 + 帧数上限；静态走单帧 png
+        const outArgs = animated
+            ? [
+                '-an',
                 '-vf', `scale=${WEBP_MAX_EDGE}:${WEBP_MAX_EDGE}:force_original_aspect_ratio=decrease`,
                 '-frames:v', String(WEBP_MAX_FRAMES),
                 '-f', 'apng', '-plays', '0',
                 outPath
-            );
-        } else {
-            args.push('-frames:v', '1', '-f', 'image2', '-c:v', 'png', outPath);
-        }
+            ]
+            : ['-an', '-frames:v', '1', '-f', 'image2', '-c:v', 'png', outPath];
+        const common = ['-y', '-hide_banner', '-loglevel', 'error'];
+        const run = (inputArgs) => runFfmpeg([...common, ...inputArgs, ...outArgs]);
+
         try {
-            await runFfmpeg(args);
+            if (animated) {
+                // ⚠️ 动画 webp 必须显式指定 `-f webp`：
+                // ffmpeg 默认按扩展名走 image2 demuxer，会把整个文件当成「单帧」交给静态 webp
+                // 解码器，而真正的帧数据在 ANMF 块里 → 报 `[webp] image data not found`。
+                try {
+                    await run(['-f', 'webp', '-i', srcPath]);
+                    console.log('[emoji] 动画 webp 已用 webp demuxer 解码');
+                } catch (first) {
+                    // 老版本 ffmpeg 没有 webp demuxer（-f webp 会报 format not available），回退自动探测
+                    console.warn('[emoji] webp demuxer 不可用，回退自动探测:', String(first.message || '').slice(-160));
+                    await run(['-i', srcPath]);
+                }
+            } else {
+                await run(['-i', srcPath]);
+            }
         } catch (e) {
             if (e && (e.code === 'ENOENT' || /not recognized|ENOENT/i.test(e.message || ''))) {
                 throw new Error('服务端未安装 ffmpeg，暂时无法处理 webp（请改用 PNG/GIF）');
             }
-            throw e;
+            // 只回传最后两行，避免把整段 ffmpeg 噪声塞进接口错误
+            const tail = String(e.message || '').split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 200);
+            throw new Error(`webp 解码失败（ffmpeg 无法解析该文件，可能是动画 webp 或新版编码器产物）: ${tail}`);
         }
         const out = await fs.promises.readFile(outPath);
         if (!out.length) throw new Error('转换结果为空');
